@@ -1,0 +1,36 @@
+[package]
+name = "tidyup-ui"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+authors.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+rust-version.workspace = true
+readme      = "README.md"
+description = "Dioxus desktop UI. Consumes the same tidyup-app services as the CLI."
+publish     = false
+
+[[bin]]
+name = "tidyup-desktop"
+path = "src/main.rs"
+
+[dependencies]
+tidyup-domain                = { workspace = true }
+tidyup-core                  = { workspace = true }
+tidyup-app                   = { workspace = true }
+tidyup-storage-sqlite        = { workspace = true }
+tidyup-extract               = { workspace = true }
+tidyup-embeddings-ort        = { workspace = true }
+tidyup-inference-mistralrs   = { workspace = true }
+
+anyhow       = { workspace = true }
+async-trait  = { workspace = true }
+tokio        = { workspace = true }
+tracing      = { workspace = true }
+# dioxus = { version = "0.6", features = ["desktop", "router"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,43 @@
+[package]
+name = "tidyup-cli"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+authors.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+rust-version.workspace = true
+readme      = "README.md"
+description = "Headless CLI for tidyup — on-device AI file organizer."
+
+[[bin]]
+name = "tidyup"
+path = "src/main.rs"
+
+[dependencies]
+tidyup-domain                = { workspace = true }
+tidyup-core                  = { workspace = true }
+tidyup-app                   = { workspace = true }
+tidyup-pipeline              = { workspace = true }
+tidyup-storage-sqlite        = { workspace = true }
+tidyup-extract               = { workspace = true }
+tidyup-embeddings-ort        = { workspace = true }
+tidyup-inference-mistralrs   = { workspace = true }
+tidyup-inference-remote      = { workspace = true }
+
+clap         = { workspace = true }
+indicatif    = { workspace = true }
+console      = { workspace = true }
+anyhow       = { workspace = true }
+async-trait  = { workspace = true }
+tokio        = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+tracing      = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid         = { workspace = true }
+
+[lints]
+workspace = true
