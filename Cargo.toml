@@ -1,0 +1,103 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tidyup-domain",
+    "crates/tidyup-core",
+    "crates/tidyup-app",
+    "crates/tidyup-extract",
+    "crates/tidyup-storage-sqlite",
+    "crates/tidyup-inference-mistralrs",
+    "crates/tidyup-inference-remote",
+    "crates/tidyup-embeddings-ort",
+    "crates/tidyup-pipeline",
+    "crates/tidyup-cli",
+    "crates/tidyup-ui",
+    "xtask",
+]
+
+[workspace.package]
+version       = "0.1.0"
+edition       = "2021"
+rust-version  = "1.90"
+license       = "Apache-2.0"
+repository    = "https://github.com/erovelli/tidyup"
+homepage      = "https://github.com/erovelli/tidyup"
+authors       = ["Tidyup Contributors"]
+keywords      = ["ai", "llm", "file-organizer", "on-device", "cli"]
+categories    = ["command-line-utilities", "filesystem"]
+
+# Central lint policy. Every member crate inherits via `[lints] workspace = true`.
+# This is the single source of truth — don't override unless a crate has a concrete reason.
+[workspace.lints.rust]
+unsafe_code                       = "forbid"
+missing_debug_implementations     = "warn"
+rust_2018_idioms                  = { level = "warn", priority = -1 }
+unreachable_pub                   = "warn"
+unused_lifetimes                  = "warn"
+unused_qualifications             = "warn"
+
+[workspace.lints.clippy]
+pedantic         = { level = "warn", priority = -1 }
+nursery          = { level = "warn", priority = -1 }
+cargo            = { level = "warn", priority = -1 }
+# Pragmatic overrides — pedantic defaults that create noise without catching real bugs.
+module_name_repetitions   = "allow"
+must_use_candidate        = "allow"
+missing_errors_doc        = "allow"
+missing_panics_doc        = "allow"
+multiple_crate_versions   = "allow"
+# Things we actively want to catch.
+unwrap_used               = "warn"
+expect_used               = "warn"
+dbg_macro                 = "warn"
+todo                      = "warn"
+unimplemented             = "warn"
+
+[workspace.dependencies]
+# Internal
+tidyup-domain                = { path = "crates/tidyup-domain",                version = "0.1.0" }
+tidyup-core                  = { path = "crates/tidyup-core",                  version = "0.1.0" }
+tidyup-app                   = { path = "crates/tidyup-app",                   version = "0.1.0" }
+tidyup-extract               = { path = "crates/tidyup-extract",               version = "0.1.0" }
+tidyup-storage-sqlite        = { path = "crates/tidyup-storage-sqlite",        version = "0.1.0" }
+tidyup-inference-mistralrs   = { path = "crates/tidyup-inference-mistralrs",   version = "0.1.0" }
+tidyup-inference-remote      = { path = "crates/tidyup-inference-remote",      version = "0.1.0" }
+tidyup-embeddings-ort        = { path = "crates/tidyup-embeddings-ort",        version = "0.1.0" }
+tidyup-pipeline              = { path = "crates/tidyup-pipeline",              version = "0.1.0" }
+
+# Core
+anyhow       = "1.0.102"
+thiserror    = "2.0.18"
+async-trait  = "0.1.89"
+tokio        = { version = "1.52", features = ["rt-multi-thread", "macros", "sync", "fs", "io-util"] }
+futures      = "0.3.32"
+serde        = { version = "1.0.228", features = ["derive"] }
+serde_json   = "1.0.149"
+toml         = "1.1"
+tracing      = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+uuid         = { version = "1.23", features = ["v4", "serde"] }
+chrono       = { version = "0.4.44", features = ["serde"] }
+sha2         = "0.11"
+walkdir      = "2.5"
+dirs         = "6"
+
+# CLI
+clap         = { version = "4.6", features = ["derive", "env"] }
+indicatif    = "0.18"
+console      = "0.16"
+
+# Storage
+rusqlite     = { version = "0.39", features = ["bundled"] }
+
+# HTTP
+reqwest      = { version = "0.13", features = ["json", "rustls", "http2", "charset"], default-features = false }
+
+[profile.release]
+lto           = "thin"
+codegen-units = 1
+strip         = "symbols"
+
+[profile.dist]
+inherits = "release"
+lto      = "fat"

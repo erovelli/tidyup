@@ -1,0 +1,22 @@
+[package]
+name = "tidyup-domain"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+authors.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+rust-version.workspace = true
+readme      = "README.md"
+description = "Pure domain types shared across the tidyup workspace."
+
+[dependencies]
+serde       = { workspace = true }
+chrono      = { workspace = true }
+uuid        = { workspace = true }
+thiserror   = { workspace = true }
+
+[lints]
+workspace = true
