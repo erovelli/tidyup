@@ -1,0 +1,26 @@
+[package]
+name = "tidyup-storage-sqlite"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+authors.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+rust-version.workspace = true
+readme      = "README.md"
+description = "Default storage backend: rusqlite-backed FileIndex, ChangeLog, BackupStore."
+
+[dependencies]
+tidyup-core   = { workspace = true }
+tidyup-domain = { workspace = true }
+async-trait   = { workspace = true }
+anyhow        = { workspace = true }
+rusqlite      = { workspace = true }
+tokio         = { workspace = true }
+uuid          = { workspace = true }
+chrono        = { workspace = true }
+
+[lints]
+workspace = true

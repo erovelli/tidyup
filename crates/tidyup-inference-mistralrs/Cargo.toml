@@ -1,0 +1,30 @@
+[package]
+name = "tidyup-inference-mistralrs"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+authors.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+rust-version.workspace = true
+readme      = "README.md"
+description = "Local inference backend via mistralrs. Runtime-detected accelerator."
+
+[features]
+default = ["cpu"]
+cpu   = []
+metal = []
+cuda  = []
+rocm  = []
+
+[dependencies]
+tidyup-core = { workspace = true }
+async-trait = { workspace = true }
+anyhow      = { workspace = true }
+tokio       = { workspace = true }
+# mistralrs = { git = "...", optional = true }   # TODO pin version + wire features
+
+[lints]
+workspace = true

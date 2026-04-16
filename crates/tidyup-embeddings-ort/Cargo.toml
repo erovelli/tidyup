@@ -1,0 +1,24 @@
+[package]
+name = "tidyup-embeddings-ort"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+authors.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+rust-version.workspace = true
+readme      = "README.md"
+description = "ONNX Runtime embedding backend (bge-small-en-v1.5 default)."
+
+[dependencies]
+tidyup-core = { workspace = true }
+async-trait = { workspace = true }
+anyhow      = { workspace = true }
+tokio       = { workspace = true }
+# ort        = "2"
+# tokenizers = "0.20"
+
+[lints]
+workspace = true
