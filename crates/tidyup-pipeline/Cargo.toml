@@ -1,0 +1,27 @@
+[package]
+name = "tidyup-pipeline"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+authors.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+rust-version.workspace = true
+readme      = "README.md"
+description = "Classification pipelines: scan-mode (taxonomy) and migration-mode (target-aware)."
+
+[dependencies]
+tidyup-core   = { workspace = true }
+tidyup-domain = { workspace = true }
+async-trait   = { workspace = true }
+anyhow        = { workspace = true }
+tokio         = { workspace = true }
+tracing       = { workspace = true }
+walkdir       = { workspace = true }
+sha2          = { workspace = true }
+serde         = { workspace = true }
+
+[lints]
+workspace = true

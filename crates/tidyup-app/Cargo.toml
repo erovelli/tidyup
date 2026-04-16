@@ -1,0 +1,30 @@
+[package]
+name = "tidyup-app"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+authors.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
+rust-version.workspace = true
+readme      = "README.md"
+description = "Application services — the plug-and-play handles shared by CLI and UI."
+
+[dependencies]
+tidyup-domain   = { workspace = true }
+tidyup-core     = { workspace = true }
+tidyup-pipeline = { workspace = true }
+
+async-trait = { workspace = true }
+anyhow      = { workspace = true }
+thiserror   = { workspace = true }
+serde       = { workspace = true }
+tokio       = { workspace = true }
+toml        = { workspace = true }
+tracing     = { workspace = true }
+uuid        = { workspace = true }
+
+[lints]
+workspace = true
