@@ -1,0 +1,11 @@
+name: Release
+# Placeholder. Run `cargo dist init` to generate a real release workflow targeting
+# Homebrew, winget, and GitHub Releases. Intentionally stubbed so contributors see
+# the release story without commiting a mis-configured pipeline.
+on:
+  workflow_dispatch:
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Run 'cargo dist init' locally to generate this workflow."

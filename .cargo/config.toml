@@ -1,0 +1,10 @@
+# Workspace aliases. `cargo ci` / `cargo lint` are the one-true commands.
+
+[alias]
+xtask  = "run --package xtask --"
+lint   = "clippy --workspace --all-targets --all-features -- -D warnings"
+fmt-ck = "fmt --all -- --check"
+ci     = "xtask ci"
+
+[build]
+# Set an explicit target-dir at the workspace root to share artifacts across crates.
