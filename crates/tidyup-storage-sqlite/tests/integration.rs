@@ -9,16 +9,22 @@ use std::path::PathBuf;
 
 use chrono::Utc;
 use tempfile::TempDir;
-use tidyup_core::storage::{ChangeLog, FileIndex};
+use tidyup_core::storage::{BackupStore, ChangeLog, FileIndex};
 use tidyup_domain::{
-    BundleKind, BundleProposal, ChangeProposal, ChangeStatus, ChangeType, ContentHash, FileId,
-    IndexedFile,
+    BackupStatus, BundleKind, BundleProposal, ChangeProposal, ChangeStatus, ChangeType,
+    ContentHash, FileId, IndexedFile,
 };
 use tidyup_storage_sqlite::SqliteStore;
 use uuid::Uuid;
 
 fn new_store(dir: &TempDir) -> SqliteStore {
     SqliteStore::open(&dir.path().join("tidyup.db")).unwrap()
+}
+
+fn new_store_with_shelf(dir: &TempDir) -> SqliteStore {
+    let shelf = dir.path().join("shelf");
+    std::fs::create_dir_all(&shelf).unwrap();
+    new_store(dir).with_backup_root(shelf)
 }
 
 fn sample_file(path: &str, id: Uuid) -> IndexedFile {
@@ -202,6 +208,82 @@ async fn bundle_kind_with_pattern_roundtrips_through_sql() {
         BundleKind::DocumentSeries { pattern: p } => assert_eq!(p, &pattern),
         other => panic!("wrong kind: {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn backup_shelve_restore_full_cycle_on_disk() {
+    let dir = TempDir::new().unwrap();
+    let store = new_store_with_shelf(&dir);
+
+    let src = dir.path().join("report.txt");
+    std::fs::write(&src, b"report contents").unwrap();
+    let file = IndexedFile {
+        id: FileId(Uuid::new_v4()),
+        path: src.clone(),
+        name: "report.txt".to_string(),
+        extension: "txt".to_string(),
+        mime_type: "text/plain".to_string(),
+        size_bytes: 15,
+        content_hash: ContentHash("feedface".to_string()),
+        indexed_at: Utc::now(),
+    };
+    let change_id = Uuid::new_v4();
+
+    let record = store.shelve(&file, change_id).await.unwrap();
+    assert_eq!(record.change_id, change_id);
+    assert_eq!(record.status, BackupStatus::Shelved);
+    assert!(record.backup_path.starts_with(dir.path().join("shelf")));
+    assert_eq!(
+        std::fs::read(&record.backup_path).unwrap(),
+        b"report contents"
+    );
+
+    // Simulate the move by removing the original, then restore it.
+    std::fs::remove_file(&src).unwrap();
+    store.restore(&record).await.unwrap();
+    assert_eq!(std::fs::read(&src).unwrap(), b"report contents");
+}
+
+#[tokio::test]
+async fn backup_prune_marks_expired_and_clears_disk() {
+    let dir = TempDir::new().unwrap();
+    let store = new_store_with_shelf(&dir);
+
+    let src = dir.path().join("old.txt");
+    std::fs::write(&src, b"stale").unwrap();
+    let file = IndexedFile {
+        id: FileId(Uuid::new_v4()),
+        path: src,
+        name: "old.txt".to_string(),
+        extension: "txt".to_string(),
+        mime_type: "text/plain".to_string(),
+        size_bytes: 5,
+        content_hash: ContentHash("abc".to_string()),
+        indexed_at: Utc::now(),
+    };
+    let record = store.shelve(&file, Uuid::new_v4()).await.unwrap();
+
+    // Backdate the shelf so the 30-day window catches it.
+    let db_path = dir.path().join("tidyup.db");
+    let id_str = record.id.to_string();
+    let backdated = Utc::now() - chrono::Duration::days(90);
+    tokio::task::spawn_blocking(move || {
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.execute(
+            "UPDATE backups SET shelved_at = ?1 WHERE id = ?2",
+            rusqlite::params![backdated, id_str],
+        )
+        .unwrap();
+    })
+    .await
+    .unwrap();
+
+    let pruned = store.prune_older_than_days(30).await.unwrap();
+    assert_eq!(pruned, 1);
+    assert!(
+        !record.backup_path.exists(),
+        "pruned shelf file must be gone"
+    );
 }
 
 #[tokio::test]

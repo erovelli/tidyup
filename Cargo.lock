@@ -2782,6 +2782,7 @@ dependencies = [
  "tidyup-domain",
  "tokio",
  "uuid",
+ "walkdir",
 ]
 
 [[package]]

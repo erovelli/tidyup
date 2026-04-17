@@ -1,26 +1,29 @@
 //! `SQLite` implementations of the storage port traits.
 //!
 //! One `SqliteStore` owns a single `Arc<Mutex<Connection>>` and implements `FileIndex`,
-//! `ChangeLog`, and (in a follow-up) `BackupStore`. rusqlite is synchronous — every trait
-//! method wraps the locked connection in `tokio::task::spawn_blocking` so the async runtime
-//! isn't blocked.
+//! `ChangeLog`, and `BackupStore`. rusqlite is synchronous — every trait method wraps the
+//! locked connection in `tokio::task::spawn_blocking` so the async runtime isn't blocked.
 //!
 //! On `open`:
 //! - `PRAGMA journal_mode = WAL` for concurrent readers during writes.
 //! - `PRAGMA foreign_keys = ON` (per-connection) to honor `ON DELETE CASCADE`.
 //! - Migrations applied idempotently.
+//!
+//! `BackupStore` methods need a shelf directory; set it with [`SqliteStore::with_backup_root`].
+//! Calling a backup method without one configured returns an error.
 
 // Every query holds the connection mutex for the duration of the spawn_blocking task.
 // Clippy's "inline the lock" suggestion breaks multi-statement queries where a
 // Statement borrows the guard across prepare + query_row/query_map.
 #![allow(clippy::significant_drop_tightening)]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
+mod backups;
 mod changes;
 mod files;
 mod schema;
@@ -29,6 +32,7 @@ mod schema;
 #[derive(Clone, Debug)]
 pub struct SqliteStore {
     conn: Arc<Mutex<Connection>>,
+    backup_root: Option<Arc<PathBuf>>,
 }
 
 impl SqliteStore {
@@ -40,6 +44,7 @@ impl SqliteStore {
         schema::apply(&mut conn).context("applying schema migrations")?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            backup_root: None,
         })
     }
 
@@ -50,11 +55,23 @@ impl SqliteStore {
         schema::apply(&mut conn).context("applying schema migrations")?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            backup_root: None,
         })
+    }
+
+    /// Configure where shelved backups live on disk. Required before any `BackupStore` call.
+    #[must_use]
+    pub fn with_backup_root(mut self, root: PathBuf) -> Self {
+        self.backup_root = Some(Arc::new(root));
+        self
     }
 
     fn conn(&self) -> Arc<Mutex<Connection>> {
         Arc::clone(&self.conn)
+    }
+
+    fn backup_root(&self) -> Option<Arc<PathBuf>> {
+        self.backup_root.as_ref().map(Arc::clone)
     }
 }
 
