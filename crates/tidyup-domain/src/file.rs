@@ -22,7 +22,10 @@ impl Default for FileId {
     }
 }
 
-/// SHA-256 content hash, hex-encoded.
+/// BLAKE3 content hash, hex-encoded.
+///
+/// BLAKE3 is ~2–3× faster than SHA-256, pure Rust, and cryptographically strong. Used across
+/// the workspace for content-addressing (`FileIndex` keying, `ProfileCache` invalidation).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ContentHash(pub String);
 

@@ -306,6 +306,8 @@ pub struct ClassifierConfig {
     pub enable_llm_renaming: bool,
     /// Composite score weights.
     pub weights: ScoreWeights,
+    /// Rename proposal thresholds.
+    pub rename: RenameConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -314,6 +316,17 @@ pub struct ScoreWeights {
     pub centroid: f32,
     pub metadata: f32,
     pub hierarchy: f32,
+}
+
+/// Thresholds gating rename proposals. Both signals must clear their threshold before a
+/// rename is surfaced to review. Renames never auto-apply, even under `--yes`.
+///
+/// - `min_classification_confidence`: lower bound on Tier-2 classification confidence.
+/// - `min_mismatch_score`: lower bound on `1.0 - cosine(embed(filename), content_embedding)`.
+#[derive(Debug, Clone)]
+pub struct RenameConfig {
+    pub min_classification_confidence: f32,
+    pub min_mismatch_score: f32,
 }
 
 impl Default for ClassifierConfig {
@@ -325,6 +338,7 @@ impl Default for ClassifierConfig {
             enable_llm_fallback: true,
             enable_llm_renaming: true,
             weights: ScoreWeights::default(),
+            rename: RenameConfig::default(),
         }
     }
 }
@@ -340,6 +354,15 @@ impl Default for ScoreWeights {
     }
 }
 
+impl Default for RenameConfig {
+    fn default() -> Self {
+        Self {
+            min_classification_confidence: 0.85,
+            min_mismatch_score: 0.60,
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -349,7 +372,9 @@ mod tests {
     fn organization_type_serde_roundtrip() {
         let types = vec![
             OrganizationType::Semantic,
-            OrganizationType::DateBased { pattern: DatePattern::Year },
+            OrganizationType::DateBased {
+                pattern: DatePattern::Year,
+            },
             OrganizationType::ProjectBased,
             OrganizationType::StatusBased,
             OrganizationType::Unknown,
@@ -368,9 +393,13 @@ mod tests {
             MoveStatus::Approved,
             MoveStatus::Rejected,
             MoveStatus::Completed,
-            MoveStatus::Failed { error: "disk full".to_string() },
+            MoveStatus::Failed {
+                error: "disk full".to_string(),
+            },
             MoveStatus::RolledBack,
-            MoveStatus::ManualOverride { new_destination: PathBuf::from("/new/path") },
+            MoveStatus::ManualOverride {
+                new_destination: PathBuf::from("/new/path"),
+            },
         ];
         for s in statuses {
             let json = serde_json::to_string(&s).unwrap();
@@ -396,5 +425,19 @@ mod tests {
         let w = &config.weights;
         let total = w.name + w.centroid + w.metadata + w.hierarchy;
         assert!((total - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn default_rename_config_matches_spec() {
+        let r = RenameConfig::default();
+        assert!((r.min_classification_confidence - 0.85).abs() < f32::EPSILON);
+        assert!((r.min_mismatch_score - 0.60).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn rename_config_thresholds_in_unit_range() {
+        let r = RenameConfig::default();
+        assert!((0.0..=1.0).contains(&r.min_classification_confidence));
+        assert!((0.0..=1.0).contains(&r.min_mismatch_score));
     }
 }

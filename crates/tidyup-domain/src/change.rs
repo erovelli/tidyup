@@ -76,6 +76,11 @@ impl ChangeStatus {
 }
 
 /// A proposed rename/move for a single file. Never applied without a `ReviewDecision::Approve`.
+///
+/// Bundle membership: when `bundle_id` is `Some`, this proposal moves a single member of a
+/// `BundleProposal` and is never approved, applied, or rolled back independently of its bundle.
+/// Members always have `change_type == ChangeType::Move` — bundle members never receive rename
+/// suggestions.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChangeProposal {
     pub id: Uuid,
@@ -90,9 +95,17 @@ pub struct ChangeProposal {
     pub status: ChangeStatus,
     pub created_at: DateTime<Utc>,
     pub applied_at: Option<DateTime<Utc>>,
-    /// When true, this proposal moves an entire directory (project bundle) as a unit.
+    /// FK to the owning `BundleProposal`. `None` for loose (non-bundle) proposals.
     #[serde(default)]
-    pub is_bundle: bool,
+    pub bundle_id: Option<Uuid>,
+    /// Tier-2 classification sub-score used (with `rename_mismatch_score`) to gate rename
+    /// proposals. `None` when classification wasn't run (e.g. bundle members, heuristic-only).
+    #[serde(default)]
+    pub classification_confidence: Option<f32>,
+    /// `1.0 - cosine(embed(filename_as_text), content_embedding)`. Drives rename proposals
+    /// jointly with `classification_confidence`. `None` when no rename was considered.
+    #[serde(default)]
+    pub rename_mismatch_score: Option<f32>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -103,6 +116,8 @@ pub enum ParseError {
     UnknownChangeStatus(String),
     #[error("unknown BackupStatus: {0}")]
     UnknownBackupStatus(String),
+    #[error("unknown BundleKind: {0}")]
+    UnknownBundleKind(String),
 }
 
 #[cfg(test)]
@@ -112,7 +127,11 @@ mod tests {
 
     #[test]
     fn change_type_roundtrip() {
-        for ct in [ChangeType::Rename, ChangeType::Move, ChangeType::RenameAndMove] {
+        for ct in [
+            ChangeType::Rename,
+            ChangeType::Move,
+            ChangeType::RenameAndMove,
+        ] {
             let s = ct.as_str();
             let back = ChangeType::parse(s).unwrap();
             assert_eq!(ct, back);
@@ -149,10 +168,38 @@ mod tests {
             status: ChangeStatus::Pending,
             created_at: Utc::now(),
             applied_at: None,
-            is_bundle: false,
+            bundle_id: None,
+            classification_confidence: Some(0.91),
+            rename_mismatch_score: Some(0.72),
         };
         let json = serde_json::to_string(&p).unwrap();
         let back: ChangeProposal = serde_json::from_str(&json).unwrap();
         assert_eq!(p, back);
+    }
+
+    #[test]
+    fn proposal_bundle_member_serde_roundtrip() {
+        let bundle_id = Uuid::new_v4();
+        let p = ChangeProposal {
+            id: Uuid::new_v4(),
+            file_id: Some(FileId(Uuid::new_v4())),
+            change_type: ChangeType::Move,
+            original_path: PathBuf::from("/src/my-project/src/main.rs"),
+            proposed_path: PathBuf::from("/code/my-project/src/main.rs"),
+            proposed_name: "main.rs".to_string(),
+            confidence: 0.95,
+            reasoning: "Bundle member".to_string(),
+            needs_review: false,
+            status: ChangeStatus::Pending,
+            created_at: Utc::now(),
+            applied_at: None,
+            bundle_id: Some(bundle_id),
+            classification_confidence: None,
+            rename_mismatch_score: None,
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: ChangeProposal = serde_json::from_str(&json).unwrap();
+        assert_eq!(p, back);
+        assert_eq!(back.bundle_id, Some(bundle_id));
     }
 }

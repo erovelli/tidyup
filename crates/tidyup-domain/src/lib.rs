@@ -9,18 +9,20 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub mod backup;
+pub mod bundle;
 pub mod change;
 pub mod file;
 pub mod migration;
 
 pub use backup::{BackupRecord, BackupStatus};
+pub use bundle::{BundleError, BundleKind, BundleProposal};
 pub use change::{ChangeProposal, ChangeStatus, ChangeType, ParseError};
 pub use file::{ContentHash, FileId, IndexedFile};
 pub use migration::{
     Candidate, ClassificationResult, ClassifierConfig, DatePattern, ExecutedMove, FolderMetadata,
     FolderNode, FolderProfile, MigrationPlan, MigrationRun, MoveStatus, OrganizationType,
-    PlanStats, ProfileCache, ProposedMove, RunStatus, ScanDiff, ScoreBreakdown, ScoreWeights,
-    TargetScan, Tier,
+    PlanStats, ProfileCache, ProposedMove, RenameConfig, RunStatus, ScanDiff, ScoreBreakdown,
+    ScoreWeights, TargetScan, Tier,
 };
 
 /// Phases emitted to frontends during a run. Drives the single progress contract
@@ -41,5 +43,8 @@ pub enum Phase {
 pub enum ReviewDecision {
     Approve(Uuid),
     Reject(Uuid),
-    Override { proposal_id: Uuid, new_target: PathBuf },
+    Override {
+        proposal_id: Uuid,
+        new_target: PathBuf,
+    },
 }

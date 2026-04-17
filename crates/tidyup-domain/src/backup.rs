@@ -52,7 +52,11 @@ mod tests {
 
     #[test]
     fn backup_status_roundtrip() {
-        for bs in [BackupStatus::Shelved, BackupStatus::Unshelved, BackupStatus::Expired] {
+        for bs in [
+            BackupStatus::Shelved,
+            BackupStatus::Unshelved,
+            BackupStatus::Expired,
+        ] {
             let s = bs.as_str();
             let back = BackupStatus::parse(s).unwrap();
             assert_eq!(bs, back);
