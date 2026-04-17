@@ -16,7 +16,7 @@ impl ReviewHandler for AutoApproveHandler {
         Ok(proposals
             .into_iter()
             .map(|p| {
-                if p.confidence.0 >= self.min_confidence {
+                if p.confidence >= self.min_confidence {
                     ReviewDecision::Approve(p.id)
                 } else {
                     ReviewDecision::Reject(p.id)

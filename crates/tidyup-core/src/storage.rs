@@ -3,17 +3,17 @@
 use std::path::Path;
 
 use async_trait::async_trait;
-use tidyup_domain::{BackupRecord, ChangeProposal, FileId, FileRecord};
+use tidyup_domain::{BackupRecord, ChangeProposal, FileId, IndexedFile};
 
 use crate::Result;
 
 /// Persistent index of observed files. Default impl: `SQLite` (`tidyup-storage-sqlite`).
 #[async_trait]
 pub trait FileIndex: Send + Sync {
-    async fn upsert(&self, record: &FileRecord) -> Result<()>;
-    async fn get(&self, id: &FileId) -> Result<Option<FileRecord>>;
-    async fn by_path(&self, path: &Path) -> Result<Option<FileRecord>>;
-    async fn list_under(&self, root: &Path) -> Result<Vec<FileRecord>>;
+    async fn upsert(&self, record: &IndexedFile) -> Result<()>;
+    async fn get(&self, id: &FileId) -> Result<Option<IndexedFile>>;
+    async fn by_path(&self, path: &Path) -> Result<Option<IndexedFile>>;
+    async fn list_under(&self, root: &Path) -> Result<Vec<IndexedFile>>;
 }
 
 /// Append-only log of proposed and applied changes. Drives diff view + audit trail.
@@ -27,7 +27,7 @@ pub trait ChangeLog: Send + Sync {
 /// Backup store — shelf-style temporary storage for rollback.
 #[async_trait]
 pub trait BackupStore: Send + Sync {
-    async fn shelve(&self, file: &FileRecord) -> Result<BackupRecord>;
+    async fn shelve(&self, file: &IndexedFile) -> Result<BackupRecord>;
     async fn restore(&self, record: &BackupRecord) -> Result<()>;
     async fn prune_older_than_days(&self, days: u32) -> Result<usize>;
 }
