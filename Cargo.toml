@@ -105,7 +105,7 @@ ndarray      = "0.17"
 # is an optional dep of `tidyup-cli` behind `--features llm-fallback`, so this
 # crate is NOT in the default release dependency graph. `cargo-deny` enforces
 # that `mistralrs` / `candle` / `hf-hub` stay out of default builds.
-mistralrs    = { git = "https://github.com/EricLBuehler/mistral.rs", rev = "aa1f16689e32ac0e1f6552eac74dfaf9cb3788f5" }
+mistralrs    = { git = "https://github.com/EricLBuehler/mistral.rs", rev = "aa1f16689e32ac0e1f6552eac74dfaf9cb3788f5", version = "0.8.1" }
 
 # CLI
 clap         = { version = "4.6", features = ["derive", "env"] }

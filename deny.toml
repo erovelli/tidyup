@@ -11,6 +11,14 @@ ignore  = [
     # by lofty 0.24 and rav1e 0.8 (via ravif -> image). No safe upgrade available.
     # Revisit when upstream migrates to pastey or equivalent.
     { id = "RUSTSEC-2024-0436", reason = "transitive via lofty + rav1e; no upstream fix available" },
+
+    # fxhash 0.2.1 is unmaintained. Pulled in transitively by bm25 -> mistralrs-core.
+    # Only reachable under --features llm-fallback. Default build is unaffected.
+    { id = "RUSTSEC-2025-0057", reason = "transitive via mistralrs; only under --features llm-fallback; no upstream fix" },
+
+    # number_prefix 0.4.0 is unmaintained (indicatif dep). Pulled in transitively by
+    # hf-hub -> mistralrs. Only reachable under --features llm-fallback.
+    { id = "RUSTSEC-2025-0119", reason = "transitive via hf-hub -> indicatif; only under --features llm-fallback; no upstream fix" },
 ]
 
 [licenses]
@@ -40,6 +48,27 @@ allow = ["NCSA"]
 # here for the Mozilla CA certificate bundle. Only present under --features remote.
 name  = "webpki-root-certs"
 allow = ["CDLA-Permissive-2.0"]
+
+[[licenses.exceptions]]
+# Same CDLA-Permissive-2.0 bundle as webpki-root-certs; this is the legacy
+# crate name still pulled in via ureq/hf-hub under --features llm-fallback.
+name  = "webpki-roots"
+allow = ["CDLA-Permissive-2.0"]
+
+[[licenses.exceptions]]
+# 0BSD is OSI-approved and permissive (effectively public-domain equivalent).
+# Scoped per-crate rather than added globally. All three are transitive
+# through mistralrs under --features llm-fallback.
+name  = "doctest-file"
+allow = ["0BSD"]
+
+[[licenses.exceptions]]
+name  = "interprocess"
+allow = ["0BSD"]
+
+[[licenses.exceptions]]
+name  = "recvmsg"
+allow = ["0BSD"]
 
 [bans]
 multiple-versions = "warn"
