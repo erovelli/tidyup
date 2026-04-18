@@ -2800,13 +2800,17 @@ dependencies = [
  "async-trait",
  "calamine",
  "image",
+ "infer",
  "kamadak-exif",
  "lofty",
+ "mime_guess",
  "pdf-extract",
  "serde_json",
+ "tempfile",
  "tidyup-core",
  "tidyup-domain",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
