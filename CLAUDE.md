@@ -187,6 +187,18 @@ Both produce `ChangeProposal`s and `BundleProposal`s that flow through the same 
 - **Don't skip hooks** (`--no-verify`) or bypass `cargo xtask ci`.
 - **Don't commit without running `cargo xtask ci` locally first.**
 
+## Keep docs in sync
+
+Treat docs as part of the change. When a code change lands, update the affected doc(s) in the **same commit** — not as a follow-up, not "later."
+
+- **`MIGRATION.md`** is the sole roadmap. When a Phase item ships, tick the checkbox, update the port-tracking table (destination path + ☑ state), and add to "Key Decisions Made" if the work locked in a decision future work must respect. If scope moved between phases, move the item.
+- **`README.md`** makes user-facing claims (default behaviour, feature gates, CLI surface, privacy guarantees, supported modalities, install story). If a change alters any of those, update it. If the change is purely internal, leave it alone.
+- **`ARCHITECTURE.md`** — update when a crate boundary, seam, port trait, or layering rule changes. Not for implementation-only changes.
+- **`CLASSIFICATION.md`** — update when the tier cascade, default thresholds, rename cascade, or per-modality coverage changes.
+- **`CLAUDE.md`** — update when a change establishes a new invariant or "don't do this" rule future work must obey. It's guidance, not a spec; don't mirror implementation details.
+
+Rule of thumb: if someone reading a doc *today* would be misled by *yesterday's* code change, the doc is out of date. Don't wait to be asked.
+
 ## Reference docs in repo
 
 - `ARCHITECTURE.md` — layer diagram, seam rationale, crate boundary justifications.

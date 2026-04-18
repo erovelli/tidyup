@@ -26,7 +26,10 @@ use rusqlite::Connection;
 mod backups;
 mod changes;
 mod files;
+pub mod indexer;
 mod schema;
+
+pub use indexer::index_directory;
 
 /// Default storage backend. Cheaply cloneable — the connection is shared.
 #[derive(Clone, Debug)]
