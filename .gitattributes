@@ -1,0 +1,15 @@
+# Binary fixtures under tests/fixtures/ — keep byte-exact across platforms.
+# Git on Windows defaults to core.autocrlf=true, which will LF→CRLF-convert any
+# file it sniffs as "text". The PDF fixture in tidyup-extract has hardcoded
+# xref byte offsets and breaks at parse time if a single LF gets rewritten to
+# CRLF on Windows checkout. Force every binary fixture through as-is.
+*.pdf  binary
+*.xlsx binary
+*.jpg  binary
+*.jpeg binary
+*.png  binary
+*.mp3  binary
+*.wav  binary
+*.flac binary
+*.ogg  binary
+*.onnx binary
