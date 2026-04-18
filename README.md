@@ -8,6 +8,18 @@ Your files stay where they belong — with you.
 
 ---
 
+## Status: pre-alpha, not yet functional
+
+> **Warning — tidyup is under active construction and not yet usable as a tool.**
+>
+> The foundational layers (domain types, SQLite storage, BLAKE3 indexer, layered config) are in place. The classification pipeline, content extractors, and inference backends are being built out now. The CLI compiles and dispatches, but **no command yet runs end-to-end** — `tidyup migrate`, `tidyup scan`, and `tidyup rollback` are stubs.
+>
+> This repository is being developed in the open. What you see reflects the target design, not current capability. Everything below describes what tidyup is being built to do — check the [roadmap](#roadmap) for what actually works today.
+>
+> Until v0.1 ships, please do not point tidyup at files you care about.
+
+---
+
 ## Why this exists
 
 Most "smart" file organizers are thin wrappers around someone else's API. You hand them your tax returns, your medical bills, your draft manuscripts, your half-written love letters — and trust that a privacy policy somewhere protects you.
@@ -88,6 +100,40 @@ cargo build --release -p tidyup-cli --features remote
 ```
 
 Rust pinned to 1.90 via `rust-toolchain.toml`. The default-binary embedding model (~35 MB) is downloaded on first launch and cached under the platform data dir; subsequent runs are fully offline.
+
+---
+
+## Roadmap
+
+tidyup is being built in phases. Each phase lands an independently compilable slice of the hexagonal architecture. The CLI binary exists from Phase 0, but doesn't become end-to-end runnable until Phase 5.
+
+| Phase | Scope                                                                                       | Status         |
+| ----- | ------------------------------------------------------------------------------------------- | -------------- |
+| 0     | Workspace scaffold, port traits, CI, lints, `deny.toml`, `xtask`                            | [x] Complete   |
+| 1     | Domain types, SQLite storage, BLAKE3 indexer, layered config, `BundleProposal` aggregate    | [x] Complete   |
+| 2     | Content extractors: router + MIME detection, plain text, PDF, Excel, image, audio           | [~] In progress |
+| 3     | Inference: `bge-small-en-v1.5` via ONNX Runtime (default); optional LLM + remote backends   | [ ] Not started |
+| 4     | Pipeline: heuristics, bundle detection, scan + migration classifiers, rename cascade        | [ ] Not started |
+| 5     | CLI wiring, first-run model download, end-to-end flows, v0.1 ship                           | [ ] Not started |
+| 6+    | Multimodal encoders (image/audio/video), Dioxus UI, code signing, `brew`/`winget`, plugins  | [ ] Backlog    |
+
+**What currently works:**
+
+- `cargo build -p tidyup-cli` produces a binary with fully stubbed subcommands
+- `cargo xtask ci` is green: `fmt` + `clippy --all-features -D warnings` + workspace tests
+- SQLite storage: `FileIndex`, `ChangeLog`, `BackupStore` with bundle-atomic shelving
+- Layered TOML config with platform-aware paths
+- `tidyup-extract`: MIME detection + router + `PlainTextExtractor`
+
+**What does not yet work:**
+
+- Classification of any file (requires Phase 3 embeddings)
+- Move/rollback execution (requires Phase 4 pipeline + Phase 5 CLI wiring)
+- Bundle detection and atomic apply
+- Any content extraction for PDF, Excel, image, or audio files
+- Any LLM or remote inference (both feature-gated off and not yet implemented)
+
+The invariants the finished tool will uphold — human-in-the-loop review, reversible moves, bundle atomicity, no-network-by-default, extractive-only renames — are enforced in the design today, but the code paths that would violate them don't exist yet.
 
 ---
 
