@@ -111,7 +111,7 @@ tidyup is being built in phases. Each phase lands an independently compilable sl
 | ----- | ------------------------------------------------------------------------------------------- | -------------- |
 | 0     | Workspace scaffold, port traits, CI, lints, `deny.toml`, `xtask`                            | [x] Complete   |
 | 1     | Domain types, SQLite storage, BLAKE3 indexer, layered config, `BundleProposal` aggregate    | [x] Complete   |
-| 2     | Content extractors: router + MIME detection, plain text, PDF, Excel, image, audio           | [~] In progress |
+| 2     | Content extractors: router + MIME detection, plain text, PDF, Excel, image, audio           | [x] Complete   |
 | 3     | Inference: `bge-small-en-v1.5` via ONNX Runtime (default); optional LLM + remote backends   | [ ] Not started |
 | 4     | Pipeline: heuristics, bundle detection, scan + migration classifiers, rename cascade        | [ ] Not started |
 | 5     | CLI wiring, first-run model download, end-to-end flows, v0.1 ship                           | [ ] Not started |
@@ -123,14 +123,13 @@ tidyup is being built in phases. Each phase lands an independently compilable sl
 - `cargo xtask ci` is green: `fmt` + `clippy --all-features -D warnings` + workspace tests
 - SQLite storage: `FileIndex`, `ChangeLog`, `BackupStore` with bundle-atomic shelving
 - Layered TOML config with platform-aware paths
-- `tidyup-extract`: MIME detection + router + `PlainTextExtractor`
+- `tidyup-extract`: MIME detection + router + `PlainTextExtractor` + `PdfExtractor` + `ExcelExtractor` + `ImageExtractor` (dimensions + EXIF) + `AudioExtractor` (ID3/Vorbis tags), each behind its own cargo feature
 
 **What does not yet work:**
 
 - Classification of any file (requires Phase 3 embeddings)
 - Move/rollback execution (requires Phase 4 pipeline + Phase 5 CLI wiring)
 - Bundle detection and atomic apply
-- Any content extraction for PDF, Excel, image, or audio files
 - Any LLM or remote inference (both feature-gated off and not yet implemented)
 
 The invariants the finished tool will uphold — human-in-the-loop review, reversible moves, bundle atomicity, no-network-by-default, extractive-only renames — are enforced in the design today, but the code paths that would violate them don't exist yet.

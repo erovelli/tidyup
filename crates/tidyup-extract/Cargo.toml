@@ -31,11 +31,11 @@ infer         = { workspace = true }
 mime_guess    = { workspace = true }
 tracing       = { workspace = true }
 
-pdf-extract   = { version = "0.10", optional = true }
-calamine      = { version = "0.34", optional = true }
-image         = { version = "0.25", optional = true }
-kamadak-exif  = { version = "0.6", optional = true }
-lofty         = { version = "0.24", optional = true }
+pdf-extract   = { workspace = true, optional = true }
+calamine      = { workspace = true, optional = true }
+image         = { workspace = true, optional = true }
+kamadak-exif  = { workspace = true, optional = true }
+lofty         = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

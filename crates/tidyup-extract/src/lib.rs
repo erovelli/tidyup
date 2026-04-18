@@ -9,10 +9,10 @@
 //! # Feature flags
 //!
 //! - `text`  (default) — [`text::PlainTextExtractor`]
-//! - `pdf`            — `PdfExtractor` (future)
-//! - `image`          — `ImageExtractor` (future)
-//! - `excel`          — `ExcelExtractor` (future)
-//! - `audio`          — `AudioExtractor` (future)
+//! - `pdf`   (default) — [`pdf::PdfExtractor`]
+//! - `image` (default) — [`image::ImageExtractor`]
+//! - `excel`          — [`excel::ExcelExtractor`]
+//! - `audio`          — [`audio::AudioExtractor`]
 //!
 //! Binaries built with `--no-default-features` still compile; they just lack
 //! any extractor implementations and must register their own.
@@ -23,6 +23,16 @@ pub mod router;
 #[cfg(feature = "text")]
 pub mod text;
 
-pub use router::pick;
+#[cfg(feature = "pdf")]
+pub mod pdf;
 
-// TODO(Phase 2): PdfExtractor, ExcelExtractor, ImageExtractor, AudioExtractor.
+#[cfg(feature = "excel")]
+pub mod excel;
+
+#[cfg(feature = "image")]
+pub mod image;
+
+#[cfg(feature = "audio")]
+pub mod audio;
+
+pub use router::pick;
