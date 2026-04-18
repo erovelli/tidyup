@@ -12,19 +12,22 @@ rust-version.workspace = true
 readme      = "README.md"
 description = "Local inference backend via mistralrs. Runtime-detected accelerator."
 
+# Default = CPU via mistralrs defaults. Metal/CUDA forwarding is a post-v0.1
+# polish step — for now, users wanting a GPU build can pass
+# `-F tidyup-inference-mistralrs/metal` (etc.) through cargo.
 [features]
-default = ["cpu"]
-cpu   = []
-metal = []
-cuda  = []
-rocm  = []
+default = []
+metal = ["mistralrs/metal"]
+cuda  = ["mistralrs/cuda"]
 
 [dependencies]
 tidyup-core = { workspace = true }
 async-trait = { workspace = true }
 anyhow      = { workspace = true }
 tokio       = { workspace = true }
-# mistralrs = { git = "...", optional = true }   # TODO pin version + wire features
+tracing     = { workspace = true }
+mistralrs   = { workspace = true }
+image       = { workspace = true }
 
 [lints]
 workspace = true

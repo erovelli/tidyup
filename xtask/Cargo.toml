@@ -14,8 +14,12 @@ publish                = false
 description            = "Workspace automation — CI entrypoint, model downloads, release prep."
 
 [dependencies]
-anyhow = { workspace = true }
-clap   = { workspace = true }
+anyhow  = { workspace = true }
+clap    = { workspace = true }
+reqwest = { workspace = true, features = ["blocking", "stream"] }
+blake3  = { workspace = true }
+dirs    = { workspace = true }
+indicatif = { workspace = true }
 
 [lints]
 workspace = true

@@ -10,9 +10,29 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::{Path, PathBuf};
+#[cfg(all(
+    feature = "text",
+    feature = "pdf",
+    feature = "excel",
+    feature = "image",
+    feature = "audio"
+))]
 use std::sync::Arc;
 
+#[cfg(any(
+    feature = "pdf",
+    feature = "excel",
+    feature = "image",
+    feature = "audio"
+))]
 use tidyup_core::extractor::ContentExtractor;
+#[cfg(all(
+    feature = "text",
+    feature = "pdf",
+    feature = "excel",
+    feature = "image",
+    feature = "audio"
+))]
 use tidyup_extract::{mime, router::pick};
 
 fn fixture(name: &str) -> PathBuf {
