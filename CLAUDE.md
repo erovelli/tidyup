@@ -75,7 +75,7 @@ domain → core → { storage-sqlite, inference-*, embeddings-ort, extract } →
 - Minimize external deps. Every added crate must clear: widely used (first-party from a major maintainer, or ~100k+ monthly downloads), actively maintained, pure-Rust where feasible.
 - FFI to battle-tested C/C++ is acceptable only when no mature Rust-native alternative exists (none currently required — `mistralrs` via `candle` is pure Rust and preferred over `llama-cpp-2`).
 - Content hashing uses **BLAKE3**, not SHA-256. ~2–3× faster, cryptographically strong, maintained by the BLAKE3 team.
-- Network deps (`reqwest`, `hyper`, `rustls`) are banned outside the `remote` feature flag — enforced by `cargo-deny`.
+- Network deps (`reqwest`, `hyper`, `rustls`) are absent from the default build. They may enter under `--features remote` (direct use, by design) or `--features llm-fallback` (transitively through `hf-hub` for model download). Default-build verification lives in `cargo xtask ci`.
 - New direct deps MUST be added to `[workspace.dependencies]` in root `Cargo.toml` first; crates reference via `{ workspace = true }`. No per-crate version pins.
 - License policy (see `deny.toml`): Apache-2.0 / MIT / BSD / ISC / Unicode / Zlib / CC0 / MPL only. GPL-family fails CI.
 
@@ -93,7 +93,9 @@ Storage follows the same shape (`FileIndex`/`ChangeLog`/`BackupStore` are traits
 
 ## Privacy model — the load-bearing promise
 
-Default `cargo build -p tidyup-cli` produces a **network-silent, LLM-silent** binary. No HTTP client (no `reqwest`, `hyper`, `rustls`) AND no LLM inference (no `mistralrs`, `candle`, `hf-hub`, heavy tokenizer tree) — not linked, not present, not reachable. `cargo-deny` enforces both: network deps are banned outside the `remote` feature flag; LLM deps are banned outside the `llm-fallback` feature flag.
+Default `cargo build -p tidyup-cli` produces a **network-silent, LLM-silent** binary. No HTTP client (no `reqwest`, `hyper`, `rustls`) AND no LLM inference (no `mistralrs`, `candle`, `hf-hub`, heavy tokenizer tree) — not linked, not present, not reachable.
+
+Verification: `cargo tree -p tidyup-cli -e normal | grep -E 'reqwest|hyper|rustls|mistralrs|candle|hf-hub'` returns empty. This is a CI-checked invariant for the default binary — break it and CI fails.
 
 **Two symmetric power-user opt-in features**, each gated identically. The shape is the same; the bans are different.
 
@@ -106,6 +108,8 @@ Default `cargo build -p tidyup-cli` produces a **network-silent, LLM-silent** bi
 
 1. *Compile-time:* build with `--features llm-fallback` to include `tidyup-inference-mistralrs` in the dependency graph.
 2. *Runtime:* `[inference] llm_fallback = true` in config TOML, plus an explicit `--llm-fallback` flag or `TIDYUP_LLM_FALLBACK=1` env var per invocation.
+
+**Network surface of `--features llm-fallback`**: this feature transitively links `reqwest` through `hf-hub` (mistralrs's mandatory model-download dep). That network surface exists *only to fetch models from Hugging Face* — there is no classifier-time phone-home, no telemetry, no analytics. The default path (neither feature) remains fully network-silent. Treat "llm-fallback implies HTTP for model download" as a documented consequence, not a leak; users who want zero network code should not enable `--features llm-fallback`.
 
 First-run UX, onboarding, and default documentation never recommend either. The tool is designed to be excellent offline with **deterministic embedding classification** — `bge-small-en-v1.5` via ONNX Runtime handles Tier 2 on the default path (see `CLASSIFICATION.md`). LLM-fallback exists for cold-start cases (empty target hierarchy, pathological extraction failures); remote exists for users with a specific deployment need. Both are power-user features explicitly opted into at build + config + invocation.
 
@@ -191,8 +195,7 @@ Both produce `ChangeProposal`s and `BundleProposal`s that flow through the same 
 
 Treat docs as part of the change. When a code change lands, update the affected doc(s) in the **same commit** — not as a follow-up, not "later."
 
-- **`MIGRATION.md`** is the sole roadmap. When a Phase item ships, tick the checkbox, update the port-tracking table (destination path + ☑ state), and add to "Key Decisions Made" if the work locked in a decision future work must respect. If scope moved between phases, move the item.
-- **`README.md`** makes user-facing claims (default behaviour, feature gates, CLI surface, privacy guarantees, supported modalities, install story). If a change alters any of those, update it. If the change is purely internal, leave it alone.
+- **`README.md`** is the roadmap of record and also makes user-facing claims (default behaviour, feature gates, CLI surface, privacy guarantees, supported modalities, install story). When a Phase item ships, tick the checkbox in the roadmap table and update the "What currently works" / "What does not yet work" lists. When a change alters user-facing behaviour, update the relevant section. If the change is purely internal, leave it alone.
 - **`ARCHITECTURE.md`** — update when a crate boundary, seam, port trait, or layering rule changes. Not for implementation-only changes.
 - **`CLASSIFICATION.md`** — update when the tier cascade, default thresholds, rename cascade, or per-modality coverage changes.
 - **`CLAUDE.md`** — update when a change establishes a new invariant or "don't do this" rule future work must obey. It's guidance, not a spec; don't mirror implementation details.
@@ -203,7 +206,7 @@ Rule of thumb: if someone reading a doc *today* would be misled by *yesterday's*
 
 - `ARCHITECTURE.md` — layer diagram, seam rationale, crate boundary justifications.
 - `CLASSIFICATION.md` — three-tier cascade, embedding-default rationale, per-modality roadmap, rename extractive cascade.
-- `MIGRATION.md` — phase-by-phase roadmap, ship plan, key decisions log.
+- `README.md` — user-facing overview plus the phase-by-phase roadmap.
 - `CONTRIBUTING.md` — PR checklist, commit style.
 - `deny.toml` — license + source policy.
 - `SECURITY.md` — reporting policy.

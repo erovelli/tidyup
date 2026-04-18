@@ -46,7 +46,7 @@ One input, one output, same for every modality and every operation. That is the 
 
 v0.1 ships with **text classification only.** `bge-small-en-v1.5` is the default Tier 2 encoder. Images, audio, and video route through Tier 1 heuristics alone (extension, MIME, EXIF/ID3 metadata, container metadata) — they go to sensible places for the common cases but don't get content-aware scoring yet.
 
-Rationale: v0.1 is the ship-to-brew/winget milestone in `MIGRATION.md`. Each non-text encoder is a real ONNX bring-up (model acquisition, license audit, fixture corpus, integration tests) and each expands the dep and binary surface. Shipping text-only preserves CLI-first velocity, proves the spine on the dominant modality in typical messy directories, and keeps the first-run download small.
+Rationale: v0.1 is the ship-to-brew/winget milestone (see the roadmap in `README.md`). Each non-text encoder is a real ONNX bring-up (model acquisition, license audit, fixture corpus, integration tests) and each expands the dep and binary surface. Shipping text-only preserves CLI-first velocity, proves the spine on the dominant modality in typical messy directories, and keeps the first-run download small.
 
 | Modality | v0.1 handling | Post-v0.1 |
 |---|---|---|
@@ -188,7 +188,7 @@ Activation routes files with low Tier 2 confidence (or pathological extraction f
 
 - **Held-out corpus for calibration (v0.2).** Ship a synthetic fixture corpus? Calibrate on first run against a labelled sample? Defer until there's real-world feedback to mine (with user opt-in)?
 - **Multilingual support.** When to swap to `bge-m3` or `multilingual-e5`? Gate on binary-size impact vs observed demand.
-- **Image/audio encoders (post-v0.1).** SigLIP for image, CLAP for audio — each under its own phase in `MIGRATION.md`. Video keyframe extraction still hinges on the `ffmpeg-next` FFI vs metadata-only decision.
+- **Image/audio encoders (post-v0.1).** SigLIP for image, CLAP for audio — each tracked as a Phase 6 item in the `README.md` roadmap. Video keyframe extraction still hinges on the `ffmpeg-next` FFI vs metadata-only decision.
 - **Cold-start UX mitigation.** Does tidyup detect "target hierarchy has no files yet" and advise the user about `--features llm-fallback`, or silently surface all proposals to review with low confidence? A `--bootstrap` mode that seeds profiles from folder-name embeddings only?
 - **Inline-YAKE maintenance.** ~150 LoC of keyword extraction inline is cheap but adds a small maintenance item. Acceptable until a mainstream crate crosses the DL threshold.
 
@@ -196,5 +196,5 @@ Activation routes files with low Tier 2 confidence (or pathological extraction f
 
 - `ARCHITECTURE.md` — crate graph, port traits, privacy model, bundle atomicity.
 - `CLAUDE.md` — coding standards, invariants, dependency policy, rename policy, safety model.
-- `MIGRATION.md` — roadmap entries, feature flag structure, phase-by-phase ship plan.
+- `README.md` — roadmap entries, feature flag structure, phase-by-phase ship plan.
 - `crates/tidyup-domain/src/migration.rs` — `ClassifierConfig`, `ScoreWeights`, `FolderProfile`, `OrganizationType`.

@@ -25,6 +25,20 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  check-privacy:
+    name: check-privacy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run -p xtask -- check-privacy
+
+  # Layered clippy matrix, mirroring `cargo xtask ci`. We can't use
+  # `--all-features` workspace-wide because the cli exposes `llm-metal` /
+  # `llm-cuda` accelerator pass-throughs that require platform-specific
+  # toolchains (Metal on macOS, `nvcc`/`cudarc` for CUDA) and so can't
+  # compile on every CI host.
   clippy:
     name: clippy
     runs-on: ubuntu-latest
@@ -34,8 +48,11 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy -p tidyup-cli --all-targets --features llm-fallback,remote -- -D warnings
+      - run: cargo clippy -p tidyup-extract --all-targets --all-features -- -D warnings
 
+  # Layered test matrix, mirroring `cargo xtask ci`.
   test:
     name: test ${{ matrix.os }} / ${{ matrix.rust }}
     runs-on: ${{ matrix.os }}
@@ -53,7 +70,9 @@ jobs:
         with:
           toolchain: ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --all-features
+      - run: cargo test --workspace
+      - run: cargo test -p tidyup-cli --features llm-fallback,remote
+      - run: cargo test -p tidyup-extract --all-features
 
   deny:
     name: cargo-deny
@@ -62,6 +81,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
 
+  # `metal`, `cuda`, `llm-metal`, `llm-cuda` are excluded for the same
+  # platform-specific-toolchain reason above.
   feature-matrix:
     name: cargo-hack
     runs-on: ubuntu-latest
@@ -70,4 +91,4 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@cargo-hack
       - uses: Swatinem/rust-cache@v2
-      - run: cargo hack --feature-powerset --exclude-features default check --workspace
+      - run: cargo hack --feature-powerset --exclude-features default,metal,cuda,llm-metal,llm-cuda check --workspace

@@ -16,16 +16,35 @@ description = "Headless CLI for tidyup — on-device AI file organizer."
 name = "tidyup"
 path = "src/main.rs"
 
+[features]
+# Default build is network-silent and LLM-silent by construction: neither
+# `tidyup-inference-mistralrs` nor `tidyup-inference-remote` is in the
+# dependency graph. Both are power-user opt-ins with identical shape — see
+# `CLAUDE.md` privacy model.
+default = []
+llm-fallback = ["dep:tidyup-inference-mistralrs"]
+remote       = ["dep:tidyup-inference-remote"]
+
+# Accelerator pass-through for the llm-fallback backend. Each implies
+# `llm-fallback` so users can spell either `--features llm-fallback` (CPU)
+# or `--features llm-metal` (Metal) without needing the longer
+# `--features llm-fallback,tidyup-inference-mistralrs/metal` form.
+llm-metal = ["llm-fallback", "tidyup-inference-mistralrs/metal"]
+llm-cuda  = ["llm-fallback", "tidyup-inference-mistralrs/cuda"]
+
 [dependencies]
-tidyup-domain                = { workspace = true }
-tidyup-core                  = { workspace = true }
-tidyup-app                   = { workspace = true }
-tidyup-pipeline              = { workspace = true }
-tidyup-storage-sqlite        = { workspace = true }
-tidyup-extract               = { workspace = true }
-tidyup-embeddings-ort        = { workspace = true }
-tidyup-inference-mistralrs   = { workspace = true }
-tidyup-inference-remote      = { workspace = true }
+tidyup-domain         = { workspace = true }
+tidyup-core           = { workspace = true }
+tidyup-app            = { workspace = true }
+tidyup-pipeline       = { workspace = true }
+tidyup-storage-sqlite = { workspace = true }
+tidyup-extract        = { workspace = true }
+tidyup-embeddings-ort = { workspace = true }
+
+# Feature-gated. MUST NOT be listed in workspace defaults or in any dep of a
+# crate that is unconditionally depended on by `tidyup-cli`.
+tidyup-inference-mistralrs = { workspace = true, optional = true }
+tidyup-inference-remote    = { workspace = true, optional = true }
 
 clap         = { workspace = true }
 indicatif    = { workspace = true }

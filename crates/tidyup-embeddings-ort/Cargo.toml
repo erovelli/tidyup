@@ -13,12 +13,24 @@ readme      = "README.md"
 description = "ONNX Runtime embedding backend (bge-small-en-v1.5 default)."
 
 [dependencies]
-tidyup-core = { workspace = true }
-async-trait = { workspace = true }
-anyhow      = { workspace = true }
-tokio       = { workspace = true }
-# ort        = "2"
-# tokenizers = "0.20"
+tidyup-core   = { workspace = true }
+tidyup-domain = { workspace = true }
+async-trait   = { workspace = true }
+anyhow        = { workspace = true }
+thiserror     = { workspace = true }
+tokio         = { workspace = true }
+tracing       = { workspace = true }
+serde         = { workspace = true }
+serde_json    = { workspace = true }
+blake3        = { workspace = true }
+dirs          = { workspace = true }
+ort           = { workspace = true }
+tokenizers    = { workspace = true }
+ndarray       = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio    = { workspace = true, features = ["rt", "macros"] }
 
 [lints]
 workspace = true

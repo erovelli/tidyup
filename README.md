@@ -63,8 +63,8 @@ Two modes:
 
 | Guarantee             | How it's enforced                                                                                     |
 | --------------------- | ----------------------------------------------------------------------------------------------------- |
-| No network inference (default) | Default binary is built without `tidyup-inference-remote`. No HTTP client, no `reqwest`/`hyper`/`rustls` linked. `cargo-deny` bans network deps outside the `remote` feature. |
-| No LLM inference (default) | Default binary is built without `tidyup-inference-mistralrs`. No `mistralrs`/`candle`/`hf-hub`/heavy tokenizer tree linked. `cargo-deny` bans these deps outside the `llm-fallback` feature. Classification is deterministic embedding similarity only. |
+| No network inference (default) | Default binary is built without `tidyup-inference-remote`. No HTTP client, no `reqwest`/`hyper`/`rustls` linked. Verified in CI by `cargo tree -p tidyup-cli -e normal` on the default feature set. |
+| No LLM inference (default) | Default binary is built without `tidyup-inference-mistralrs`. No `mistralrs`/`candle`/`hf-hub`/heavy tokenizer tree linked. Classification is deterministic embedding similarity only. `--features llm-fallback` additionally links `reqwest` transitively via `hf-hub` (needed for one-shot model download); there is no classifier-time phone-home. |
 | No telemetry          | No analytics crate in `Cargo.toml`. CI check blocks additions.                                        |
 | No background uploads | App has no cloud sync feature, by design.                                                             |
 | Local-only storage    | SQLite DB + config + backups all under platform data dir.                                             |
@@ -91,15 +91,15 @@ cargo run   --release -p tidyup-cli -- --help
 cargo build --release -p tidyup-cli --features llm-fallback
 
 # With hardware acceleration for the optional LLM fallback
-cargo build --release -p tidyup-cli --features "llm-fallback metal"   # macOS
-cargo build --release -p tidyup-cli --features "llm-fallback cuda"    # NVIDIA
+cargo build --release -p tidyup-cli --features llm-metal   # macOS
+cargo build --release -p tidyup-cli --features llm-cuda    # NVIDIA
 
 # Power user: include the optional remote inference backend.
 # Enables HTTP client deps (reqwest, rustls). Still requires runtime config + --remote flag.
 cargo build --release -p tidyup-cli --features remote
 ```
 
-Rust pinned to 1.90 via `rust-toolchain.toml`. The default-binary embedding model (~35 MB) is downloaded on first launch and cached under the platform data dir; subsequent runs are fully offline.
+Rust pinned to 1.90 via `rust-toolchain.toml`. The default-binary embedding model (~35 MB) is fetched out-of-band by `cargo xtask download-models` — the release binary itself has no HTTP client and cannot download anything. Packagers are expected to bundle the model alongside the binary; developers run the xtask once. Model cache: `dirs::cache_dir()/tidyup/models/` (overridable via `TIDYUP_MODEL_CACHE`).
 
 ---
 
@@ -112,7 +112,7 @@ tidyup is being built in phases. Each phase lands an independently compilable sl
 | 0     | Workspace scaffold, port traits, CI, lints, `deny.toml`, `xtask`                            | [x] Complete   |
 | 1     | Domain types, SQLite storage, BLAKE3 indexer, layered config, `BundleProposal` aggregate    | [x] Complete   |
 | 2     | Content extractors: router + MIME detection, plain text, PDF, Excel, image, audio           | [x] Complete   |
-| 3     | Inference: `bge-small-en-v1.5` via ONNX Runtime (default); optional LLM + remote backends   | [ ] Not started |
+| 3     | Inference: `bge-small-en-v1.5` via ONNX Runtime (default); optional LLM + remote backends   | [x] Complete   |
 | 4     | Pipeline: heuristics, bundle detection, scan + migration classifiers, rename cascade        | [ ] Not started |
 | 5     | CLI wiring, first-run model download, end-to-end flows, v0.1 ship                           | [ ] Not started |
 | 6+    | Multimodal encoders (image/audio/video), Dioxus UI, code signing, `brew`/`winget`, plugins  | [ ] Backlog    |
@@ -120,17 +120,20 @@ tidyup is being built in phases. Each phase lands an independently compilable sl
 **What currently works:**
 
 - `cargo build -p tidyup-cli` produces a binary with fully stubbed subcommands
-- `cargo xtask ci` is green: `fmt` + `clippy --all-features -D warnings` + workspace tests
+- `cargo xtask ci` is green: privacy check + `fmt` + `clippy --all-features -D warnings` + workspace tests
+- `cargo xtask check-privacy` asserts the default dep graph contains no `reqwest`/`hyper`/`rustls`/`mistralrs`/`candle-core`/`hf-hub`
 - SQLite storage: `FileIndex`, `ChangeLog`, `BackupStore` with bundle-atomic shelving
 - Layered TOML config with platform-aware paths
 - `tidyup-extract`: MIME detection + router + `PlainTextExtractor` + `PdfExtractor` + `ExcelExtractor` + `ImageExtractor` (dimensions + EXIF) + `AudioExtractor` (ID3/Vorbis tags), each behind its own cargo feature
+- `tidyup-embeddings-ort`: `bge-small-en-v1.5` ONNX classifier, taxonomy cache (BLAKE3-invalidated), inline YAKE, model-install verifier
+- `tidyup-inference-mistralrs` (opt-in `--features llm-fallback`): `TextBackend` + lazy `VisionBackend` via `mistralrs`; Metal/CUDA pass-through features
+- `tidyup-inference-remote` (opt-in `--features remote`): `TextBackend` over OpenAI-compatible, Anthropic, and Ollama endpoints
 
 **What does not yet work:**
 
-- Classification of any file (requires Phase 3 embeddings)
 - Move/rollback execution (requires Phase 4 pipeline + Phase 5 CLI wiring)
 - Bundle detection and atomic apply
-- Any LLM or remote inference (both feature-gated off and not yet implemented)
+- End-to-end classification flow (ports are built; pipeline wiring is Phase 4)
 
 The invariants the finished tool will uphold — human-in-the-loop review, reversible moves, bundle atomicity, no-network-by-default, extractive-only renames — are enforced in the design today, but the code paths that would violate them don't exist yet.
 

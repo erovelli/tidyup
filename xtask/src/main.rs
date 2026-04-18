@@ -3,6 +3,9 @@
 //! Replaces ad-hoc shell scripts. Keeps the build story portable across Linux,
 //! macOS, and Windows with no bash dependency.
 
+mod models;
+mod privacy;
+
 use std::process::{Command, ExitCode};
 
 use anyhow::{bail, Context, Result};
@@ -27,6 +30,20 @@ enum Task {
     Deny,
     /// Run `cargo hack --feature-powerset check` to catch feature breakage.
     FeatureMatrix,
+    /// Download the default embedding model into the platform cache directory.
+    ///
+    /// Used by packagers and developers. The default tidyup CLI binary is
+    /// network-silent by design (see `CLAUDE.md`) — this xtask is the
+    /// sanctioned one-shot installer.
+    DownloadModels {
+        /// Overwrite existing files if they are present.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Assert the default `tidyup-cli` dep graph contains no network or LLM
+    /// deps. Runs `cargo tree -p tidyup-cli -e normal` and fails if any
+    /// banned crate appears. Embedded in `ci`.
+    CheckPrivacy,
 }
 
 fn main() -> ExitCode {
@@ -43,33 +60,75 @@ impl Task {
     fn run(self) -> Result<()> {
         match self {
             Self::Ci => {
+                privacy::check()?;
                 sh(&["fmt", "--all", "--", "--check"])?;
-                sh(&[
-                    "clippy",
-                    "--workspace",
-                    "--all-targets",
-                    "--all-features",
-                    "--",
-                    "-D",
-                    "warnings",
-                ])?;
-                sh(&["test", "--workspace", "--all-features"])?;
+                run_ci_lints()?;
+                run_ci_tests()?;
                 Ok(())
             }
             Self::Fmt => sh(&["fmt", "--all"]),
-            Self::Lint => sh(&[
-                "clippy",
-                "--workspace",
-                "--all-targets",
-                "--all-features",
-                "--",
-                "-D",
-                "warnings",
-            ]),
+            Self::Lint => run_ci_lints(),
             Self::Deny => ext("cargo-deny", &["check"]),
             Self::FeatureMatrix => ext("cargo-hack", &["hack", "--feature-powerset", "check"]),
+            Self::DownloadModels { force } => models::download(force),
+            Self::CheckPrivacy => privacy::check(),
         }
     }
+}
+
+/// Feature combinations exercised by `cargo xtask ci`.
+///
+/// `--all-features` isn't usable workspace-wide because the cli exposes
+/// `llm-metal` / `llm-cuda` accelerator pass-throughs that require
+/// platform-specific toolchains (Metal on macOS, `nvcc`/`cudarc` for CUDA).
+/// Neither can succeed on every CI host, so we run a layered matrix instead:
+/// workspace-default for regression coverage, cli with the two opt-in inference
+/// features, and extract with all format features. Accelerator passthroughs
+/// remain available to end users via `cargo build --features llm-metal`.
+fn run_ci_lints() -> Result<()> {
+    sh(&[
+        "clippy",
+        "--workspace",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings",
+    ])?;
+    sh(&[
+        "clippy",
+        "-p",
+        "tidyup-cli",
+        "--all-targets",
+        "--features",
+        "llm-fallback,remote",
+        "--",
+        "-D",
+        "warnings",
+    ])?;
+    sh(&[
+        "clippy",
+        "-p",
+        "tidyup-extract",
+        "--all-targets",
+        "--all-features",
+        "--",
+        "-D",
+        "warnings",
+    ])?;
+    Ok(())
+}
+
+fn run_ci_tests() -> Result<()> {
+    sh(&["test", "--workspace"])?;
+    sh(&[
+        "test",
+        "-p",
+        "tidyup-cli",
+        "--features",
+        "llm-fallback,remote",
+    ])?;
+    sh(&["test", "-p", "tidyup-extract", "--all-features"])?;
+    Ok(())
 }
 
 fn sh(args: &[&str]) -> Result<()> {

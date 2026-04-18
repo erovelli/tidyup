@@ -6,6 +6,7 @@
 //! - [`scanner`]   — target tree walk + `OrganizationType` detection.
 //! - [`heuristics`] — Tier 1 MIME + keyword + date patterns.
 //! - [`naming`]    — filename sanitization + rendering from proposals.
+//! - [`yake`]      — inlined keyword extraction for the rename cascade.
 
 pub mod heuristics;
 pub mod migration;
@@ -13,3 +14,4 @@ pub mod naming;
 pub mod profiler;
 pub mod scan;
 pub mod scanner;
+pub mod yake;
