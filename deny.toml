@@ -4,9 +4,14 @@
 all-features = false
 
 [advisories]
-version        = 2
-ignore         = []
-yanked         = "deny"
+version = 2
+yanked  = "deny"
+ignore  = [
+    # paste 1.0.15 is unmaintained (archived by dtolnay). Pulled in transitively
+    # by lofty 0.24 and rav1e 0.8 (via ravif -> image). No safe upgrade available.
+    # Revisit when upstream migrates to pastey or equivalent.
+    { id = "RUSTSEC-2024-0436", reason = "transitive via lofty + rav1e; no upstream fix available" },
+]
 
 [licenses]
 version = 2
@@ -17,13 +22,24 @@ allow = [
     "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
-    "Unicode-DFS-2016",
     "Unicode-3.0",
     "Zlib",
     "CC0-1.0",
     "MPL-2.0",
 ]
 confidence-threshold = 0.93
+
+# Scoped exceptions — narrower than adding to the global allow list.
+[[licenses.exceptions]]
+# NCSA is OSI-approved + FSF Free. libfuzzer-sys is a build-only dep of rav1e.
+name  = "libfuzzer-sys"
+allow = ["NCSA"]
+
+[[licenses.exceptions]]
+# CDLA-Permissive-2.0 is the Linux Foundation's standard data license, used
+# here for the Mozilla CA certificate bundle. Only present under --features remote.
+name  = "webpki-root-certs"
+allow = ["CDLA-Permissive-2.0"]
 
 [bans]
 multiple-versions = "warn"
