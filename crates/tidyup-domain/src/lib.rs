@@ -13,6 +13,7 @@ pub mod bundle;
 pub mod change;
 pub mod file;
 pub mod migration;
+pub mod run;
 
 pub use backup::{BackupRecord, BackupStatus};
 pub use bundle::{BundleError, BundleKind, BundleProposal};
@@ -24,6 +25,7 @@ pub use migration::{
     PlanStats, ProfileCache, ProposedMove, RenameConfig, RunStatus, ScanDiff, ScoreBreakdown,
     ScoreWeights, TargetScan, Tier,
 };
+pub use run::{RunMode, RunRecord, RunState};
 
 /// Phases emitted to frontends during a run. Drives the single progress contract
 /// shared between CLI (`indicatif`) and UI (Dioxus signals).

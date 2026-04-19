@@ -2,48 +2,291 @@
 //! and either an `AutoApproveHandler` or `InteractiveHandler`, then calls the
 //! matching application service.
 
+use anyhow::{Context, Result};
+use tidyup_app::config;
+use tidyup_app::{
+    migration::MigrationRequest, scan::ScanRequest, MigrationService, RollbackService, ScanService,
+};
+
+use crate::context::{build, build_default_scan_candidates, describe_data_dir};
 use crate::reporter::CliReporter;
 use crate::review::{AutoApproveHandler, InteractiveHandler};
 use crate::{Cli, Command};
 
-pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
-    let _config = tidyup_app::config::load()?;
+/// Confidence threshold for auto-approving loose proposals when the user
+/// passes `--yes`. Tuned to bias toward safe auto-application of Tier-1
+/// matches while surfacing Tier-2 ambiguity to review in interactive mode.
+const YES_MIN_CONFIDENCE: f32 = 0.75;
+/// Confidence threshold for auto-applying bundles under `--yes`.
+const YES_BUNDLE_MIN_CONFIDENCE: f32 = 0.85;
 
-    // TODO: build ServiceContext via backend registry:
-    //   - pick TextBackend per config.inference.backends order
-    //   - construct storage (sqlite), embeddings (ort), extractors
-    // let ctx = Arc::new(tidyup_app::ServiceContext { ... });
-
-    let reporter = CliReporter { json: cli.json };
-    let _reviewer: Box<dyn tidyup_core::ReviewHandler> = if cli.yes {
-        Box::new(AutoApproveHandler {
-            min_confidence: 0.66,
-        })
-    } else {
-        Box::new(InteractiveHandler)
-    };
-
+pub(crate) async fn dispatch(cli: Cli) -> Result<()> {
+    let cfg = config::load().context("loading tidyup config")?;
+    let yes = cli.yes;
+    let json = cli.json;
     match cli.command {
         Command::Migrate {
             source,
             target,
             dry_run,
-        } => {
-            // let svc = MigrationService::new(ctx);
-            // svc.run(MigrationRequest { source, target, dry_run }, &reporter, &*reviewer).await?;
-            let _ = (source, target, dry_run, &reporter);
-        }
+        } => run_migrate(yes, json, &cfg, source, target, dry_run).await,
         Command::Scan {
             root,
             taxonomy,
             dry_run,
-        } => {
-            let _ = (root, taxonomy, dry_run);
+        } => run_scan(yes, json, &cfg, root, taxonomy, dry_run).await,
+        Command::Rollback { run_id, list } => {
+            if list {
+                run_list_runs(json, &cfg).await
+            } else if let Some(id) = run_id {
+                run_rollback(json, &cfg, id).await
+            } else {
+                anyhow::bail!("rollback requires a run ID (or pass --list)")
+            }
         }
-        Command::Rollback { run_id } => {
-            let _ = run_id;
-        }
-        Command::Config => {}
+        Command::Config => run_config(&cfg),
+    }
+}
+
+async fn run_migrate(
+    yes: bool,
+    json: bool,
+    cfg: &config::TidyupConfig,
+    source: std::path::PathBuf,
+    target: std::path::PathBuf,
+    dry_run: bool,
+) -> Result<()> {
+    let ctx = build(cfg, true).await?;
+    let reporter = CliReporter::new(json);
+    let reviewer = reviewer_for(yes);
+
+    let service = MigrationService::new(ctx);
+    let report = service
+        .run(
+            MigrationRequest {
+                source,
+                target,
+                dry_run,
+                auto_approve_bundles: yes,
+                bundle_min_confidence: YES_BUNDLE_MIN_CONFIDENCE,
+            },
+            &reporter,
+            reviewer.as_ref(),
+        )
+        .await?;
+
+    emit_summary(
+        json,
+        "migrate",
+        report.run_id,
+        report.proposed,
+        report.bundles,
+        report.unclassified,
+        report.approved,
+        report.applied,
+        report.skipped,
+        report.failed,
+        report.bundles_applied,
+        report.bundles_skipped,
+        report.bundles_failed,
+        dry_run,
+    );
+    Ok(())
+}
+
+async fn run_scan(
+    yes: bool,
+    json: bool,
+    cfg: &config::TidyupConfig,
+    root: std::path::PathBuf,
+    taxonomy: Option<std::path::PathBuf>,
+    dry_run: bool,
+) -> Result<()> {
+    let ctx = build(cfg, true).await?;
+    let reporter = CliReporter::new(json);
+    let reviewer = reviewer_for(yes);
+
+    let candidates = build_default_scan_candidates(ctx.embeddings.as_ref()).await?;
+
+    let service = ScanService::new(ctx);
+    let report = service
+        .run(
+            ScanRequest {
+                root,
+                taxonomy_path: taxonomy,
+                dry_run,
+                auto_approve_bundles: yes,
+                bundle_min_confidence: YES_BUNDLE_MIN_CONFIDENCE,
+            },
+            &candidates,
+            &reporter,
+            reviewer.as_ref(),
+        )
+        .await?;
+
+    emit_summary(
+        json,
+        "scan",
+        report.run_id,
+        report.proposed,
+        report.bundles,
+        report.unclassified,
+        report.approved,
+        report.applied,
+        report.skipped,
+        report.failed,
+        report.bundles_applied,
+        report.bundles_skipped,
+        report.bundles_failed,
+        dry_run,
+    );
+    Ok(())
+}
+
+async fn run_list_runs(json: bool, cfg: &config::TidyupConfig) -> Result<()> {
+    let ctx = build(cfg, false).await?;
+    let service = RollbackService::new(ctx);
+    let runs = service.list_runs().await?;
+
+    if json {
+        let rows: Vec<_> = runs
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "run_id": r.id,
+                    "mode": r.mode.as_str(),
+                    "state": r.state.as_str(),
+                    "source_root": r.source_root,
+                    "target_root": r.target_root,
+                    "started_at": r.started_at,
+                    "completed_at": r.completed_at,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::json!({"event": "runs", "runs": rows}));
+        return Ok(());
+    }
+
+    if runs.is_empty() {
+        println!("No recorded runs.");
+        return Ok(());
+    }
+    println!("Recorded runs (most recent first):");
+    for r in &runs {
+        let target = r
+            .target_root
+            .as_ref()
+            .map(|p| format!(" -> {}", p.display()))
+            .unwrap_or_default();
+        println!(
+            "  {}  {:<8}  {:<12}  {}{}",
+            r.id,
+            r.mode.as_str(),
+            r.state.as_str(),
+            r.source_root.display(),
+            target,
+        );
     }
     Ok(())
+}
+
+async fn run_rollback(json: bool, cfg: &config::TidyupConfig, run_id: uuid::Uuid) -> Result<()> {
+    let ctx = build(cfg, false).await?;
+    let reporter = CliReporter::new(json);
+    let service = RollbackService::new(ctx);
+    let report = service.rollback_run(run_id, &reporter).await?;
+
+    if json {
+        let v = serde_json::json!({
+            "event": "rollback_summary",
+            "run_id": report.run_id,
+            "restored": report.restored,
+            "bundles_restored": report.bundles_restored,
+            "failures": report.failures,
+        });
+        println!("{v}");
+    } else {
+        println!(
+            "Rollback {}: restored {} loose change(s), {} bundle(s); {} failure(s).",
+            report.run_id, report.restored, report.bundles_restored, report.failures,
+        );
+    }
+    Ok(())
+}
+
+fn run_config(cfg: &config::TidyupConfig) -> Result<()> {
+    let data = describe_data_dir(cfg).unwrap_or_else(|| "<unresolved>".into());
+    let config_path = config::platform_config_path()
+        .map_or_else(|_| "<unresolved>".into(), |p| p.display().to_string());
+    println!("tidyup config");
+    println!("  config file: {config_path}");
+    println!("  data dir:    {data}");
+    println!();
+    let toml_text =
+        toml::to_string_pretty(cfg).context("serialising config to TOML for display")?;
+    print!("{toml_text}");
+    Ok(())
+}
+
+fn reviewer_for(yes: bool) -> Box<dyn tidyup_core::ReviewHandler> {
+    if yes {
+        Box::new(AutoApproveHandler {
+            min_confidence: YES_MIN_CONFIDENCE,
+        })
+    } else {
+        Box::new(InteractiveHandler)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_summary(
+    json: bool,
+    mode: &str,
+    run_id: uuid::Uuid,
+    proposed: usize,
+    bundles: usize,
+    unclassified: usize,
+    approved: usize,
+    applied: usize,
+    skipped: usize,
+    failed: usize,
+    bundles_applied: usize,
+    bundles_skipped: usize,
+    bundles_failed: usize,
+    dry_run: bool,
+) {
+    if json {
+        let v = serde_json::json!({
+            "event": format!("{mode}_summary"),
+            "run_id": run_id,
+            "dry_run": dry_run,
+            "proposed": proposed,
+            "bundles": bundles,
+            "unclassified": unclassified,
+            "approved": approved,
+            "applied": applied,
+            "skipped": skipped,
+            "failed": failed,
+            "bundles_applied": bundles_applied,
+            "bundles_skipped": bundles_skipped,
+            "bundles_failed": bundles_failed,
+        });
+        println!("{v}");
+        return;
+    }
+    let tag = if dry_run { " [dry-run]" } else { "" };
+    println!();
+    println!("{mode} complete{tag} (run {run_id}):");
+    println!(
+        "  proposals: {proposed} (approved {approved}, applied {applied}, skipped {skipped}, failed {failed})"
+    );
+    println!(
+        "  bundles:   {bundles} (applied {bundles_applied}, skipped {bundles_skipped}, failed {bundles_failed})"
+    );
+    if unclassified > 0 {
+        println!("  unclassified: {unclassified}");
+    }
+    if applied > 0 {
+        println!("Undo with: tidyup rollback {run_id}");
+    }
 }

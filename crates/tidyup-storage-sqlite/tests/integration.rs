@@ -106,7 +106,7 @@ async fn record_bundle_persists_members_and_filters_from_pending() {
     let store = new_store(&dir);
 
     let loose = sample_proposal("/src/loose.pdf", "/docs/loose.pdf", None);
-    store.record_proposal(&loose).await.unwrap();
+    store.record_proposal(&loose, None).await.unwrap();
 
     let bundle = BundleProposal::new(
         PathBuf::from("/src/proj"),
@@ -121,7 +121,7 @@ async fn record_bundle_persists_members_and_filters_from_pending() {
     )
     .unwrap();
     let bundle_id = bundle.id;
-    store.record_bundle(&bundle).await.unwrap();
+    store.record_bundle(&bundle, None).await.unwrap();
 
     let pending_loose = store.pending().await.unwrap();
     assert_eq!(
@@ -150,7 +150,7 @@ async fn record_bundle_rejects_bundle_member_via_record_proposal() {
 
     let mut p = sample_proposal("/a", "/b", None);
     p.bundle_id = Some(Uuid::new_v4());
-    let err = store.record_proposal(&p).await.unwrap_err();
+    let err = store.record_proposal(&p, None).await.unwrap_err();
     assert!(err.to_string().contains("record_bundle"), "actual: {err}");
 }
 
@@ -172,7 +172,7 @@ async fn mark_bundle_applied_flips_bundle_and_members() {
     )
     .unwrap();
     let bundle_id = bundle.id;
-    store.record_bundle(&bundle).await.unwrap();
+    store.record_bundle(&bundle, None).await.unwrap();
 
     store.mark_bundle_applied(bundle_id).await.unwrap();
 
@@ -200,7 +200,7 @@ async fn bundle_kind_with_pattern_roundtrips_through_sql() {
         "monthly invoice series".to_string(),
     )
     .unwrap();
-    store.record_bundle(&bundle).await.unwrap();
+    store.record_bundle(&bundle, None).await.unwrap();
 
     let got = store.pending_bundles().await.unwrap();
     assert_eq!(got.len(), 1);
@@ -303,7 +303,7 @@ async fn file_fk_cascade_on_bundle_delete() {
     )
     .unwrap();
     let bundle_id = bundle.id;
-    store.record_bundle(&bundle).await.unwrap();
+    store.record_bundle(&bundle, None).await.unwrap();
 
     // Confirm one member exists.
     let before = store.pending_bundles().await.unwrap();

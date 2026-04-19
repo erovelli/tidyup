@@ -4,21 +4,29 @@
 //! an existing folder *hierarchy*. Both produce `ChangeProposal`s that use the same
 //! review flow.
 //!
-//! # Phase 4 scope
+//! # Flow
 //!
-//! This service produces and persists proposals. The **apply** step (shelving
-//! originals + executing filesystem moves) is Phase 5 and is intentionally absent
-//! — the service ends the flow at review. That keeps the privacy / safety surface
-//! smaller while the pipeline stabilises.
+//! 1. Produce proposals via [`tidyup_pipeline::scan::run_scan`].
+//! 2. Persist proposals + bundles to the change log, tagged with a fresh `run_id`.
+//! 3. Review loose proposals via the supplied [`ReviewHandler`].
+//! 4. Apply approved loose proposals via the [`crate::executor`] (shelve → move →
+//!    mark applied).
+//! 5. Auto-apply bundles iff `--yes` + confidence threshold; otherwise leave them
+//!    pending with a message (bundle review UX is Phase 6+).
 
 use std::path::Path;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use tidyup_core::frontend::Level;
 use tidyup_core::{ProgressReporter, Result, ReviewHandler};
+use tidyup_domain::{RunMode, RunRecord, RunState};
 use tidyup_pipeline::scan::{run_scan, ScanCandidate};
 use uuid::Uuid;
 
+use crate::executor::{
+    apply_bundles, apply_loose_decisions, select_auto_applied_bundles, ApplyReport, ExecutorDeps,
+};
 use crate::ServiceContext;
 
 #[allow(missing_debug_implementations)]
@@ -31,6 +39,18 @@ pub struct ScanRequest {
     pub root: std::path::PathBuf,
     pub taxonomy_path: Option<std::path::PathBuf>,
     pub dry_run: bool,
+    /// When true, auto-apply bundles whose confidence clears
+    /// `bundle_min_confidence`. Required for bundles to apply in v0.1 (no
+    /// interactive bundle review yet). Set by the CLI only if `--yes` is passed.
+    #[serde(default)]
+    pub auto_approve_bundles: bool,
+    /// Lower bound on confidence for auto-applied bundles.
+    #[serde(default = "default_bundle_confidence")]
+    pub bundle_min_confidence: f32,
+}
+
+const fn default_bundle_confidence() -> f32 {
+    0.85
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,10 +61,20 @@ pub struct ScanReport {
     pub bundles: usize,
     /// Files the cascade couldn't classify.
     pub unclassified: usize,
-    /// Loose proposals the user approved in review. (Apply is Phase 5 — so
-    /// `applied == 0` until then.)
+    /// Loose proposals the user approved in review.
     pub approved: usize,
+    /// Loose proposals successfully moved (post-review + shelve).
     pub applied: usize,
+    /// Loose proposals skipped (reject, not approved).
+    pub skipped: usize,
+    /// Loose proposals whose move failed after approval.
+    pub failed: usize,
+    /// Bundles successfully moved atomically.
+    pub bundles_applied: usize,
+    /// Bundles skipped (held for review).
+    pub bundles_skipped: usize,
+    /// Bundle moves that failed.
+    pub bundles_failed: usize,
     pub run_id: Uuid,
 }
 
@@ -63,7 +93,7 @@ impl ScanService {
     /// specific embedding-backend crate.
     ///
     /// # Errors
-    /// Propagates pipeline, storage, and review errors.
+    /// Propagates pipeline, storage, review, and apply errors.
     pub async fn run(
         &self,
         request: ScanRequest,
@@ -71,7 +101,38 @@ impl ScanService {
         progress: &dyn ProgressReporter,
         review: &dyn ReviewHandler,
     ) -> Result<ScanReport> {
-        let run_id = Uuid::new_v4();
+        let run = RunRecord::begin(RunMode::Scan, request.root.clone(), None);
+        let run_id = run.id;
+        self.ctx.run_log.record_run(&run).await?;
+
+        let outcome_result = self
+            .try_run(&request, candidates, progress, review, run_id)
+            .await;
+
+        match &outcome_result {
+            Ok(_) => {
+                self.ctx
+                    .run_log
+                    .finish_run(run_id, RunState::Completed)
+                    .await?;
+            }
+            Err(_) => {
+                // Best-effort: record terminal state but don't mask original error.
+                let _ = self.ctx.run_log.finish_run(run_id, RunState::Failed).await;
+            }
+        }
+
+        outcome_result
+    }
+
+    async fn try_run(
+        &self,
+        request: &ScanRequest,
+        candidates: &[ScanCandidate],
+        progress: &dyn ProgressReporter,
+        review: &dyn ReviewHandler,
+        run_id: Uuid,
+    ) -> Result<ScanReport> {
         let output_root = request.root.clone();
 
         let outcome = run_scan(
@@ -85,17 +146,19 @@ impl ScanService {
         )
         .await?;
 
-        // Persist. Loose proposals first, then bundles (each atomic with its members).
         for proposal in &outcome.proposals {
-            self.ctx.change_log.record_proposal(proposal).await?;
+            self.ctx
+                .change_log
+                .record_proposal(proposal, Some(run_id))
+                .await?;
         }
         for bundle in &outcome.bundles {
-            self.ctx.change_log.record_bundle(bundle).await?;
+            self.ctx
+                .change_log
+                .record_bundle(bundle, Some(run_id))
+                .await?;
         }
 
-        // Review loose proposals. Bundle surfacing to a frontend is not yet
-        // defined at the port layer — for now they short-circuit review and
-        // remain in Pending state in the change log.
         let decisions = if outcome.proposals.is_empty() {
             Vec::new()
         } else {
@@ -103,29 +166,69 @@ impl ScanService {
         };
         let approved = decisions
             .iter()
-            .filter(|d| matches!(d, tidyup_domain::ReviewDecision::Approve(_)))
+            .filter(|d| {
+                matches!(
+                    d,
+                    tidyup_domain::ReviewDecision::Approve(_)
+                        | tidyup_domain::ReviewDecision::Override { .. }
+                )
+            })
             .count();
 
-        // Apply: Phase 5. For now `applied == 0` regardless of `dry_run`.
-        let _ = request.dry_run;
+        let deps = ExecutorDeps {
+            change_log: self.ctx.change_log.as_ref(),
+            backup_store: self.ctx.backup_store.as_ref(),
+            progress,
+        };
+
+        let loose_report: ApplyReport = if decisions.is_empty() {
+            ApplyReport::default()
+        } else {
+            apply_loose_decisions(&outcome.proposals, &decisions, &deps, request.dry_run).await?
+        };
+
+        let auto_apply_ids = select_auto_applied_bundles(
+            &outcome.bundles,
+            request.auto_approve_bundles,
+            request.bundle_min_confidence,
+        );
+        if !outcome.bundles.is_empty() && auto_apply_ids.is_empty() {
+            progress
+                .message(
+                    Level::Info,
+                    &format!(
+                        "{} bundle(s) held for review; run with --yes to auto-apply those above {:.2} confidence",
+                        outcome.bundles.len(),
+                        request.bundle_min_confidence,
+                    ),
+                )
+                .await;
+        }
+        let bundle_report =
+            apply_bundles(&outcome.bundles, &auto_apply_ids, &deps, request.dry_run).await?;
 
         Ok(ScanReport {
             proposed: outcome.proposals.len(),
             bundles: outcome.bundles.len(),
             unclassified: outcome.unclassified.len(),
             approved,
-            applied: 0,
+            applied: loose_report.applied,
+            skipped: loose_report.skipped,
+            failed: loose_report.failed,
+            bundles_applied: bundle_report.bundles_applied,
+            bundles_skipped: bundle_report.bundles_skipped,
+            bundles_failed: bundle_report.bundles_failed,
             run_id,
         })
     }
 
-    /// Stub retained for UI call sites; fully-implemented one-file classification
-    /// is Phase 5 and requires threading a single [`ScanCandidate`] slice in.
+    /// Single-file classification — not wired in v0.1. The scan pipeline is
+    /// batch-oriented and always scopes against a source root.
     ///
     /// # Errors
-    /// Always errors — this is a deliberate "not yet wired" boundary.
+    /// Always errors.
     pub async fn classify_one(&self, file: &Path) -> Result<tidyup_domain::ChangeProposal> {
         let _ = (&self.ctx, file);
-        anyhow::bail!("single-file classification not wired until Phase 5")
+        anyhow::bail!("single-file classification is not part of the v0.1 scope")
     }
 }

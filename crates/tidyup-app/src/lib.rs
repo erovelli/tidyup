@@ -23,12 +23,13 @@
 //! That is the entire seam.
 
 pub mod config;
+pub mod executor;
 pub mod migration;
 pub mod rollback;
 pub mod scan;
 
 pub use migration::{MigrationReport, MigrationService};
-pub use rollback::RollbackService;
+pub use rollback::{RollbackReport, RollbackService};
 pub use scan::{ScanReport, ScanService};
 
 /// Bundle of backend handles a service needs. Constructed once per process.
@@ -40,6 +41,7 @@ pub struct ServiceContext {
     pub file_index: std::sync::Arc<dyn tidyup_core::storage::FileIndex>,
     pub change_log: std::sync::Arc<dyn tidyup_core::storage::ChangeLog>,
     pub backup_store: std::sync::Arc<dyn tidyup_core::storage::BackupStore>,
+    pub run_log: std::sync::Arc<dyn tidyup_core::storage::RunLog>,
     pub text: std::sync::Arc<dyn tidyup_core::inference::TextBackend>,
     pub embeddings: std::sync::Arc<dyn tidyup_core::inference::EmbeddingBackend>,
     pub vision: Option<std::sync::Arc<dyn tidyup_core::inference::VisionBackend>>,

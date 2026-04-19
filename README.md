@@ -8,15 +8,21 @@ Your files stay where they belong — with you.
 
 ---
 
-## Status: pre-alpha, not yet functional
+## Status: pre-alpha — end-to-end, not yet v0.1
 
-> **Warning — tidyup is under active construction and not yet usable as a tool.**
+> **Warning — tidyup is still under active construction.**
 >
-> The foundational layers (domain types, SQLite storage, BLAKE3 indexer, layered config) are in place. The classification pipeline, content extractors, and inference backends are being built out now. The CLI compiles and dispatches, but **no command yet runs end-to-end** — `tidyup migrate`, `tidyup scan`, and `tidyup rollback` are stubs.
+> As of Phase 5, `tidyup migrate`, `tidyup scan`, and `tidyup rollback` run
+> end-to-end on the default binary: proposals are generated, reviewed,
+> shelved, moved, and reversible. First-run fails fast with installer
+> instructions when the embedding model is missing. That said, the
+> confidence thresholds, default taxonomy, and rename cascade have not yet
+> been calibrated against a real corpus, interactive bundle review is still
+> TODO, and the multimodal encoders aren't wired in — so please do not yet
+> point tidyup at files you care about.
 >
-> This repository is being developed in the open. What you see reflects the target design, not current capability. Everything below describes what tidyup is being built to do — check the [roadmap](#roadmap) for what actually works today.
->
-> Until v0.1 ships, please do not point tidyup at files you care about.
+> Everything below describes the target design. Check the
+> [roadmap](#roadmap) for what actually works today.
 
 ---
 
@@ -114,30 +120,32 @@ tidyup is being built in phases. Each phase lands an independently compilable sl
 | 2     | Content extractors: router + MIME detection, plain text, PDF, Excel, image, audio           | [x] Complete   |
 | 3     | Inference: `bge-small-en-v1.5` via ONNX Runtime (default); optional LLM + remote backends   | [x] Complete   |
 | 4     | Pipeline: heuristics, bundle detection, scan + migration classifiers, rename cascade        | [x] Complete   |
-| 5     | CLI wiring, first-run model download, end-to-end flows, v0.1 ship                           | [ ] Not started |
+| 5     | CLI wiring, apply + rollback, first-run model check, end-to-end flows                       | [x] Complete   |
 | 6+    | Multimodal encoders (image/audio/video), Dioxus UI, code signing, `brew`/`winget`, plugins  | [ ] Backlog    |
 
 **What currently works:**
 
-- `cargo build -p tidyup-cli` produces a binary with fully stubbed subcommands
+- `cargo build --release -p tidyup-cli` produces a fully functional default binary: `tidyup migrate`, `tidyup scan`, `tidyup rollback`, `tidyup config`
 - `cargo xtask ci` is green: privacy check + `fmt` + `clippy --all-features -D warnings` + workspace tests
 - `cargo xtask check-privacy` asserts the default dep graph contains no `reqwest`/`hyper`/`rustls`/`mistralrs`/`candle-core`/`hf-hub`
-- SQLite storage: `FileIndex`, `ChangeLog`, `BackupStore` with bundle-atomic shelving
+- SQLite storage: `FileIndex`, `ChangeLog`, `BackupStore`, `RunLog` with bundle-atomic shelving
 - Layered TOML config with platform-aware paths
 - `tidyup-extract`: MIME detection + router + `PlainTextExtractor` + `PdfExtractor` + `ExcelExtractor` + `ImageExtractor` (dimensions + EXIF) + `AudioExtractor` (ID3/Vorbis tags), each behind its own cargo feature
 - `tidyup-embeddings-ort`: `bge-small-en-v1.5` ONNX classifier, taxonomy cache (BLAKE3-invalidated), inline YAKE, model-install verifier
 - `tidyup-inference-mistralrs` (opt-in `--features llm-fallback`): `TextBackend` + lazy `VisionBackend` via `mistralrs`; Metal/CUDA pass-through features
 - `tidyup-inference-remote` (opt-in `--features remote`): `TextBackend` over OpenAI-compatible, Anthropic, and Ollama endpoints
 - `tidyup-pipeline`: Tier 1 heuristics, bundle detection (Cargo/npm/pyproject/Gradle/Xcode/.git/Jupyter), target-tree profiler with name+centroid embeddings, extractive rename cascade (metadata → keywords → adapt → keep), scan-mode classifier against a fixed taxonomy, migration-mode classifier against an existing hierarchy
-- `tidyup-app`: `ScanService` and `MigrationService` wired to the pipeline, driving `ChangeLog` persistence and the `ReviewHandler` port
+- `tidyup-app`: `ScanService`, `MigrationService`, and `RollbackService` driving the pipeline end-to-end — shelve → move → mark applied → per-run rollback via the `RunLog`
+- First-run model check: scan/migrate surface `cargo xtask download-models` (or a manual placement hint) when the embedding bundle is missing, without linking an HTTP client
 
 **What does not yet work:**
 
-- Move/rollback execution (apply step is Phase 5; services stop at review)
-- CLI subcommand wiring to services + first-run model download (Phase 5)
-- End-to-end user flow from a shell prompt (Phase 5)
+- Interactive bundle review. Bundles above the configured confidence threshold auto-apply under `--yes`; otherwise they stay pending with a warning. Full bundle-review UX lands in Phase 6+.
+- Multimodal encoders (image/audio/video backends). Images/audio still classify via embedded metadata + filename for now.
+- Calibrated confidence. v0.1 confidence is raw weighted-cosine; calibration is a v0.2 story.
+- Dioxus UI, signed binaries, Homebrew/winget packaging.
 
-The invariants the finished tool will uphold — human-in-the-loop review, reversible moves, bundle atomicity, no-network-by-default, extractive-only renames — are enforced in the design today, but the code paths that would violate them don't exist yet.
+The invariants the finished tool will uphold — human-in-the-loop review, reversible moves, bundle atomicity, no-network-by-default, extractive-only renames — are now enforced at the code path, not just the design.
 
 ---
 

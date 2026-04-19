@@ -2,16 +2,14 @@
 // with clippy::redundant_pub_crate. Silence it; the rustc unreachable_pub lint is more
 // semantically correct for binaries.
 #![allow(clippy::redundant_pub_crate)]
-// Stubs don't await yet; remove once commands dispatch through real services.
-#![allow(clippy::unused_async)]
-#![allow(clippy::missing_const_for_fn)]
 
 //! Tidyup CLI entry point.
 //!
 //! The CLI's job is narrow:
 //! 1. Parse args (clap).
 //! 2. Load config.
-//! 3. Build the `ServiceContext` via the backend registry.
+//! 3. Build the `ServiceContext` (storage + embeddings + extractors) via
+//!    [`context::build`].
 //! 4. Supply a CLI-flavored `ProgressReporter` (indicatif) and `ReviewHandler`
 //!    (interactive prompts, or `--yes` auto-approver).
 //! 5. Call `tidyup_app::*Service`.
@@ -21,6 +19,7 @@
 //! impls.
 
 mod commands;
+mod context;
 mod reporter;
 mod review;
 
@@ -32,7 +31,8 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
 
-    /// Suppress interactive prompts; auto-approve anything above `--min-confidence`.
+    /// Suppress interactive prompts; auto-approve anything above the internal
+    /// confidence threshold. Renames never auto-apply, even under `--yes`.
     #[arg(long, global = true)]
     yes: bool,
 
@@ -58,15 +58,27 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Roll back a previous run by ID.
-    Rollback { run_id: uuid::Uuid },
-    /// Show/edit config.
+    /// Roll back a previous run by ID, or list recorded runs with `--list`.
+    Rollback {
+        /// Run ID to roll back. Required unless `--list` is passed.
+        run_id: Option<uuid::Uuid>,
+        /// List recorded runs instead of rolling one back.
+        #[arg(long)]
+        list: bool,
+    },
+    /// Show current config (file path + parsed values).
     Config,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt().with_env_filter("info").init();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
     let cli = Cli::parse();
     commands::dispatch(cli).await
 }

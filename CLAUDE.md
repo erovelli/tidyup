@@ -48,7 +48,7 @@ domain → core → { storage-sqlite, inference-*, embeddings-ort, extract } →
 ```
 
 - `tidyup-domain` is a **zero-dep stability firewall**. No `anyhow`, no I/O, no async, no references to other tidyup crates. Breaking change here = intentional. Use `thiserror` for typed errors (see `change::ParseError`).
-- `tidyup-core` holds **port traits only** — `FileIndex`, `ChangeLog`, `BackupStore` (storage), `TextBackend`/`VisionBackend`/`EmbeddingBackend` (inference), `ContentExtractor` (extract), `ProgressReporter`/`ReviewHandler` (frontend). No implementations.
+- `tidyup-core` holds **port traits only** — `FileIndex`, `ChangeLog`, `BackupStore`, `RunLog` (storage), `TextBackend`/`VisionBackend`/`EmbeddingBackend` (inference), `ContentExtractor` (extract), `ProgressReporter`/`ReviewHandler` (frontend). No implementations.
 - Impl crates (`storage-sqlite`, `inference-mistralrs`, `inference-remote`, `embeddings-ort`, `extract`) depend on `core` — **never on each other**. This keeps disjoint heavy deps (ONNX runtime, mistralrs, rusqlite) from leaking across the graph.
 - `tidyup-pipeline` consumes trait objects from `core`, not concrete types.
 - `tidyup-app` wires services (`ScanService`, `MigrationService`, `RollbackService`) with an Arc<dyn Trait> `ServiceContext`. Config lives here — no separate `tidyup-config` crate.
@@ -87,7 +87,7 @@ Two patterns are architectural contracts, not suggestions:
 
 2. **Inference backend registry.** Backends register by capability at runtime, driven by `InferenceConfig.backends` (ordered list of IDs: `"mistralrs"`, `"remote-openai"`, `"ollama"`). Runtime *selection* is config-driven — not a cargo feature flag. Adding a backend: new `tidyup-inference-*` crate + implement `TextBackend`/`VisionBackend`/`EmbeddingBackend` + register. No pipeline/app changes.
 
-Storage follows the same shape (`FileIndex`/`ChangeLog`/`BackupStore` are traits, sqlite is the default impl) but we don't expect alternates pre-v0.1.
+Storage follows the same shape (`FileIndex`/`ChangeLog`/`BackupStore`/`RunLog` are traits, sqlite is the default impl) but we don't expect alternates pre-v0.1.
 
 **Backend *inclusion* is separate from *selection*.** Network-capable backends (`tidyup-inference-remote`) are compiled in only with `--features remote`. Default builds have no HTTP client linked. See the privacy model below.
 

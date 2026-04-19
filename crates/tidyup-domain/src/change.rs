@@ -118,6 +118,10 @@ pub enum ParseError {
     UnknownBackupStatus(String),
     #[error("unknown BundleKind: {0}")]
     UnknownBundleKind(String),
+    #[error("unknown RunMode: {0}")]
+    UnknownRunMode(String),
+    #[error("unknown RunState: {0}")]
+    UnknownRunState(String),
 }
 
 #[cfg(test)]

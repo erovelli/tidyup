@@ -18,10 +18,10 @@ use crate::SqliteStore;
 
 const CHANGE_COLS: &str = "id, file_id, change_type, original_path, proposed_path, \
      proposed_name, confidence, reasoning, needs_review, status, created_at, applied_at, \
-     bundle_id, classification_confidence, rename_mismatch_score";
+     bundle_id, classification_confidence, rename_mismatch_score, run_id";
 
 const BUNDLE_COLS: &str = "id, root, kind, target_parent, status, reasoning, confidence, \
-     created_at, applied_at";
+     created_at, applied_at, run_id";
 
 fn parse_uuid(s: &str) -> rusqlite::Result<Uuid> {
     Uuid::parse_str(s).map_err(|e| {
@@ -106,11 +106,11 @@ fn path_str(p: &std::path::Path) -> Result<&str> {
         .ok_or_else(|| anyhow!("path is not valid UTF-8: {}", p.display()))
 }
 
-fn insert_proposal(tx: &Transaction<'_>, p: &ChangeProposal) -> Result<()> {
+fn insert_proposal(tx: &Transaction<'_>, p: &ChangeProposal, run_id: Option<Uuid>) -> Result<()> {
     tx.execute(
         &format!(
             "INSERT INTO change_proposals ({CHANGE_COLS}) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)"
         ),
         params![
             p.id.to_string(),
@@ -128,6 +128,7 @@ fn insert_proposal(tx: &Transaction<'_>, p: &ChangeProposal) -> Result<()> {
             p.bundle_id.map(|b| b.to_string()),
             p.classification_confidence.map(f64::from),
             p.rename_mismatch_score.map(f64::from),
+            run_id.map(|r| r.to_string()),
         ],
     )
     .context("inserting change proposal")?;
@@ -136,7 +137,11 @@ fn insert_proposal(tx: &Transaction<'_>, p: &ChangeProposal) -> Result<()> {
 
 #[async_trait]
 impl ChangeLog for SqliteStore {
-    async fn record_proposal(&self, proposal: &ChangeProposal) -> tidyup_core::Result<()> {
+    async fn record_proposal(
+        &self,
+        proposal: &ChangeProposal,
+        run_id: Option<Uuid>,
+    ) -> tidyup_core::Result<()> {
         let conn = self.conn();
         let proposal = proposal.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
@@ -148,7 +153,7 @@ impl ChangeLog for SqliteStore {
             {
                 let mut guard = conn.lock().map_err(|e| anyhow!("lock poisoned: {e}"))?;
                 let tx = guard.transaction()?;
-                insert_proposal(&tx, &proposal)?;
+                insert_proposal(&tx, &proposal, run_id)?;
                 tx.commit()?;
             }
             Ok(())
@@ -181,6 +186,25 @@ impl ChangeLog for SqliteStore {
         Ok(())
     }
 
+    async fn mark_unshelved(&self, proposal_id: Uuid) -> tidyup_core::Result<()> {
+        let conn = self.conn();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            {
+                let guard = conn.lock().map_err(|e| anyhow!("lock poisoned: {e}"))?;
+                guard
+                    .execute(
+                        "UPDATE change_proposals SET status = ?1 WHERE id = ?2",
+                        params![ChangeStatus::Unshelved.as_str(), proposal_id.to_string()],
+                    )
+                    .context("marking proposal unshelved")?;
+            }
+            Ok(())
+        })
+        .await
+        .context("join mark_unshelved task")??;
+        Ok(())
+    }
+
     async fn pending(&self) -> tidyup_core::Result<Vec<ChangeProposal>> {
         let conn = self.conn();
         let result = tokio::task::spawn_blocking(move || -> Result<Vec<ChangeProposal>> {
@@ -202,7 +226,11 @@ impl ChangeLog for SqliteStore {
         Ok(result)
     }
 
-    async fn record_bundle(&self, bundle: &BundleProposal) -> tidyup_core::Result<()> {
+    async fn record_bundle(
+        &self,
+        bundle: &BundleProposal,
+        run_id: Option<Uuid>,
+    ) -> tidyup_core::Result<()> {
         let conn = self.conn();
         let bundle = bundle.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
@@ -214,7 +242,7 @@ impl ChangeLog for SqliteStore {
                 tx.execute(
                     &format!(
                         "INSERT INTO bundles ({BUNDLE_COLS}) VALUES \
-                         (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
+                         (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
                     ),
                     params![
                         bundle.id.to_string(),
@@ -226,11 +254,12 @@ impl ChangeLog for SqliteStore {
                         f64::from(bundle.confidence),
                         bundle.created_at,
                         bundle.applied_at,
+                        run_id.map(|r| r.to_string()),
                     ],
                 )
                 .context("inserting bundle")?;
                 for member in &bundle.members {
-                    insert_proposal(&tx, member)?;
+                    insert_proposal(&tx, member, run_id)?;
                 }
                 tx.commit()?;
             }
@@ -269,6 +298,33 @@ impl ChangeLog for SqliteStore {
         Ok(())
     }
 
+    async fn mark_bundle_unshelved(&self, bundle_id: Uuid) -> tidyup_core::Result<()> {
+        let conn = self.conn();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            {
+                let mut guard = conn.lock().map_err(|e| anyhow!("lock poisoned: {e}"))?;
+                let tx = guard.transaction()?;
+                let unshelved = ChangeStatus::Unshelved.as_str();
+                let id_str = bundle_id.to_string();
+                tx.execute(
+                    "UPDATE bundles SET status = ?1 WHERE id = ?2",
+                    params![unshelved, id_str],
+                )
+                .context("marking bundle unshelved")?;
+                tx.execute(
+                    "UPDATE change_proposals SET status = ?1 WHERE bundle_id = ?2",
+                    params![unshelved, id_str],
+                )
+                .context("marking bundle members unshelved")?;
+                tx.commit()?;
+            }
+            Ok(())
+        })
+        .await
+        .context("join mark_bundle_unshelved task")??;
+        Ok(())
+    }
+
     async fn pending_bundles(&self) -> tidyup_core::Result<Vec<BundleProposal>> {
         let conn = self.conn();
         let result = tokio::task::spawn_blocking(move || -> Result<Vec<BundleProposal>> {
@@ -297,6 +353,66 @@ impl ChangeLog for SqliteStore {
         })
         .await
         .context("join pending_bundles task")??;
+        Ok(result)
+    }
+
+    async fn applied_proposals_for_run(
+        &self,
+        run_id: Uuid,
+    ) -> tidyup_core::Result<Vec<ChangeProposal>> {
+        let conn = self.conn();
+        let result = tokio::task::spawn_blocking(move || -> Result<Vec<ChangeProposal>> {
+            let guard = conn.lock().map_err(|e| anyhow!("lock poisoned: {e}"))?;
+            let mut stmt = guard.prepare(&format!(
+                "SELECT {CHANGE_COLS} FROM change_proposals \
+                 WHERE run_id = ?1 AND bundle_id IS NULL AND status = ?2 \
+                 ORDER BY applied_at"
+            ))?;
+            let fetched: Vec<ChangeProposal> = stmt
+                .query_map(
+                    params![run_id.to_string(), ChangeStatus::Applied.as_str()],
+                    row_to_proposal,
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(fetched)
+        })
+        .await
+        .context("join applied_proposals_for_run task")??;
+        Ok(result)
+    }
+
+    async fn applied_bundles_for_run(
+        &self,
+        run_id: Uuid,
+    ) -> tidyup_core::Result<Vec<BundleProposal>> {
+        let conn = self.conn();
+        let result = tokio::task::spawn_blocking(move || -> Result<Vec<BundleProposal>> {
+            let guard = conn.lock().map_err(|e| anyhow!("lock poisoned: {e}"))?;
+            let mut stmt = guard.prepare(&format!(
+                "SELECT {BUNDLE_COLS} FROM bundles \
+                 WHERE run_id = ?1 AND status = ?2 ORDER BY applied_at"
+            ))?;
+            let mut bundles: Vec<BundleProposal> = stmt
+                .query_map(
+                    params![run_id.to_string(), ChangeStatus::Applied.as_str()],
+                    row_to_bundle,
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+
+            let mut member_stmt = guard.prepare(&format!(
+                "SELECT {CHANGE_COLS} FROM change_proposals \
+                 WHERE bundle_id = ?1 ORDER BY original_path"
+            ))?;
+            for bundle in &mut bundles {
+                let members = member_stmt
+                    .query_map(params![bundle.id.to_string()], row_to_proposal)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                bundle.members = members;
+            }
+            Ok(bundles)
+        })
+        .await
+        .context("join applied_bundles_for_run task")??;
         Ok(result)
     }
 }

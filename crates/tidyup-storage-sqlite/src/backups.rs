@@ -14,9 +14,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-#[cfg(test)]
-use rusqlite::Row;
-use rusqlite::{params, Transaction};
+use rusqlite::{params, Row, Transaction};
 use tidyup_core::storage::BackupStore;
 use tidyup_domain::{BackupRecord, BackupStatus, IndexedFile};
 use uuid::Uuid;
@@ -32,17 +30,12 @@ fn path_str(p: &Path) -> Result<&str> {
         .ok_or_else(|| anyhow!("path is not valid UTF-8: {}", p.display()))
 }
 
-// Full-record reads aren't needed by the trait yet — `restore` takes a `BackupRecord` it was
-// handed, and `prune` only needs `backup_path`. Keep these helpers test-gated until a rollback
-// lookup path surfaces the need.
-#[cfg(test)]
 fn parse_uuid(s: &str) -> rusqlite::Result<Uuid> {
     Uuid::parse_str(s).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
     })
 }
 
-#[cfg(test)]
 fn row_to_backup(row: &Row<'_>) -> rusqlite::Result<BackupRecord> {
     let id = parse_uuid(&row.get::<_, String>("id")?)?;
     let change_id = parse_uuid(&row.get::<_, String>("change_id")?)?;
@@ -204,6 +197,31 @@ impl BackupStore for SqliteStore {
         })
         .await
         .context("join shelve_bundle task")??;
+        Ok(result)
+    }
+
+    async fn find_by_change_id(
+        &self,
+        change_id: Uuid,
+    ) -> tidyup_core::Result<Option<BackupRecord>> {
+        let conn = self.conn();
+        let result = tokio::task::spawn_blocking(move || -> Result<Option<BackupRecord>> {
+            let guard = conn.lock().map_err(|e| anyhow!("lock poisoned: {e}"))?;
+            let mut stmt = guard.prepare(&format!(
+                "SELECT {BACKUP_COLS} FROM backups \
+                 WHERE change_id = ?1 AND status = ?2 \
+                 ORDER BY shelved_at DESC LIMIT 1"
+            ))?;
+            let fetched = stmt
+                .query_row(
+                    params![change_id.to_string(), BackupStatus::Shelved.as_str()],
+                    row_to_backup,
+                )
+                .ok();
+            Ok(fetched)
+        })
+        .await
+        .context("join find_by_change_id task")??;
         Ok(result)
     }
 
@@ -472,6 +490,34 @@ mod tests {
         // Second run finds nothing new.
         let n2 = store.prune_older_than_days(30).await.unwrap();
         assert_eq!(n2, 0);
+    }
+
+    #[tokio::test]
+    async fn find_by_change_id_returns_only_shelved() {
+        let dir = TempDir::new().unwrap();
+        let store = store_with_backup_root(&dir);
+
+        let src = write_file(dir.path(), "x.txt", b"x");
+        let change_id = Uuid::new_v4();
+        let shelved = store.shelve(&sample_indexed(src), change_id).await.unwrap();
+
+        let found = store.find_by_change_id(change_id).await.unwrap().unwrap();
+        assert_eq!(found.id, shelved.id);
+
+        // After restore, status flips to Unshelved and lookup returns None.
+        store.restore(&shelved).await.unwrap();
+        assert!(store.find_by_change_id(change_id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn find_by_change_id_returns_none_when_missing() {
+        let dir = TempDir::new().unwrap();
+        let store = store_with_backup_root(&dir);
+        assert!(store
+            .find_by_change_id(Uuid::new_v4())
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

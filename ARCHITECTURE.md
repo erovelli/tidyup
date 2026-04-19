@@ -116,7 +116,7 @@ Both thresholds are config-tunable (`[rename] min_classification_confidence`, `[
 
 ## Storage interchange
 
-`FileIndex`, `ChangeLog`, `BackupStore` are traits. `tidyup-storage-sqlite` is the default implementation. Alternatives (sled, redb, an in-memory test double) slot in without touching the pipeline.
+`FileIndex`, `ChangeLog`, `BackupStore`, `RunLog` are traits. `tidyup-storage-sqlite` is the default implementation. Alternatives (sled, redb, an in-memory test double) slot in without touching the pipeline. `RunLog` records every scan/migration invocation so `tidyup rollback <run_id>` can enumerate applied changes and drive `BackupStore::restore` for each.
 
 Content-addressed dedup is a first-class concern: `FileIndex` is keyed by `ContentHash` (BLAKE3), and `IndexedFile` is a many-to-one presence record. Classification happens once per unique hash; a single result applies to every path sharing that content.
 
