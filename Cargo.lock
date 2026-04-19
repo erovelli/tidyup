@@ -5822,6 +5822,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "blake3",
+ "chrono",
  "dirs",
  "serde",
  "serde_json",
@@ -5835,6 +5837,7 @@ dependencies = [
  "toml 1.1.2+spec-1.1.0",
  "tracing",
  "uuid 1.23.0",
+ "walkdir",
 ]
 
 [[package]]
@@ -5848,6 +5851,7 @@ dependencies = [
  "indicatif 0.18.4",
  "serde",
  "serde_json",
+ "tempfile",
  "tidyup-app",
  "tidyup-core",
  "tidyup-domain",
@@ -5858,6 +5862,7 @@ dependencies = [
  "tidyup-pipeline",
  "tidyup-storage-sqlite",
  "tokio",
+ "toml 1.1.2+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
  "uuid 1.23.0",
