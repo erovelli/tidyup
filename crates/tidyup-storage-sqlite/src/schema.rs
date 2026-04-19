@@ -25,6 +25,18 @@ CREATE TABLE IF NOT EXISTS files (
 const CREATE_FILES_HASH_IDX: &str =
     "CREATE INDEX IF NOT EXISTS idx_files_content_hash ON files(content_hash);";
 
+const CREATE_RUNS: &str = r"
+CREATE TABLE IF NOT EXISTS runs (
+    id            TEXT PRIMARY KEY,
+    mode          TEXT NOT NULL,
+    source_root   TEXT NOT NULL,
+    target_root   TEXT,
+    started_at    TEXT NOT NULL,
+    completed_at  TEXT,
+    state         TEXT NOT NULL
+);
+";
+
 const CREATE_BUNDLES: &str = r"
 CREATE TABLE IF NOT EXISTS bundles (
     id             TEXT PRIMARY KEY,
@@ -35,7 +47,8 @@ CREATE TABLE IF NOT EXISTS bundles (
     reasoning      TEXT NOT NULL,
     confidence     REAL NOT NULL,
     created_at     TEXT NOT NULL,
-    applied_at     TEXT
+    applied_at     TEXT,
+    run_id         TEXT REFERENCES runs(id)
 );
 ";
 
@@ -55,7 +68,8 @@ CREATE TABLE IF NOT EXISTS change_proposals (
     applied_at                 TEXT,
     bundle_id                  TEXT REFERENCES bundles(id) ON DELETE CASCADE,
     classification_confidence  REAL,
-    rename_mismatch_score      REAL
+    rename_mismatch_score      REAL,
+    run_id                     TEXT REFERENCES runs(id)
 );
 ";
 
@@ -64,6 +78,12 @@ const CREATE_CHANGES_BUNDLE_IDX: &str =
 
 const CREATE_CHANGES_STATUS_IDX: &str =
     "CREATE INDEX IF NOT EXISTS idx_changes_status ON change_proposals(status);";
+
+const CREATE_CHANGES_RUN_IDX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_changes_run_id ON change_proposals(run_id);";
+
+const CREATE_BUNDLES_RUN_IDX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_bundles_run_id ON bundles(run_id);";
 
 const CREATE_BACKUPS: &str = r"
 CREATE TABLE IF NOT EXISTS backups (
@@ -85,10 +105,13 @@ pub(super) fn apply(conn: &mut Connection) -> rusqlite::Result<()> {
         &[
             CREATE_FILES,
             CREATE_FILES_HASH_IDX,
+            CREATE_RUNS,
             CREATE_BUNDLES,
             CREATE_CHANGE_PROPOSALS,
             CREATE_CHANGES_BUNDLE_IDX,
             CREATE_CHANGES_STATUS_IDX,
+            CREATE_CHANGES_RUN_IDX,
+            CREATE_BUNDLES_RUN_IDX,
             CREATE_BACKUPS,
         ]
         .join("\n"),

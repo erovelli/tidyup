@@ -27,6 +27,7 @@ mod backups;
 mod changes;
 mod files;
 pub mod indexer;
+mod runs;
 mod schema;
 
 pub use indexer::index_directory;
@@ -100,13 +101,13 @@ mod tests {
             let conn = store.conn.lock().unwrap();
             conn.query_row(
                 "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN \
-                 ('files', 'bundles', 'change_proposals', 'backups')",
+                 ('files', 'runs', 'bundles', 'change_proposals', 'backups')",
                 [],
                 |r| r.get(0),
             )
             .unwrap()
         };
-        assert_eq!(count, 4);
+        assert_eq!(count, 5);
     }
 
     #[test]
