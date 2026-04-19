@@ -1,22 +1,20 @@
 //! Migration service — moves files from a source tree into a user-defined target tree.
 //!
 //! Same handle drives CLI (`tidyup migrate`) and UI ("Migrate" button).
-//!
-//! # Phase 4 scope
-//!
-//! The service produces and persists proposals end-to-end. The **apply** step
-//! (shelving + filesystem moves) is Phase 5 — this service stops at review.
-//! That keeps the privacy / safety surface smaller while the pipeline
-//! stabilises.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use tidyup_core::frontend::Level;
 use tidyup_core::{ProgressReporter, Result, ReviewHandler};
+use tidyup_domain::{RunMode, RunRecord, RunState};
 use tidyup_pipeline::{migration::run_migration, profiler};
 use uuid::Uuid;
 
+use crate::executor::{
+    apply_bundles, apply_loose_decisions, select_auto_applied_bundles, ApplyReport, ExecutorDeps,
+};
 use crate::ServiceContext;
 
 #[allow(missing_debug_implementations)]
@@ -29,6 +27,17 @@ pub struct MigrationRequest {
     pub source: std::path::PathBuf,
     pub target: std::path::PathBuf,
     pub dry_run: bool,
+    /// When true, auto-apply bundles whose confidence clears
+    /// `bundle_min_confidence`. Set by the CLI only if `--yes`.
+    #[serde(default)]
+    pub auto_approve_bundles: bool,
+    /// Lower bound on confidence for auto-applied bundles.
+    #[serde(default = "default_bundle_confidence")]
+    pub bundle_min_confidence: f32,
+}
+
+const fn default_bundle_confidence() -> f32 {
+    0.85
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,6 +49,9 @@ pub struct MigrationReport {
     pub applied: usize,
     pub skipped: usize,
     pub failed: usize,
+    pub bundles_applied: usize,
+    pub bundles_skipped: usize,
+    pub bundles_failed: usize,
     pub run_id: Uuid,
 }
 
@@ -52,25 +64,52 @@ impl MigrationService {
     /// Run a full migration. Single entry point both frontends call.
     ///
     /// 1. Scans target tree, builds folder profiles (`Phase::ProfilingTarget`).
-    /// 2. Indexes source tree (`Phase::Indexing`).
-    /// 3. Classifies each source file (`Phase::Classifying`).
-    /// 4. Persists proposals + bundles via [`ChangeLog`].
-    /// 5. Calls `review.review(proposals)` for loose proposals.
-    ///
-    /// Apply (shelving + moves) is Phase 5. `applied` stays 0 here.
+    /// 2. Classifies each source file (`Phase::Classifying`).
+    /// 3. Persists proposals + bundles via [`ChangeLog`], tagged with a run id.
+    /// 4. Calls `review.review(proposals)` for loose proposals.
+    /// 5. Shelves and moves approved proposals atomically (per-file or per-bundle).
     ///
     /// [`ChangeLog`]: tidyup_core::storage::ChangeLog
     ///
     /// # Errors
-    /// Propagates profiling, pipeline, storage, and review errors.
+    /// Propagates profiling, pipeline, storage, review, and apply errors.
     pub async fn run(
         &self,
         request: MigrationRequest,
         progress: &dyn ProgressReporter,
         review: &dyn ReviewHandler,
     ) -> Result<MigrationReport> {
-        let run_id = Uuid::new_v4();
+        let run = RunRecord::begin(
+            RunMode::Migrate,
+            request.source.clone(),
+            Some(request.target.clone()),
+        );
+        let run_id = run.id;
+        self.ctx.run_log.record_run(&run).await?;
 
+        let result = self.try_run(&request, progress, review, run_id).await;
+
+        match &result {
+            Ok(_) => {
+                self.ctx
+                    .run_log
+                    .finish_run(run_id, RunState::Completed)
+                    .await?;
+            }
+            Err(_) => {
+                let _ = self.ctx.run_log.finish_run(run_id, RunState::Failed).await;
+            }
+        }
+        result
+    }
+
+    async fn try_run(
+        &self,
+        request: &MigrationRequest,
+        progress: &dyn ProgressReporter,
+        review: &dyn ReviewHandler,
+        run_id: Uuid,
+    ) -> Result<MigrationReport> {
         progress
             .phase_started(tidyup_domain::Phase::ProfilingTarget, None)
             .await;
@@ -92,10 +131,16 @@ impl MigrationService {
         .await?;
 
         for proposal in &outcome.proposals {
-            self.ctx.change_log.record_proposal(proposal).await?;
+            self.ctx
+                .change_log
+                .record_proposal(proposal, Some(run_id))
+                .await?;
         }
         for bundle in &outcome.bundles {
-            self.ctx.change_log.record_bundle(bundle).await?;
+            self.ctx
+                .change_log
+                .record_bundle(bundle, Some(run_id))
+                .await?;
         }
 
         let decisions = if outcome.proposals.is_empty() {
@@ -103,39 +148,71 @@ impl MigrationService {
         } else {
             review.review(outcome.proposals.clone()).await?
         };
-        let mut approved = 0usize;
-        let mut skipped = 0usize;
-        for d in &decisions {
-            match d {
-                tidyup_domain::ReviewDecision::Approve(_)
-                | tidyup_domain::ReviewDecision::Override { .. } => approved += 1,
-                tidyup_domain::ReviewDecision::Reject(_) => skipped += 1,
-            }
-        }
+        let approved = decisions
+            .iter()
+            .filter(|d| {
+                matches!(
+                    d,
+                    tidyup_domain::ReviewDecision::Approve(_)
+                        | tidyup_domain::ReviewDecision::Override { .. }
+                )
+            })
+            .count();
 
-        // Apply: Phase 5.
-        let _ = request.dry_run;
+        let deps = ExecutorDeps {
+            change_log: self.ctx.change_log.as_ref(),
+            backup_store: self.ctx.backup_store.as_ref(),
+            progress,
+        };
+
+        let loose_report: ApplyReport = if decisions.is_empty() {
+            ApplyReport::default()
+        } else {
+            apply_loose_decisions(&outcome.proposals, &decisions, &deps, request.dry_run).await?
+        };
+
+        let auto_apply_ids = select_auto_applied_bundles(
+            &outcome.bundles,
+            request.auto_approve_bundles,
+            request.bundle_min_confidence,
+        );
+        if !outcome.bundles.is_empty() && auto_apply_ids.is_empty() {
+            progress
+                .message(
+                    Level::Info,
+                    &format!(
+                        "{} bundle(s) held for review; run with --yes to auto-apply those above {:.2} confidence",
+                        outcome.bundles.len(),
+                        request.bundle_min_confidence,
+                    ),
+                )
+                .await;
+        }
+        let bundle_report =
+            apply_bundles(&outcome.bundles, &auto_apply_ids, &deps, request.dry_run).await?;
 
         Ok(MigrationReport {
             proposed: outcome.proposals.len(),
             bundles: outcome.bundles.len(),
             unclassified: outcome.unclassified.len(),
             approved,
-            applied: 0,
-            skipped,
-            failed: 0,
+            applied: loose_report.applied,
+            skipped: loose_report.skipped,
+            failed: loose_report.failed,
+            bundles_applied: bundle_report.bundles_applied,
+            bundles_skipped: bundle_report.bundles_skipped,
+            bundles_failed: bundle_report.bundles_failed,
             run_id,
         })
     }
 
-    /// Indexing-only pass. Useful for `tidyup status` or UI initial load.
-    ///
-    /// Phase-5 territory — returns an error until the indexer wiring lands.
+    /// Indexing-only pass. Out of scope for v0.1 — indexing happens implicitly
+    /// inside `run_migration`. Exposed for future `tidyup status` flows.
     ///
     /// # Errors
-    /// Always errors until Phase 5.
+    /// Always errors — intentionally unwired until a `status` subcommand lands.
     pub async fn index(&self, root: &Path, progress: &dyn ProgressReporter) -> Result<usize> {
         let _ = (&self.ctx, root, progress);
-        anyhow::bail!("indexing-only pass not wired until Phase 5")
+        anyhow::bail!("stand-alone indexing pass is not part of the v0.1 scope")
     }
 }

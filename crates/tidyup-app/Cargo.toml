@@ -19,6 +19,8 @@ tidyup-pipeline = { workspace = true }
 
 async-trait = { workspace = true }
 anyhow      = { workspace = true }
+blake3      = { workspace = true }
+chrono      = { workspace = true }
 thiserror   = { workspace = true }
 serde       = { workspace = true }
 tokio       = { workspace = true }
@@ -26,11 +28,13 @@ toml        = { workspace = true }
 tracing     = { workspace = true }
 uuid        = { workspace = true }
 dirs        = { workspace = true }
+walkdir     = { workspace = true }
 
 [dev-dependencies]
 tempfile              = { workspace = true }
 tidyup-storage-sqlite = { workspace = true }
 serde_json            = { workspace = true }
+async-trait           = { workspace = true }
 
 [lints]
 workspace = true

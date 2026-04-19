@@ -151,11 +151,21 @@ impl ContentExtractor for PlainExtractor {
 }
 
 fn make_ctx() -> (Arc<ServiceContext>, SqliteStore) {
+    make_ctx_with_shelf(None)
+}
+
+fn make_ctx_with_shelf(shelf: Option<std::path::PathBuf>) -> (Arc<ServiceContext>, SqliteStore) {
     let store = SqliteStore::open_in_memory().unwrap();
+    let store = if let Some(s) = shelf {
+        store.with_backup_root(s)
+    } else {
+        store
+    };
     let ctx = Arc::new(ServiceContext {
         file_index: Arc::new(store.clone()),
         change_log: Arc::new(store.clone()),
         backup_store: Arc::new(store.clone()),
+        run_log: Arc::new(store.clone()),
         text: Arc::new(StubText),
         embeddings: Arc::new(BucketEmbeddings),
         vision: None,
@@ -203,6 +213,8 @@ async fn scan_service_persists_proposals_and_auto_approves() {
                 root: src.path().to_path_buf(),
                 taxonomy_path: None,
                 dry_run: true,
+                auto_approve_bundles: false,
+                bundle_min_confidence: 0.85,
             },
             &candidates,
             &NullProgress,
@@ -214,9 +226,9 @@ async fn scan_service_persists_proposals_and_auto_approves() {
     assert_eq!(report.proposed, 1, "expected 1 loose proposal");
     assert_eq!(report.bundles, 0);
     assert_eq!(report.approved, 1, "auto-approve should count 1");
-    assert_eq!(report.applied, 0, "apply is Phase 5 — should stay 0");
+    assert_eq!(report.applied, 1, "dry-run apply counts approved proposals");
 
-    // Proposal should have been persisted to the change log.
+    // Dry-run leaves proposals Pending in the change log.
     let pending = store.pending().await.unwrap();
     assert_eq!(pending.len(), 1);
     let seen = reviewer.seen_ids();
@@ -241,6 +253,8 @@ async fn scan_service_records_bundles_separately() {
                 root: src.path().to_path_buf(),
                 taxonomy_path: None,
                 dry_run: true,
+                auto_approve_bundles: false,
+                bundle_min_confidence: 0.85,
             },
             &candidates,
             &NullProgress,
@@ -275,6 +289,8 @@ async fn migration_service_builds_profiles_and_classifies() {
                 source: src.path().to_path_buf(),
                 target: tgt.path().to_path_buf(),
                 dry_run: true,
+                auto_approve_bundles: false,
+                bundle_min_confidence: 0.85,
             },
             &NullProgress,
             &reviewer,
@@ -285,12 +301,99 @@ async fn migration_service_builds_profiles_and_classifies() {
     assert_eq!(report.proposed, 1, "one loose proposal");
     assert_eq!(report.bundles, 0);
     assert_eq!(report.approved, 1);
-    assert_eq!(report.applied, 0, "apply is Phase 5");
+    assert_eq!(report.applied, 1, "dry-run apply counts approved");
 
     let pending = store.pending().await.unwrap();
     assert_eq!(pending.len(), 1);
     // Destination must be inside the target tree.
     assert!(pending[0].proposed_path.starts_with(tgt.path()));
+}
+
+#[tokio::test]
+async fn scan_service_applies_moves_and_rollback_restores_them() {
+    use tidyup_app::RollbackService;
+
+    let workdir = TempDir::new().unwrap();
+    let shelf = workdir.path().join("shelf");
+    std::fs::create_dir_all(&shelf).unwrap();
+    let src_root = workdir.path().join("src");
+    std::fs::create_dir_all(&src_root).unwrap();
+    let src_file = src_root.join("helpers.rs");
+    std::fs::write(&src_file, b"fn main() {}").unwrap();
+
+    let (ctx, _store) = make_ctx_with_shelf(Some(shelf));
+    let candidates = sample_scan_candidates().await;
+    let service = ScanService::new(Arc::clone(&ctx));
+    let reviewer = AutoApprove::new();
+
+    let report = service
+        .run(
+            tidyup_app::scan::ScanRequest {
+                root: src_root.clone(),
+                taxonomy_path: None,
+                dry_run: false,
+                auto_approve_bundles: false,
+                bundle_min_confidence: 0.85,
+            },
+            &candidates,
+            &NullProgress,
+            &reviewer,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.proposed, 1);
+    assert_eq!(report.applied, 1, "real apply should move the file");
+    assert_eq!(report.failed, 0);
+    assert!(!src_file.exists(), "original must be gone after apply");
+
+    let rollback = RollbackService::new(Arc::clone(&ctx));
+    let report = rollback
+        .rollback_run(report.run_id, &NullProgress)
+        .await
+        .unwrap();
+
+    assert_eq!(report.restored, 1);
+    assert_eq!(report.failures, 0);
+    assert!(src_file.exists(), "rollback restores the original");
+    assert_eq!(std::fs::read(&src_file).unwrap(), b"fn main() {}");
+}
+
+#[tokio::test]
+async fn rollback_service_lists_runs_most_recent_first() {
+    use tidyup_app::RollbackService;
+
+    let workdir = TempDir::new().unwrap();
+    let shelf = workdir.path().join("shelf");
+    std::fs::create_dir_all(&shelf).unwrap();
+    let src_root = workdir.path().join("src");
+    std::fs::create_dir_all(&src_root).unwrap();
+
+    let (ctx, _store) = make_ctx_with_shelf(Some(shelf));
+    let candidates = sample_scan_candidates().await;
+    let service = ScanService::new(Arc::clone(&ctx));
+
+    // Run once with no source files — just to create a run record.
+    let _ = service
+        .run(
+            tidyup_app::scan::ScanRequest {
+                root: src_root.clone(),
+                taxonomy_path: None,
+                dry_run: true,
+                auto_approve_bundles: false,
+                bundle_min_confidence: 0.85,
+            },
+            &candidates,
+            &NullProgress,
+            &AutoApprove::new(),
+        )
+        .await
+        .unwrap();
+
+    let rollback = RollbackService::new(Arc::clone(&ctx));
+    let runs = rollback.list_runs().await.unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].mode, tidyup_domain::RunMode::Scan);
 }
 
 #[tokio::test]
@@ -309,6 +412,8 @@ async fn migration_service_skips_review_when_no_loose_proposals() {
                 source: src.path().to_path_buf(),
                 target: tgt.path().to_path_buf(),
                 dry_run: true,
+                auto_approve_bundles: false,
+                bundle_min_confidence: 0.85,
             },
             &NullProgress,
             &reviewer,
