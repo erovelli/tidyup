@@ -113,7 +113,7 @@ tidyup is being built in phases. Each phase lands an independently compilable sl
 | 1     | Domain types, SQLite storage, BLAKE3 indexer, layered config, `BundleProposal` aggregate    | [x] Complete   |
 | 2     | Content extractors: router + MIME detection, plain text, PDF, Excel, image, audio           | [x] Complete   |
 | 3     | Inference: `bge-small-en-v1.5` via ONNX Runtime (default); optional LLM + remote backends   | [x] Complete   |
-| 4     | Pipeline: heuristics, bundle detection, scan + migration classifiers, rename cascade        | [ ] Not started |
+| 4     | Pipeline: heuristics, bundle detection, scan + migration classifiers, rename cascade        | [x] Complete   |
 | 5     | CLI wiring, first-run model download, end-to-end flows, v0.1 ship                           | [ ] Not started |
 | 6+    | Multimodal encoders (image/audio/video), Dioxus UI, code signing, `brew`/`winget`, plugins  | [ ] Backlog    |
 
@@ -128,12 +128,14 @@ tidyup is being built in phases. Each phase lands an independently compilable sl
 - `tidyup-embeddings-ort`: `bge-small-en-v1.5` ONNX classifier, taxonomy cache (BLAKE3-invalidated), inline YAKE, model-install verifier
 - `tidyup-inference-mistralrs` (opt-in `--features llm-fallback`): `TextBackend` + lazy `VisionBackend` via `mistralrs`; Metal/CUDA pass-through features
 - `tidyup-inference-remote` (opt-in `--features remote`): `TextBackend` over OpenAI-compatible, Anthropic, and Ollama endpoints
+- `tidyup-pipeline`: Tier 1 heuristics, bundle detection (Cargo/npm/pyproject/Gradle/Xcode/.git/Jupyter), target-tree profiler with name+centroid embeddings, extractive rename cascade (metadata → keywords → adapt → keep), scan-mode classifier against a fixed taxonomy, migration-mode classifier against an existing hierarchy
+- `tidyup-app`: `ScanService` and `MigrationService` wired to the pipeline, driving `ChangeLog` persistence and the `ReviewHandler` port
 
 **What does not yet work:**
 
-- Move/rollback execution (requires Phase 4 pipeline + Phase 5 CLI wiring)
-- Bundle detection and atomic apply
-- End-to-end classification flow (ports are built; pipeline wiring is Phase 4)
+- Move/rollback execution (apply step is Phase 5; services stop at review)
+- CLI subcommand wiring to services + first-run model download (Phase 5)
+- End-to-end user flow from a shell prompt (Phase 5)
 
 The invariants the finished tool will uphold — human-in-the-loop review, reversible moves, bundle atomicity, no-network-by-default, extractive-only renames — are enforced in the design today, but the code paths that would violate them don't exist yet.
 

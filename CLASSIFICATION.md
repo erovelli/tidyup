@@ -70,6 +70,8 @@ score(v, folder) = w_cent · cos(v, folder.content_centroid)
 
 Default weights (from `ClassifierConfig::ScoreWeights` in `tidyup-domain`): `w_cent = 0.55`, `w_name = 0.25`, `w_meta = 0.10`, `w_hier = 0.10`. Tunable per-config.
 
+**Centroid-absent fallback (v0.1).** Target folders start with `content_centroid = None` on first scan — centroids are populated only once a folder has enough member embeddings to average meaningfully. When a profile's centroid is missing, the pipeline redistributes `w_cent` onto `w_name` (so the effective `w_name` is `0.80` and the centroid term is `0`), keeping the composite on the same `[0, 1]` scale rather than shrinking it. Folder names are the only semantic signal for a cold target; name-embedding similarity is what carries those placements.
+
 Decision per file:
 
 1. Compute `score` against every candidate folder.
