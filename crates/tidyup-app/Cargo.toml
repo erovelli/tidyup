@@ -28,7 +28,9 @@ uuid        = { workspace = true }
 dirs        = { workspace = true }
 
 [dev-dependencies]
-tempfile    = { workspace = true }
+tempfile              = { workspace = true }
+tidyup-storage-sqlite = { workspace = true }
+serde_json            = { workspace = true }
 
 [lints]
 workspace = true
