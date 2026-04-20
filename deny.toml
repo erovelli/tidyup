@@ -28,8 +28,21 @@ ignore  = [
     # builds. Revisit when dioxus-desktop moves off GTK3.
     # CI privacy check on `tidyup-cli` stays clean; this dep tree is
     # UI-binary-only.
+    { id = "RUSTSEC-2024-0411", reason = "gdkwayland-sys: archived gtk-rs GTK3 stack; transitive via dioxus-desktop" },
     { id = "RUSTSEC-2024-0412", reason = "gdk: archived gtk-rs GTK3 stack; transitive via dioxus-desktop" },
+    { id = "RUSTSEC-2024-0413", reason = "atk: archived gtk-rs GTK3 stack; transitive via dioxus-desktop" },
+    { id = "RUSTSEC-2024-0414", reason = "gdkx11-sys: archived gtk-rs GTK3 stack; transitive via dioxus-desktop" },
+    { id = "RUSTSEC-2024-0415", reason = "gtk: archived gtk-rs GTK3 stack; transitive via dioxus-desktop" },
     { id = "RUSTSEC-2024-0416", reason = "atk-sys: archived gtk-rs GTK3 stack; transitive via dioxus-desktop" },
+    { id = "RUSTSEC-2024-0418", reason = "gdk-sys: archived gtk-rs GTK3 stack; transitive via dioxus-desktop" },
+    { id = "RUSTSEC-2024-0419", reason = "gtk3-macros: archived gtk-rs GTK3 stack; transitive via dioxus-desktop" },
+    { id = "RUSTSEC-2024-0420", reason = "gtk-sys: archived gtk-rs GTK3 stack; transitive via dioxus-desktop" },
+
+    # proc-macro-error 1.0.4 is unmaintained (reached via glib-macros -> glib
+    # in the same gtk3-rs dep tree above). Also only reachable from tidyup-ui.
+    # No upstream fix; alternatives (proc-macro-error2 / manyhow) aren't
+    # adopted by the GTK3 bindings we're pulling in transitively.
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error: unmaintained; transitive via glib-macros (GTK3 stack) under dioxus-desktop" },
 ]
 
 [licenses]
