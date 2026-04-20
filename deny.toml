@@ -19,6 +19,17 @@ ignore  = [
     # number_prefix 0.4.0 is unmaintained (indicatif dep). Pulled in transitively by
     # hf-hub -> mistralrs. Only reachable under --features llm-fallback.
     { id = "RUSTSEC-2025-0119", reason = "transitive via hf-hub -> indicatif; only under --features llm-fallback; no upstream fix" },
+
+    # gtk-rs GTK3 bindings archived 2024. Pulled in transitively via
+    # dioxus-desktop -> wry/tao/muda/tray-icon only in the `tidyup-ui` binary.
+    # Upstream recommends migrating to gtk4-rs, but wry/tao haven't cut over
+    # yet, so no "safe upgrade" is available for dioxus-desktop 0.7. These are
+    # unmaintained advisories, not active CVEs — the code still ships and
+    # builds. Revisit when dioxus-desktop moves off GTK3.
+    # CI privacy check on `tidyup-cli` stays clean; this dep tree is
+    # UI-binary-only.
+    { id = "RUSTSEC-2024-0412", reason = "gdk: archived gtk-rs GTK3 stack; transitive via dioxus-desktop" },
+    { id = "RUSTSEC-2024-0416", reason = "atk-sys: archived gtk-rs GTK3 stack; transitive via dioxus-desktop" },
 ]
 
 [licenses]
