@@ -83,7 +83,7 @@ domain → core → { storage-sqlite, inference-*, embeddings-ort, extract } →
 
 Two patterns are architectural contracts, not suggestions:
 
-1. **Frontend seam.** `tidyup-app` services take `&dyn ProgressReporter` and `&dyn ReviewHandler`. Never embed a frontend impl in a service. Adding a new frontend (web, TUI, MCP) = implementing two traits. It must not require a service-layer refactor.
+1. **Frontend seam.** `tidyup-app` services take `&dyn ProgressReporter` and `&dyn ReviewHandler`. Never embed a frontend impl in a service. Two live implementations already exercise this seam — `tidyup-cli` (indicatif + interactive prompts) and `tidyup-ui` (Dioxus signal-backed progress + oneshot-channel review). Adding another frontend (web, TUI, MCP) = implementing two traits; it must not require a service-layer refactor. Note that `SyncStorage`-backed signals are the UI-side requirement to satisfy `Send + Sync` on those trait objects.
 
 2. **Inference backend registry.** Backends register by capability at runtime, driven by `InferenceConfig.backends` (ordered list of IDs: `"mistralrs"`, `"remote-openai"`, `"ollama"`). Runtime *selection* is config-driven — not a cargo feature flag. Adding a backend: new `tidyup-inference-*` crate + implement `TextBackend`/`VisionBackend`/`EmbeddingBackend` + register. No pipeline/app changes.
 
@@ -198,6 +198,7 @@ Treat docs as part of the change. When a code change lands, update the affected 
 - **`README.md`** is the roadmap of record and also makes user-facing claims (default behaviour, feature gates, CLI surface, privacy guarantees, supported modalities, install story). When a Phase item ships, tick the checkbox in the roadmap table and update the "What currently works" / "What does not yet work" lists. When a change alters user-facing behaviour, update the relevant section. If the change is purely internal, leave it alone.
 - **`ARCHITECTURE.md`** — update when a crate boundary, seam, port trait, or layering rule changes. Not for implementation-only changes.
 - **`CLASSIFICATION.md`** — update when the tier cascade, default thresholds, rename cascade, or per-modality coverage changes.
+- **`DESIGN.md`** — update when UI/UX tokens, surface rules, component specs, or do/don't guidance change. Frontend work (`tidyup-ui` and any future frontend) should conform to it; deviations get reflected here.
 - **`CLAUDE.md`** — update when a change establishes a new invariant or "don't do this" rule future work must obey. It's guidance, not a spec; don't mirror implementation details.
 
 Rule of thumb: if someone reading a doc *today* would be misled by *yesterday's* code change, the doc is out of date. Don't wait to be asked.
@@ -206,6 +207,7 @@ Rule of thumb: if someone reading a doc *today* would be misled by *yesterday's*
 
 - `ARCHITECTURE.md` — layer diagram, seam rationale, crate boundary justifications.
 - `CLASSIFICATION.md` — three-tier cascade, embedding-default rationale, per-modality roadmap, rename extractive cascade.
+- `DESIGN.md` — UI/UX design system ("The Verdant Archive"): colors, typography, elevation, component specs, do/don't rules.
 - `README.md` — user-facing overview plus the phase-by-phase roadmap.
 - `CONTRIBUTING.md` — PR checklist, commit style.
 - `deny.toml` — license + source policy.

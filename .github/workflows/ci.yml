@@ -48,6 +48,20 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      # dioxus-desktop transitively depends on wry + tao, which need GTK3,
+      # WebKit2GTK 4.1, libsoup3, libayatana-appindicator and libxdo (rfd) via
+      # pkg-config. macOS / Windows runners pick up WKWebView / WebView2 from
+      # the system; Ubuntu needs the packages installed explicitly.
+      - name: Install tidyup-ui system deps (Linux)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libsoup-3.0-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy -p tidyup-cli --all-targets --features llm-fallback,remote -- -D warnings
       - run: cargo clippy -p tidyup-extract --all-targets --all-features -- -D warnings
@@ -70,6 +84,18 @@ jobs:
         with:
           toolchain: ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@v2
+      # Same rationale as the clippy job; only Linux needs the apt install.
+      - name: Install tidyup-ui system deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libsoup-3.0-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev
       - run: cargo test --workspace
       - run: cargo test -p tidyup-cli --features llm-fallback,remote
       - run: cargo test -p tidyup-extract --all-features
@@ -91,4 +117,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@cargo-hack
       - uses: Swatinem/rust-cache@v2
+      # `--workspace` pulls tidyup-ui into every feature combination; see
+      # clippy job for the rationale.
+      - name: Install tidyup-ui system deps (Linux)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libsoup-3.0-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev
       - run: cargo hack --feature-powerset --exclude-features default,metal,cuda,llm-metal,llm-cuda check --workspace

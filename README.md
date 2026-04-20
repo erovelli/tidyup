@@ -15,7 +15,10 @@ Your files stay where they belong — with you.
 > As of Phase 5, `tidyup migrate`, `tidyup scan`, and `tidyup rollback` run
 > end-to-end on the default binary: proposals are generated, reviewed,
 > shelved, moved, and reversible. First-run fails fast with installer
-> instructions when the embedding model is missing. That said, the
+> instructions when the embedding model is missing. Phase 6 adds the
+> `tidyup-desktop` Dioxus UI on top of the same `ServiceContext` — the
+> plug-and-play seam promised by the architecture: CLI and UI differ only in
+> how they report progress and gather review decisions. That said, the
 > confidence thresholds, default taxonomy, and rename cascade have not yet
 > been calibrated against a real corpus, interactive bundle review is still
 > TODO, and the multimodal encoders aren't wired in — so please do not yet
@@ -121,7 +124,8 @@ tidyup is being built in phases. Each phase lands an independently compilable sl
 | 3     | Inference: `bge-small-en-v1.5` via ONNX Runtime (default); optional LLM + remote backends   | [x] Complete   |
 | 4     | Pipeline: heuristics, bundle detection, scan + migration classifiers, rename cascade        | [x] Complete   |
 | 5     | CLI wiring, apply + rollback, first-run model check, end-to-end flows                       | [x] Complete   |
-| 6+    | Multimodal encoders (image/audio/video), Dioxus UI, code signing, `brew`/`winget`, plugins  | [ ] Backlog    |
+| 6     | Dioxus desktop UI (dashboard, review, runs, settings) on the same service seam              | [x] Complete   |
+| 7+    | Multimodal encoders (image/audio/video), interactive bundle review, code signing, packaging | [ ] Backlog    |
 
 **What currently works:**
 
@@ -137,13 +141,14 @@ tidyup is being built in phases. Each phase lands an independently compilable sl
 - `tidyup-pipeline`: Tier 1 heuristics, bundle detection (Cargo/npm/pyproject/Gradle/Xcode/.git/Jupyter), target-tree profiler with name+centroid embeddings, extractive rename cascade (metadata → keywords → adapt → keep), scan-mode classifier against a fixed taxonomy, migration-mode classifier against an existing hierarchy
 - `tidyup-app`: `ScanService`, `MigrationService`, and `RollbackService` driving the pipeline end-to-end — shelve → move → mark applied → per-run rollback via the `RunLog`
 - First-run model check: scan/migrate surface `cargo xtask download-models` (or a manual placement hint) when the embedding bundle is missing, without linking an HTTP client
+- `tidyup-ui`: Dioxus 0.7 desktop binary (`cargo run -p tidyup-ui --bin tidyup-desktop`) with Dashboard / Review / Runs / Settings pages, signal-backed `ProgressReporter` and oneshot-channel `ReviewHandler`. Same `ServiceContext` construction, extractors, and embedding model as the CLI — the only difference is the frontend port impls. Styled per `DESIGN.md` ("The Verdant Archive")
 
 **What does not yet work:**
 
-- Interactive bundle review. Bundles above the configured confidence threshold auto-apply under `--yes`; otherwise they stay pending with a warning. Full bundle-review UX lands in Phase 6+.
+- Interactive bundle review. Bundles above the configured confidence threshold auto-apply under `--yes`; otherwise they stay pending with a warning. Full bundle-review UX lands in Phase 7+.
 - Multimodal encoders (image/audio/video backends). Images/audio still classify via embedded metadata + filename for now.
 - Calibrated confidence. v0.1 confidence is raw weighted-cosine; calibration is a v0.2 story.
-- Dioxus UI, signed binaries, Homebrew/winget packaging.
+- Signed binaries, Homebrew/winget packaging.
 
 The invariants the finished tool will uphold — human-in-the-loop review, reversible moves, bundle atomicity, no-network-by-default, extractive-only renames — are now enforced at the code path, not just the design.
 

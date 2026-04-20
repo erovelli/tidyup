@@ -18,19 +18,27 @@ name = "tidyup-desktop"
 path = "src/main.rs"
 
 [dependencies]
-tidyup-domain                = { workspace = true }
-tidyup-core                  = { workspace = true }
-tidyup-app                   = { workspace = true }
-tidyup-storage-sqlite        = { workspace = true }
-tidyup-extract               = { workspace = true }
-tidyup-embeddings-ort        = { workspace = true }
-tidyup-inference-mistralrs   = { workspace = true }
+tidyup-domain         = { workspace = true }
+tidyup-core           = { workspace = true }
+tidyup-app            = { workspace = true }
+tidyup-pipeline       = { workspace = true }
+tidyup-storage-sqlite = { workspace = true }
+tidyup-extract        = { workspace = true }
+tidyup-embeddings-ort = { workspace = true }
 
-anyhow       = { workspace = true }
-async-trait  = { workspace = true }
-tokio        = { workspace = true }
-tracing      = { workspace = true }
-# dioxus = { version = "0.6", features = ["desktop", "router"] }
+anyhow             = { workspace = true }
+async-trait        = { workspace = true }
+tokio              = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+toml               = { workspace = true }
+uuid               = { workspace = true }
+chrono             = { workspace = true }
+
+dioxus             = { workspace = true }
+rfd                = { workspace = true }
 
 [lints]
 workspace = true
