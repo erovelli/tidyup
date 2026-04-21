@@ -17,27 +17,92 @@ struct Artifact {
     url: &'static str,
 }
 
-const MODEL_DIR: &str = "bge-small-en-v1.5";
+struct Bundle {
+    name: &'static str,
+    dir: &'static str,
+    artifacts: &'static [Artifact],
+}
 
-const ARTIFACTS: &[Artifact] = &[
-    Artifact {
-        filename: "model.onnx",
-        url: "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/onnx/model.onnx",
-    },
-    Artifact {
-        filename: "tokenizer.json",
-        url: "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/tokenizer.json",
-    },
-];
+const BGE_SMALL: Bundle = Bundle {
+    name: "bge-small-en-v1.5",
+    dir: "bge-small-en-v1.5",
+    artifacts: &[
+        Artifact {
+            filename: "model.onnx",
+            url: "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/onnx/model.onnx",
+        },
+        Artifact {
+            filename: "tokenizer.json",
+            url: "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/tokenizer.json",
+        },
+    ],
+};
+
+const SIGLIP: Bundle = Bundle {
+    name: "siglip-base-patch16-224",
+    dir: "siglip-base-patch16-224",
+    artifacts: &[
+        Artifact {
+            filename: "vision_model.onnx",
+            url: "https://huggingface.co/nielsr/siglip-base-patch16-224/resolve/main/onnx/vision_model.onnx",
+        },
+        Artifact {
+            filename: "text_model.onnx",
+            url: "https://huggingface.co/nielsr/siglip-base-patch16-224/resolve/main/onnx/text_model.onnx",
+        },
+        Artifact {
+            filename: "tokenizer.json",
+            url: "https://huggingface.co/nielsr/siglip-base-patch16-224/resolve/main/tokenizer.json",
+        },
+    ],
+};
+
+const CLAP: Bundle = Bundle {
+    name: "clap-htsat-unfused",
+    dir: "clap-htsat-unfused",
+    artifacts: &[
+        Artifact {
+            filename: "audio_model.onnx",
+            url: "https://huggingface.co/Xenova/clap-htsat-unfused/resolve/main/onnx/audio_model.onnx",
+        },
+        Artifact {
+            filename: "text_model.onnx",
+            url: "https://huggingface.co/Xenova/clap-htsat-unfused/resolve/main/onnx/text_model.onnx",
+        },
+        Artifact {
+            filename: "tokenizer.json",
+            url: "https://huggingface.co/Xenova/clap-htsat-unfused/resolve/main/tokenizer.json",
+        },
+    ],
+};
 
 #[allow(unreachable_pub)]
-pub fn download(force: bool) -> Result<()> {
-    let target_dir = resolve_cache_dir()?.join(MODEL_DIR);
+pub fn download(force: bool, siglip: bool, clap: bool) -> Result<()> {
+    let cache = resolve_cache_dir()?;
+    let mut bundles: Vec<&Bundle> = vec![&BGE_SMALL];
+    if siglip {
+        bundles.push(&SIGLIP);
+    }
+    if clap {
+        bundles.push(&CLAP);
+    }
+    for bundle in bundles {
+        download_bundle(&cache, bundle, force)?;
+    }
+    Ok(())
+}
+
+fn download_bundle(cache: &Path, bundle: &Bundle, force: bool) -> Result<()> {
+    let target_dir = cache.join(bundle.dir);
     std::fs::create_dir_all(&target_dir)
         .with_context(|| format!("create cache dir {}", target_dir.display()))?;
 
-    println!("Downloading into {}", target_dir.display());
-    for artifact in ARTIFACTS {
+    println!(
+        "[{}] Downloading into {}",
+        bundle.name,
+        target_dir.display()
+    );
+    for artifact in bundle.artifacts {
         let dest = target_dir.join(artifact.filename);
         if dest.exists() && !force {
             println!(

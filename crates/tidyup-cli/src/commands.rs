@@ -8,7 +8,10 @@ use tidyup_app::{
     migration::MigrationRequest, scan::ScanRequest, MigrationService, RollbackService, ScanService,
 };
 
-use crate::context::{build, build_default_scan_candidates, describe_data_dir};
+use crate::context::{
+    build, build_audio_scan_candidates, build_default_scan_candidates, build_image_scan_candidates,
+    describe_data_dir,
+};
 use crate::reporter::CliReporter;
 use crate::review::{AutoApproveHandler, InteractiveHandler};
 use crate::{Cli, Command};
@@ -107,6 +110,8 @@ async fn run_scan(
     let reviewer = reviewer_for(yes);
 
     let candidates = build_default_scan_candidates(ctx.embeddings.as_ref()).await?;
+    let image_candidates = build_image_scan_candidates(ctx.image_embeddings.as_deref()).await?;
+    let audio_candidates = build_audio_scan_candidates(ctx.audio_embeddings.as_deref()).await?;
 
     let service = ScanService::new(ctx);
     let report = service
@@ -119,6 +124,8 @@ async fn run_scan(
                 bundle_min_confidence: YES_BUNDLE_MIN_CONFIDENCE,
             },
             &candidates,
+            &image_candidates,
+            &audio_candidates,
             &reporter,
             reviewer.as_ref(),
         )

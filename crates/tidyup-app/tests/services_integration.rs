@@ -169,6 +169,8 @@ fn make_ctx_with_shelf(shelf: Option<std::path::PathBuf>) -> (Arc<ServiceContext
         text: Arc::new(StubText),
         embeddings: Arc::new(BucketEmbeddings),
         vision: None,
+        image_embeddings: None,
+        audio_embeddings: None,
         extractors: vec![Arc::new(PlainExtractor)],
     });
     (ctx, store)
@@ -217,6 +219,8 @@ async fn scan_service_persists_proposals_and_auto_approves() {
                 bundle_min_confidence: 0.85,
             },
             &candidates,
+            &[],
+            &[],
             &NullProgress,
             &reviewer,
         )
@@ -257,6 +261,8 @@ async fn scan_service_records_bundles_separately() {
                 bundle_min_confidence: 0.85,
             },
             &candidates,
+            &[],
+            &[],
             &NullProgress,
             &reviewer,
         )
@@ -336,6 +342,8 @@ async fn scan_service_applies_moves_and_rollback_restores_them() {
                 bundle_min_confidence: 0.85,
             },
             &candidates,
+            &[],
+            &[],
             &NullProgress,
             &reviewer,
         )
@@ -384,6 +392,8 @@ async fn rollback_service_lists_runs_most_recent_first() {
                 bundle_min_confidence: 0.85,
             },
             &candidates,
+            &[],
+            &[],
             &NullProgress,
             &AutoApprove::new(),
         )

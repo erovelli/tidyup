@@ -30,15 +30,29 @@ enum Task {
     Deny,
     /// Run `cargo hack --feature-powerset check` to catch feature breakage.
     FeatureMatrix,
-    /// Download the default embedding model into the platform cache directory.
+    /// Download model bundles into the platform cache directory.
     ///
     /// Used by packagers and developers. The default tidyup CLI binary is
     /// network-silent by design (see `CLAUDE.md`) — this xtask is the
     /// sanctioned one-shot installer.
+    ///
+    /// By default downloads only the text embedding bundle (`bge-small`).
+    /// Pass `--siglip` to additionally fetch the Phase 7 image encoder, or
+    /// `--clap` for the audio encoder. `--multimodal` is shorthand for
+    /// `--siglip --clap`.
     DownloadModels {
         /// Overwrite existing files if they are present.
         #[arg(long)]
         force: bool,
+        /// Also download the `SigLIP` image encoder bundle.
+        #[arg(long)]
+        siglip: bool,
+        /// Also download the `CLAP` audio encoder bundle.
+        #[arg(long)]
+        clap: bool,
+        /// Convenience: enables both `--siglip` and `--clap`.
+        #[arg(long)]
+        multimodal: bool,
     },
     /// Assert the default `tidyup-cli` dep graph contains no network or LLM
     /// deps. Runs `cargo tree -p tidyup-cli -e normal` and fails if any
@@ -70,7 +84,16 @@ impl Task {
             Self::Lint => run_ci_lints(),
             Self::Deny => ext("cargo-deny", &["check"]),
             Self::FeatureMatrix => ext("cargo-hack", &["hack", "--feature-powerset", "check"]),
-            Self::DownloadModels { force } => models::download(force),
+            Self::DownloadModels {
+                force,
+                siglip,
+                clap,
+                multimodal,
+            } => {
+                let want_siglip = siglip || multimodal;
+                let want_clap = clap || multimodal;
+                models::download(force, want_siglip, want_clap)
+            }
             Self::CheckPrivacy => privacy::check(),
         }
     }

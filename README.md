@@ -110,6 +110,23 @@ cargo build --release -p tidyup-cli --features remote
 
 Rust pinned to 1.90 via `rust-toolchain.toml`. The default-binary embedding model (~35 MB) is fetched out-of-band by `cargo xtask download-models` — the release binary itself has no HTTP client and cannot download anything. Packagers are expected to bundle the model alongside the binary; developers run the xtask once. Model cache: `dirs::cache_dir()/tidyup/models/` (overridable via `TIDYUP_MODEL_CACHE`).
 
+**Multimodal model bundles (optional, Phase 7).** Image and audio Tier 2
+classification needs the SigLIP and CLAP ONNX bundles — neither ships by
+default because each adds ~200–400 MB to the on-disk install.
+
+```bash
+# Just the SigLIP image encoder (~370 MB).
+cargo xtask download-models --siglip
+# Just the CLAP audio encoder (~600 MB).
+cargo xtask download-models --clap
+# Both at once.
+cargo xtask download-models --multimodal
+```
+
+The CLI and UI binaries detect the bundles at startup and enable the
+modality-specific Tier 2 path automatically when present. Absent bundles are
+not an error — image/audio files fall back to Tier 1 heuristics.
+
 ---
 
 ## Roadmap
@@ -125,7 +142,8 @@ tidyup is being built in phases. Each phase lands an independently compilable sl
 | 4     | Pipeline: heuristics, bundle detection, scan + migration classifiers, rename cascade        | [x] Complete   |
 | 5     | CLI wiring, apply + rollback, first-run model check, end-to-end flows                       | [x] Complete   |
 | 6     | Dioxus desktop UI (dashboard, review, runs, settings) on the same service seam              | [x] Complete   |
-| 7+    | Multimodal encoders (image/audio/video), interactive bundle review, code signing, packaging | [ ] Backlog    |
+| 7     | Multimodal encoders (SigLIP image / CLAP audio Tier 2) wired into scan-mode for both CLI and UI | [x] Complete   |
+| 8+    | Interactive bundle review, video keyframe encoder, code signing, packaging                  | [ ] Backlog    |
 
 **What currently works:**
 
@@ -142,11 +160,13 @@ tidyup is being built in phases. Each phase lands an independently compilable sl
 - `tidyup-app`: `ScanService`, `MigrationService`, and `RollbackService` driving the pipeline end-to-end — shelve → move → mark applied → per-run rollback via the `RunLog`
 - First-run model check: scan/migrate surface `cargo xtask download-models` (or a manual placement hint) when the embedding bundle is missing, without linking an HTTP client
 - `tidyup-ui`: Dioxus 0.7 desktop binary (`cargo run -p tidyup-ui --bin tidyup-desktop`) with Dashboard / Review / Runs / Settings pages, signal-backed `ProgressReporter` and oneshot-channel `ReviewHandler`. Same `ServiceContext` construction, extractors, and embedding model as the CLI — the only difference is the frontend port impls. Styled per `DESIGN.md` ("The Verdant Archive")
+- **Phase 7 multimodal Tier 2 (optional, off-by-default)**: SigLIP-base for cross-modal image classification and CLAP-htsat-unfused for audio. Both are pure-Rust ONNX (no FFI beyond `ort`/`symphonia`/`image`) and load only when their model bundles exist on disk. Default install ships text-only — image and audio files fall back to Tier 1 heuristics when the multimodal bundles aren't installed. Fetch them with `cargo xtask download-models --multimodal`. Wired identically into both CLI and UI `ServiceContext`
 
 **What does not yet work:**
 
-- Interactive bundle review. Bundles above the configured confidence threshold auto-apply under `--yes`; otherwise they stay pending with a warning. Full bundle-review UX lands in Phase 7+.
-- Multimodal encoders (image/audio/video backends). Images/audio still classify via embedded metadata + filename for now.
+- Interactive bundle review. Bundles above the configured confidence threshold auto-apply under `--yes`; otherwise they stay pending with a warning. Full bundle-review UX lands in Phase 8+.
+- Migration-mode multimodal. Phase 7 wires SigLIP/CLAP into scan mode; migration mode still classifies images/audio against text-embedded folder profiles, which is a weaker signal until folder profiles also gain image/audio centroids.
+- Video keyframe encoder. Video files still classify via Tier 1 only — pure-Rust frame-extraction is gated on the `ffmpeg-next` FFI vs metadata-only decision.
 - Calibrated confidence. v0.1 confidence is raw weighted-cosine; calibration is a v0.2 story.
 - Signed binaries, Homebrew/winget packaging.
 

@@ -95,11 +95,18 @@ impl BackendKind {
 
 /// Backend capability modalities — used by a runtime registry to pick the best
 /// backend for a request. A backend may advertise any subset.
+///
+/// `Embeddings` covers text-only embedding backends (e.g. `bge-small`).
+/// `ImageEmbeddings` and `AudioEmbeddings` cover cross-modal contrastive
+/// encoders (`SigLIP`, `CLAP`) — distinct because their latent spaces are
+/// not interchangeable with each other or with text-only embeddings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Modality {
     Text,
     Vision,
     Embeddings,
+    ImageEmbeddings,
+    AudioEmbeddings,
 }
 
 /// Runtime capability descriptor. A registry uses this to pick the best backend
@@ -215,6 +222,63 @@ pub trait EmbeddingBackend: Send + Sync {
 
     /// Stable identifier. Used as a cache key for taxonomy and folder-profile
     /// caches; changing this invalidates them.
+    fn model_id(&self) -> &str;
+}
+
+/// Cross-modal image embedding backend — produces L2-normalized vectors in a
+/// shared image-text latent space (e.g. `SigLIP`).
+///
+/// The text and image methods produce vectors in the **same** latent space, so
+/// `cosine(embed_image(bytes), embed_text("a photograph of a cat"))` is a
+/// meaningful similarity score. This is the v0.1 mechanism for image-modality
+/// classification: pre-embed taxonomy descriptions with `embed_text`, embed
+/// the candidate image with `embed_image`, and rank by cosine similarity.
+///
+/// **Latent-space isolation.** These vectors are NOT comparable to those from
+/// [`EmbeddingBackend`] — pairing them would compute meaningless cosines. The
+/// pipeline keeps the backends separate to make this impossible to mis-wire.
+#[async_trait]
+pub trait ImageEmbeddingBackend: Send + Sync {
+    /// Embed raw image bytes. `mime` is informational — implementations may
+    /// use it to short-circuit decoding for unsupported formats.
+    async fn embed_image(&self, image_bytes: &[u8], mime: &str) -> Result<Vec<f32>>;
+
+    /// Embed a text query in the same latent space (`SigLIP` text tower).
+    async fn embed_text(&self, text: &str) -> Result<Vec<f32>>;
+
+    /// Batched text embedding for taxonomy precomputation.
+    async fn embed_texts(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>>;
+
+    /// Output dimensionality (`SigLIP-base` = 768).
+    fn dimensions(&self) -> usize;
+
+    /// Stable identifier. Cache key for image-taxonomy embeddings.
+    fn model_id(&self) -> &str;
+}
+
+/// Cross-modal audio embedding backend — produces L2-normalized vectors in a
+/// shared audio-text latent space (e.g. `CLAP`).
+///
+/// Same shape as [`ImageEmbeddingBackend`] but for audio: pre-embed taxonomy
+/// descriptions, embed the candidate audio, rank by cosine. Latent-space
+/// isolation applies — these vectors are not comparable to text-only
+/// [`EmbeddingBackend`] or [`ImageEmbeddingBackend`] vectors.
+#[async_trait]
+pub trait AudioEmbeddingBackend: Send + Sync {
+    /// Embed raw audio bytes. Implementations are responsible for resampling,
+    /// mel-spectrogram computation, and length truncation.
+    async fn embed_audio(&self, audio_bytes: &[u8], mime: &str) -> Result<Vec<f32>>;
+
+    /// Embed a text query in the same latent space (`CLAP` text tower).
+    async fn embed_text(&self, text: &str) -> Result<Vec<f32>>;
+
+    /// Batched text embedding for taxonomy precomputation.
+    async fn embed_texts(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>>;
+
+    /// Output dimensionality (`CLAP-htsat` = 512).
+    fn dimensions(&self) -> usize;
+
+    /// Stable identifier.
     fn model_id(&self) -> &str;
 }
 
@@ -414,5 +478,19 @@ mod tests {
         assert!(caps.supports(Modality::Text));
         assert!(caps.supports(Modality::Embeddings));
         assert!(!caps.supports(Modality::Vision));
+        assert!(!caps.supports(Modality::ImageEmbeddings));
+        assert!(!caps.supports(Modality::AudioEmbeddings));
+    }
+
+    #[test]
+    fn backend_capabilities_supports_multimodal() {
+        let caps = BackendCapabilities {
+            name: "siglip".into(),
+            modalities: vec![Modality::ImageEmbeddings],
+            requires_network: false,
+            accelerator: Accelerator::Cpu,
+        };
+        assert!(caps.supports(Modality::ImageEmbeddings));
+        assert!(!caps.supports(Modality::Embeddings));
     }
 }

@@ -28,7 +28,9 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tidyup_core::extractor::ContentExtractor;
 use tidyup_core::frontend::{Level, ProgressItem, ProgressReporter};
-use tidyup_core::inference::EmbeddingBackend;
+use tidyup_core::inference::{
+    AudioEmbeddingBackend, EmbeddingBackend, FileModality, ImageEmbeddingBackend,
+};
 use tidyup_domain::change::{ChangeProposal, ChangeStatus, ChangeType};
 use tidyup_domain::{BundleKind, BundleProposal, ClassifierConfig, Phase};
 use uuid::Uuid;
@@ -58,6 +60,38 @@ pub struct ScanCandidate {
     pub embedding: Vec<f32>,
 }
 
+/// Optional multimodal Tier 2 backends + per-modality candidate lists.
+///
+/// Phase 7 wiring: when a backend is present, the pipeline routes files of
+/// that modality through it instead of (or in addition to) the text cascade.
+/// Each candidate list embeds in the **modality-specific** latent space and
+/// is NOT interchangeable with the text-only `ScanCandidate` list passed at
+/// the top level — the pipeline keeps them separate so a misconfigured
+/// caller can't compute a meaningless cross-space cosine.
+///
+/// `Default::default()` returns an empty context so legacy text-only
+/// callers don't have to know about Phase 7.
+#[derive(Default)]
+#[allow(missing_debug_implementations)] // trait objects don't implement Debug
+pub struct MultimodalContext<'a> {
+    pub image: Option<ImageContext<'a>>,
+    pub audio: Option<AudioContext<'a>>,
+}
+
+/// Image-side classification context: SigLIP-style backend + image taxonomy.
+#[allow(missing_debug_implementations)]
+pub struct ImageContext<'a> {
+    pub backend: &'a dyn ImageEmbeddingBackend,
+    pub candidates: &'a [ScanCandidate],
+}
+
+/// Audio-side classification context: CLAP-style backend + audio taxonomy.
+#[allow(missing_debug_implementations)]
+pub struct AudioContext<'a> {
+    pub backend: &'a dyn AudioEmbeddingBackend,
+    pub candidates: &'a [ScanCandidate],
+}
+
 /// Output of one scan pass.
 #[derive(Debug, Clone)]
 pub struct ScanOutcome {
@@ -75,15 +109,21 @@ pub struct ScanOutcome {
 /// path — typically the source root itself (to reorganize in-place) or a
 /// user-specified directory.
 ///
+/// `multimodal` carries optional Phase 7 image/audio backends + their per-
+/// modality candidate lists. Pass [`MultimodalContext::default()`] for the
+/// text-only cascade.
+///
 /// # Errors
 /// Propagates source-read and embedding-backend failures. Per-file extraction
 /// or classification errors are logged via `progress.message(Level::Warn, …)`
 /// and surfaced through [`ScanOutcome::unclassified`].
+#[allow(clippy::too_many_arguments)]
 pub async fn run_scan(
     source_root: &Path,
     output_root: &Path,
     candidates: &[ScanCandidate],
     embeddings: &dyn EmbeddingBackend,
+    multimodal: &MultimodalContext<'_>,
     extractors: &[Arc<dyn ContentExtractor>],
     config: &ClassifierConfig,
     progress: &dyn ProgressReporter,
@@ -120,7 +160,7 @@ pub async fn run_scan(
         .await;
 
     for (idx, path) in tree.loose_files.iter().enumerate() {
-        match classify_file(path, candidates, embeddings, extractors, config).await {
+        match classify_file(path, candidates, embeddings, multimodal, extractors, config).await {
             Ok(Some(classified)) => {
                 let proposal = build_proposal(path, output_root, &classified);
                 outcome.proposals.push(proposal);
@@ -173,11 +213,12 @@ struct ClassifiedFile {
 ///
 /// Returns `Ok(None)` when no tier produced any signal (typically: unknown
 /// extension and extraction failure).
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn classify_file(
     path: &Path,
     candidates: &[ScanCandidate],
     embeddings: &dyn EmbeddingBackend,
+    multimodal: &MultimodalContext<'_>,
     extractors: &[Arc<dyn ContentExtractor>],
     config: &ClassifierConfig,
 ) -> Result<Option<ClassifiedFile>> {
@@ -240,7 +281,42 @@ async fn classify_file(
         }
     }
 
-    // Tier 2. Requires extracted text.
+    // Tier 2 — modality-aware. Image/audio files with the corresponding
+    // backend present go through cross-modal classification (SigLIP / CLAP).
+    // Fall through to text classification for everything else, or if the
+    // modality backend is absent.
+    let modality = file_modality(path, effective_mime.as_deref());
+    if matches!(modality, FileModality::Image) {
+        if let Some(img_ctx) = multimodal.image.as_ref() {
+            if let Some(verdict) = classify_image(
+                path,
+                img_ctx,
+                effective_mime.as_deref(),
+                extracted.as_ref(),
+                config,
+            )
+            .await?
+            {
+                return Ok(Some(verdict));
+            }
+        }
+    } else if matches!(modality, FileModality::Audio) {
+        if let Some(aud_ctx) = multimodal.audio.as_ref() {
+            if let Some(verdict) = classify_audio(
+                path,
+                aud_ctx,
+                effective_mime.as_deref(),
+                extracted.as_ref(),
+                config,
+            )
+            .await?
+            {
+                return Ok(Some(verdict));
+            }
+        }
+    }
+
+    // Tier 2 text path. Requires extracted text.
     let text = extracted.as_ref().and_then(|e| e.text.as_deref());
     let Some(text) = text else {
         // No text → no embedding → we can only report Tier 1 if it fired at
@@ -292,6 +368,134 @@ async fn classify_file(
         rename: rename.proposal,
         classification_confidence: Some(best_score),
         rename_mismatch_score: rename.mismatch_score,
+    }))
+}
+
+/// Decide a file's modality from its extension + MIME. Used to pick which
+/// Tier 2 backend handles it. Mirrors the classification in
+/// `tidyup-extract` but produces the [`FileModality`] enum the inference
+/// crate exposes.
+fn file_modality(path: &Path, mime: Option<&str>) -> FileModality {
+    if let Some(m) = mime {
+        if m.starts_with("image/") {
+            return FileModality::Image;
+        }
+        if m.starts_with("audio/") {
+            return FileModality::Audio;
+        }
+        if m.starts_with("video/") {
+            return FileModality::Video;
+        }
+        if m.starts_with("text/") || m == "application/pdf" {
+            return FileModality::Text;
+        }
+    }
+    let Some(ext) = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(str::to_ascii_lowercase)
+    else {
+        return FileModality::Skip;
+    };
+    match ext.as_str() {
+        "jpg" | "jpeg" | "png" | "gif" | "bmp" | "tiff" | "tif" | "webp" | "ico" | "avif"
+        | "jxl" | "heic" | "heif" | "raw" | "cr2" | "cr3" | "nef" | "arw" | "orf" | "dng"
+        | "rw2" | "raf" => FileModality::Image,
+        "mp3" | "flac" | "m4a" | "wav" | "ogg" | "opus" | "aiff" | "aif" | "ape" | "wma"
+        | "alac" | "aac" | "mka" => FileModality::Audio,
+        "mp4" | "mov" | "mkv" | "avi" | "wmv" | "flv" | "webm" | "m4v" | "mpg" | "mpeg" => {
+            FileModality::Video
+        }
+        _ => FileModality::Text,
+    }
+}
+
+/// Image-modality Tier 2 — `SigLIP` cross-modal cosine against image taxonomy.
+///
+/// Returns `Ok(None)` when the image fails to read or the candidate list is
+/// empty. The caller falls back to the text Tier 2 path in that case.
+async fn classify_image(
+    path: &Path,
+    ctx: &ImageContext<'_>,
+    mime: Option<&str>,
+    extracted: Option<&tidyup_core::extractor::ExtractedContent>,
+    config: &ClassifierConfig,
+) -> Result<Option<ClassifiedFile>> {
+    if ctx.candidates.is_empty() {
+        return Ok(None);
+    }
+    let Ok(bytes) = tokio::fs::read(path).await else {
+        return Ok(None);
+    };
+    let mime_str = mime.unwrap_or("application/octet-stream");
+    let Ok(embedding) = ctx.backend.embed_image(&bytes, mime_str).await else {
+        return Ok(None);
+    };
+    let (best_idx, best_score, gap) = best_match(&embedding, ctx.candidates);
+    let Some(idx) = best_idx else {
+        return Ok(None);
+    };
+    let candidate = &ctx.candidates[idx];
+    let needs_review = best_score < config.embedding_threshold || gap < config.ambiguity_gap;
+    let year = year_from_path_and_text(path, extracted.and_then(|e| e.text.as_deref()));
+    Ok(Some(ClassifiedFile {
+        folder_path: candidate.folder_path.clone(),
+        confidence: best_score,
+        reasoning: format!(
+            "tier2 image: cos={best_score:.3} gap={gap:.3} model={}",
+            ctx.backend.model_id(),
+        ),
+        needs_review,
+        year,
+        temporal: candidate.temporal,
+        // Image-side rename gating is intentionally not wired in v0.1 of
+        // Phase 7 — extractive renames for images come from the existing
+        // EXIF metadata path, which the text Tier 2 cascade already covers.
+        // Surfacing image filenames as-is keeps the cross-modal cut conservative.
+        rename: RenameProposal::Keep,
+        classification_confidence: Some(best_score),
+        rename_mismatch_score: None,
+    }))
+}
+
+/// Audio-modality Tier 2 — `CLAP` cross-modal cosine against audio taxonomy.
+async fn classify_audio(
+    path: &Path,
+    ctx: &AudioContext<'_>,
+    mime: Option<&str>,
+    extracted: Option<&tidyup_core::extractor::ExtractedContent>,
+    config: &ClassifierConfig,
+) -> Result<Option<ClassifiedFile>> {
+    if ctx.candidates.is_empty() {
+        return Ok(None);
+    }
+    let Ok(bytes) = tokio::fs::read(path).await else {
+        return Ok(None);
+    };
+    let mime_str = mime.unwrap_or("application/octet-stream");
+    let Ok(embedding) = ctx.backend.embed_audio(&bytes, mime_str).await else {
+        return Ok(None);
+    };
+    let (best_idx, best_score, gap) = best_match(&embedding, ctx.candidates);
+    let Some(idx) = best_idx else {
+        return Ok(None);
+    };
+    let candidate = &ctx.candidates[idx];
+    let needs_review = best_score < config.embedding_threshold || gap < config.ambiguity_gap;
+    let year = year_from_path_and_text(path, extracted.and_then(|e| e.text.as_deref()));
+    Ok(Some(ClassifiedFile {
+        folder_path: candidate.folder_path.clone(),
+        confidence: best_score,
+        reasoning: format!(
+            "tier2 audio: cos={best_score:.3} gap={gap:.3} model={}",
+            ctx.backend.model_id(),
+        ),
+        needs_review,
+        year,
+        temporal: candidate.temporal,
+        rename: RenameProposal::Keep,
+        classification_confidence: Some(best_score),
+        rename_mismatch_score: None,
     }))
 }
 
@@ -676,6 +880,7 @@ mod tests {
             td.path(),
             &candidates,
             &eb,
+            &MultimodalContext::default(),
             &ex,
             &ClassifierConfig::default(),
             &NullProgress,
@@ -707,6 +912,7 @@ mod tests {
             td.path(),
             &candidates,
             &eb,
+            &MultimodalContext::default(),
             &ex,
             &ClassifierConfig::default(),
             &NullProgress,
@@ -741,6 +947,7 @@ mod tests {
             td.path(),
             &candidates,
             &eb,
+            &MultimodalContext::default(),
             &ex,
             &cfg,
             &NullProgress,
@@ -767,6 +974,7 @@ mod tests {
             td.path(),
             &[],
             &eb,
+            &MultimodalContext::default(),
             &[],
             &ClassifierConfig::default(),
             &NullProgress,
@@ -795,6 +1003,7 @@ mod tests {
             td.path(),
             &candidates,
             &eb,
+            &MultimodalContext::default(),
             &ex,
             &cfg,
             &NullProgress,
@@ -803,6 +1012,122 @@ mod tests {
         .unwrap();
         assert_eq!(out.proposals.len(), 1);
         assert!(out.proposals[0].needs_review);
+    }
+
+    /// Toy SigLIP-style backend: bucket-based image embedding + same-sized
+    /// text embedding, so cosine matches across modalities.
+    struct BucketImageBackend;
+    #[async_trait]
+    impl ImageEmbeddingBackend for BucketImageBackend {
+        async fn embed_image(&self, bytes: &[u8], _mime: &str) -> Result<Vec<f32>> {
+            let mut v = vec![0.0_f32; 7];
+            for (i, b) in bytes.iter().enumerate() {
+                v[i % 7] += f32::from(*b);
+            }
+            let n = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+            for x in &mut v {
+                *x /= n;
+            }
+            Ok(v)
+        }
+        async fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
+            let mut v = vec![0.0_f32; 7];
+            for (i, b) in text.bytes().enumerate() {
+                v[i % 7] += f32::from(b);
+            }
+            let n = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+            for x in &mut v {
+                *x /= n;
+            }
+            Ok(v)
+        }
+        async fn embed_texts(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            let mut out = Vec::with_capacity(texts.len());
+            for t in texts {
+                out.push(self.embed_text(t).await?);
+            }
+            Ok(out)
+        }
+        fn dimensions(&self) -> usize {
+            7
+        }
+        fn model_id(&self) -> &'static str {
+            "bucket-image"
+        }
+    }
+
+    #[tokio::test]
+    async fn image_modality_routes_through_image_backend_when_present() {
+        let td = TempDir::new().unwrap();
+        // Generate a tiny PNG so MIME detection identifies it as image/.
+        let img_path = td.path().join("snapshot.png");
+        let img = image::RgbImage::new(4, 4);
+        img.save(&img_path).unwrap();
+
+        let img_be = BucketImageBackend;
+        let candidates = vec![ScanCandidate {
+            folder_path: "Photos/".to_string(),
+            description: "a photograph".to_string(),
+            temporal: true,
+            embedding: img_be.embed_text("a photograph").await.unwrap(),
+        }];
+        let img_ctx = ImageContext {
+            backend: &img_be,
+            candidates: &candidates,
+        };
+        let multimodal = MultimodalContext {
+            image: Some(img_ctx),
+            audio: None,
+        };
+
+        let eb = BucketEmbeddings;
+        // Empty text candidates so we know any proposal came from the image
+        // path. Tier 1 will fire (PNG → Photos/) — verify the proposal is
+        // produced even with that path; the modality routing kicks in only
+        // when Tier 1 misses or the heuristic threshold isn't cleared.
+        let cfg = ClassifierConfig {
+            heuristic_threshold: 0.99, // force Tier 1 to miss
+            embedding_threshold: 0.0,
+            ambiguity_gap: 0.0,
+            ..ClassifierConfig::default()
+        };
+        // No extractors: the test PlainExtractor would falsely advertise
+        // text/plain MIME and short-circuit modality routing. With no
+        // extractor, the `mime` from `tidyup_extract::mime::detect` (which
+        // sniffs PNG headers correctly) drives modality detection.
+        let ex: Vec<Arc<dyn ContentExtractor>> = vec![];
+        let out = run_scan(
+            td.path(),
+            td.path(),
+            &[],
+            &eb,
+            &multimodal,
+            &ex,
+            &cfg,
+            &NullProgress,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.proposals.len(), 1);
+        let p = &out.proposals[0];
+        assert!(
+            p.reasoning.contains("tier2 image"),
+            "expected image tier reasoning, got {}",
+            p.reasoning,
+        );
+        assert!(p.proposed_path.to_string_lossy().contains("Photos"));
+    }
+
+    #[test]
+    fn file_modality_classifies_image_extension() {
+        let m = file_modality(Path::new("/tmp/photo.HEIC"), None);
+        assert!(matches!(m, FileModality::Image));
+    }
+
+    #[test]
+    fn file_modality_classifies_audio_mime() {
+        let m = file_modality(Path::new("/tmp/clip"), Some("audio/mpeg"));
+        assert!(matches!(m, FileModality::Audio));
     }
 
     #[test]

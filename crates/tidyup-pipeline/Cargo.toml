@@ -29,6 +29,8 @@ chrono        = { workspace = true }
 
 [dev-dependencies]
 tempfile      = { workspace = true }
+# Multimodal tests author tiny PNGs to exercise image-modality routing.
+image         = { workspace = true }
 
 [lints]
 workspace = true

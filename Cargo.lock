@@ -7972,6 +7972,7 @@ dependencies = [
  "lazy_static",
  "symphonia-bundle-flac",
  "symphonia-bundle-mp3",
+ "symphonia-codec-aac",
  "symphonia-codec-pcm",
  "symphonia-codec-vorbis",
  "symphonia-core",
@@ -8003,6 +8004,17 @@ dependencies = [
  "log",
  "symphonia-core",
  "symphonia-metadata",
+]
+
+[[package]]
+name = "symphonia-codec-aac"
+version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c263845aa86881416849c1729a54c7f55164f8b96111dba59de46849e73a790"
+dependencies = [
+ "lazy_static",
+ "log",
+ "symphonia-core",
 ]
 
 [[package]]
@@ -8435,10 +8447,12 @@ dependencies = [
  "async-trait",
  "blake3",
  "dirs",
+ "image",
  "ndarray",
  "ort",
  "serde",
  "serde_json",
+ "symphonia",
  "tempfile",
  "thiserror 2.0.18",
  "tidyup-core",
@@ -8503,6 +8517,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "chrono",
+ "image",
  "serde",
  "serde_json",
  "tempfile",

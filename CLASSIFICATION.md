@@ -42,20 +42,40 @@ struct ClassificationResult {
 
 One input, one output, same for every modality and every operation. That is the unification.
 
-## v0.1 scope: text only
+## v0.1 scope: text by default, image/audio opt-in
 
-v0.1 ships with **text classification only.** `bge-small-en-v1.5` is the default Tier 2 encoder. Images, audio, and video route through Tier 1 heuristics alone (extension, MIME, EXIF/ID3 metadata, container metadata) — they go to sensible places for the common cases but don't get content-aware scoring yet.
+v0.1 ships text Tier 2 via `bge-small-en-v1.5` by default. Phase 7 added
+optional cross-modal Tier 2 for images (`SigLIP-base-patch16-224`) and audio
+(`CLAP-htsat-unfused`); both are off by default and only activate when their
+ONNX bundles are present in the platform model cache. Video still routes
+through Tier 1 heuristics — keyframe extraction is gated on the `ffmpeg-next`
+FFI decision.
 
-Rationale: v0.1 is the ship-to-brew/winget milestone (see the roadmap in `README.md`). Each non-text encoder is a real ONNX bring-up (model acquisition, license audit, fixture corpus, integration tests) and each expands the dep and binary surface. Shipping text-only preserves CLI-first velocity, proves the spine on the dominant modality in typical messy directories, and keeps the first-run download small.
+| Modality | Default handling | Phase 7 (opt-in) | Post-Phase-7 |
+|---|---|---|---|
+| Text (pdf / docx / md / source / ipynb) | Tier 2 via `bge-small-en-v1.5` | — | — |
+| Image (jpg / png / heic / raw) | Tier 1 heuristics (extension + EXIF) | Tier 2 via `SigLIP-base` (cross-modal) when bundle installed | — |
+| Audio (mp3 / flac / m4a / wav) | Tier 1 heuristics (extension + ID3 via `lofty`) | Tier 2 via `CLAP-htsat-unfused` (cross-modal) when bundle installed | — |
+| Video (mp4 / mov / mkv) | Tier 1 heuristics only (extension + container metadata) | — | SigLIP(keyframe) + CLAP(audio), gated on pure-Rust video decode vs `ffmpeg-next` FFI decision |
 
-| Modality | v0.1 handling | Post-v0.1 |
-|---|---|---|
-| Text (pdf / docx / md / source / ipynb) | Tier 2 via `bge-small-en-v1.5` | — |
-| Image (jpg / png / heic / raw) | Tier 1 heuristics only (extension + EXIF) | SigLIP-base in Tier 2 |
-| Audio (mp3 / flac / m4a / wav) | Tier 1 heuristics only (extension + ID3 via `lofty`) | CLAP in Tier 2 |
-| Video (mp4 / mov / mkv) | Tier 1 heuristics only (extension + container metadata) | SigLIP(keyframe) + CLAP(audio), gated on pure-Rust video decode vs `ffmpeg-next` FFI decision |
+Adding a modality is a new encoder behind a port trait — currently
+[`ImageEmbeddingBackend`](crates/tidyup-core/src/inference.rs) and
+[`AudioEmbeddingBackend`](crates/tidyup-core/src/inference.rs) — not a
+service-layer refactor. Each modality's backend is held as
+`Option<Arc<dyn …>>` on `ServiceContext`; the pipeline routes by
+[`FileModality`](crates/tidyup-core/src/inference.rs) and short-circuits to
+the text Tier 2 path when the modality backend is absent.
 
-Adding a modality post-v0.1 is a new encoder behind the `Classifier` port, not a service-layer refactor. The port shape stays stable across the roadmap.
+### Cross-modal latent-space isolation
+
+Image and audio backends produce vectors in **modality-specific** latent
+spaces — SigLIP's image embeddings are not comparable to bge-small text
+embeddings, nor to CLAP's audio embeddings. The pipeline keeps each
+modality's candidate list separate (`ImageContext.candidates`,
+`AudioContext.candidates`) so a misconfigured caller cannot compute a
+cross-space cosine. Each modality has its own natural-language taxonomy
+authored as captions ("a photograph of a person", "a podcast episode") rather
+than the keyword soup that works best for `bge-small`.
 
 ## Tier 2: how embedding classification works
 
@@ -190,7 +210,9 @@ Activation routes files with low Tier 2 confidence (or pathological extraction f
 
 - **Held-out corpus for calibration (v0.2).** Ship a synthetic fixture corpus? Calibrate on first run against a labelled sample? Defer until there's real-world feedback to mine (with user opt-in)?
 - **Multilingual support.** When to swap to `bge-m3` or `multilingual-e5`? Gate on binary-size impact vs observed demand.
-- **Image/audio encoders (post-v0.1).** SigLIP for image, CLAP for audio — each tracked as a Phase 6 item in the `README.md` roadmap. Video keyframe extraction still hinges on the `ffmpeg-next` FFI vs metadata-only decision.
+- **Migration-mode multimodal.** Phase 7 wires SigLIP/CLAP into scan mode only. Migration-mode profiling builds folder centroids in the bge-small text space; image/audio files still route through that text-space match in migration mode. Adding `image_name_embedding` / `audio_name_embedding` to `FolderProfile` (and recomputing from existing folder contents) would make migration-mode multimodal symmetric with scan-mode.
+- **Image-side rename gating.** Phase 7 image classification produces a folder choice but no rename proposal. The rename cascade still runs against text Tier 2 (EXIF metadata → keyword fill → adapt → keep). A future enhancement: cross-modal mismatch gate using SigLIP text + image embeddings of filename and content.
+- **Video keyframe extraction.** Still pending the `ffmpeg-next` FFI vs metadata-only decision.
 - **Cold-start UX mitigation.** Does tidyup detect "target hierarchy has no files yet" and advise the user about `--features llm-fallback`, or silently surface all proposals to review with low confidence? A `--bootstrap` mode that seeds profiles from folder-name embeddings only?
 - **Inline-YAKE maintenance.** ~150 LoC of keyword extraction inline is cheap but adds a small maintenance item. Acceptable until a mainstream crate crosses the DL threshold.
 

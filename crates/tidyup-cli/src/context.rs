@@ -22,8 +22,14 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use tidyup_app::config::{resolve_data_dir, TidyupConfig};
 use tidyup_app::ServiceContext;
-use tidyup_core::inference::{ContentClassification, GenerationOptions, TextBackend};
-use tidyup_embeddings_ort::{installation_instructions, verify_default_model, OrtEmbeddings};
+use tidyup_core::inference::{
+    AudioEmbeddingBackend, ContentClassification, GenerationOptions, ImageEmbeddingBackend,
+    TextBackend,
+};
+use tidyup_embeddings_ort::{
+    installation_instructions, verify_clap_model, verify_default_model, verify_siglip_model,
+    ClapEmbeddings, OrtEmbeddings, SigLipEmbeddings,
+};
 use tidyup_storage_sqlite::SqliteStore;
 
 /// Top-level build: given a parsed config, produce a ready-to-use
@@ -63,6 +69,13 @@ pub(crate) async fn build(
         }
     };
 
+    // Phase 7: optional image/audio backends. Each is loaded only if its
+    // bundle is present on disk — missing artifacts are NOT an error since
+    // the default install path ships text-only. The pipeline gracefully
+    // falls back when a backend is absent.
+    let image_embeddings = try_load_siglip();
+    let audio_embeddings = try_load_clap();
+
     let extractors = default_extractors();
 
     Ok(Arc::new(ServiceContext {
@@ -73,8 +86,49 @@ pub(crate) async fn build(
         text: Arc::new(NullTextBackend),
         embeddings,
         vision: None,
+        image_embeddings,
+        audio_embeddings,
         extractors,
     }))
+}
+
+/// Best-effort load of the `SigLIP` image encoder. Returns `None` when the
+/// bundle is missing or fails to load — the caller surfaces the absence as
+/// a soft fallback to text-tier classification, not an error.
+fn try_load_siglip() -> Option<Arc<dyn ImageEmbeddingBackend>> {
+    if verify_siglip_model().is_err() {
+        tracing::debug!("SigLIP bundle not present; image-modality Tier 2 disabled");
+        return None;
+    }
+    match SigLipEmbeddings::load_default() {
+        Ok(b) => {
+            tracing::info!("SigLIP image encoder loaded — image-modality Tier 2 enabled");
+            Some(Arc::new(b))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "SigLIP load failed; falling back to text Tier 2");
+            None
+        }
+    }
+}
+
+/// Best-effort load of the `CLAP` audio encoder. Same fallback semantics as
+/// [`try_load_siglip`].
+fn try_load_clap() -> Option<Arc<dyn AudioEmbeddingBackend>> {
+    if verify_clap_model().is_err() {
+        tracing::debug!("CLAP bundle not present; audio-modality Tier 2 disabled");
+        return None;
+    }
+    match ClapEmbeddings::load_default() {
+        Ok(b) => {
+            tracing::info!("CLAP audio encoder loaded — audio-modality Tier 2 enabled");
+            Some(Arc::new(b))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "CLAP load failed; falling back to text Tier 2");
+            None
+        }
+    }
 }
 
 /// Verify model artifacts are present and load the embedding backend.
@@ -197,6 +251,59 @@ pub(crate) async fn build_default_scan_candidates(
     let entries = tidyup_embeddings_ort::default_taxonomy();
     let texts: Vec<&str> = entries.iter().map(|e| e.description).collect();
     let vecs = embeddings.embed_texts(&texts).await?;
+    let mut out = Vec::with_capacity(entries.len());
+    for (entry, emb) in entries.into_iter().zip(vecs) {
+        out.push(tidyup_pipeline::scan::ScanCandidate {
+            folder_path: entry.path.to_string(),
+            description: entry.description.to_string(),
+            temporal: entry.temporal,
+            embedding: emb,
+        });
+    }
+    Ok(out)
+}
+
+/// Build the image-modality scan taxonomy. Caller passes the image backend
+/// (typically `ctx.image_embeddings`); returns an empty vec when the backend
+/// is `None`.
+///
+/// # Errors
+/// Propagates embedding backend failures.
+pub(crate) async fn build_image_scan_candidates(
+    image_backend: Option<&dyn ImageEmbeddingBackend>,
+) -> Result<Vec<tidyup_pipeline::scan::ScanCandidate>> {
+    let Some(backend) = image_backend else {
+        return Ok(Vec::new());
+    };
+    let entries = tidyup_embeddings_ort::default_image_taxonomy();
+    let texts: Vec<&str> = entries.iter().map(|e| e.description).collect();
+    let vecs = backend.embed_texts(&texts).await?;
+    let mut out = Vec::with_capacity(entries.len());
+    for (entry, emb) in entries.into_iter().zip(vecs) {
+        out.push(tidyup_pipeline::scan::ScanCandidate {
+            folder_path: entry.path.to_string(),
+            description: entry.description.to_string(),
+            temporal: entry.temporal,
+            embedding: emb,
+        });
+    }
+    Ok(out)
+}
+
+/// Build the audio-modality scan taxonomy. Symmetric with
+/// [`build_image_scan_candidates`].
+///
+/// # Errors
+/// Propagates embedding backend failures.
+pub(crate) async fn build_audio_scan_candidates(
+    audio_backend: Option<&dyn AudioEmbeddingBackend>,
+) -> Result<Vec<tidyup_pipeline::scan::ScanCandidate>> {
+    let Some(backend) = audio_backend else {
+        return Ok(Vec::new());
+    };
+    let entries = tidyup_embeddings_ort::default_audio_taxonomy();
+    let texts: Vec<&str> = entries.iter().map(|e| e.description).collect();
+    let vecs = backend.embed_texts(&texts).await?;
     let mut out = Vec::with_capacity(entries.len());
     for (entry, emb) in entries.into_iter().zip(vecs) {
         out.push(tidyup_pipeline::scan::ScanCandidate {

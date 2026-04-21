@@ -28,6 +28,11 @@ ort           = { workspace = true }
 tokenizers    = { workspace = true }
 ndarray       = { workspace = true }
 
+# Multimodal preprocessing. Image decode/resize for SigLIP; audio decode for
+# CLAP. Both pure-Rust per CLAUDE.md dep policy.
+image         = { workspace = true }
+symphonia     = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio    = { workspace = true, features = ["rt", "macros"] }

@@ -36,6 +36,13 @@ pub use scan::{ScanReport, ScanService};
 ///
 /// Using `Arc<dyn Trait>` everywhere keeps the services object-safe and lets
 /// the same instance be shared across CLI command handlers or UI components.
+///
+/// Phase 7 added the optional cross-modal embedding backends
+/// ([`image_embeddings`](Self::image_embeddings) and
+/// [`audio_embeddings`](Self::audio_embeddings)). Both are `Option<Arc<dyn …>>`
+/// because the model artifacts ship out-of-band — the default install path
+/// (text-only) leaves them `None` and the pipeline falls back to text-tier
+/// classification for image/audio files.
 #[allow(missing_debug_implementations)] // trait objects don't implement Debug
 pub struct ServiceContext {
     pub file_index: std::sync::Arc<dyn tidyup_core::storage::FileIndex>,
@@ -45,5 +52,7 @@ pub struct ServiceContext {
     pub text: std::sync::Arc<dyn tidyup_core::inference::TextBackend>,
     pub embeddings: std::sync::Arc<dyn tidyup_core::inference::EmbeddingBackend>,
     pub vision: Option<std::sync::Arc<dyn tidyup_core::inference::VisionBackend>>,
+    pub image_embeddings: Option<std::sync::Arc<dyn tidyup_core::inference::ImageEmbeddingBackend>>,
+    pub audio_embeddings: Option<std::sync::Arc<dyn tidyup_core::inference::AudioEmbeddingBackend>>,
     pub extractors: Vec<std::sync::Arc<dyn tidyup_core::extractor::ContentExtractor>>,
 }

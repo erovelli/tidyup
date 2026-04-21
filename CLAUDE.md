@@ -173,6 +173,33 @@ Both produce `ChangeProposal`s and `BundleProposal`s that flow through the same 
 - **Taxonomy embedding cache invalidates by hash of taxonomy text**, not by version number.
 - **`ProfileCache` is keyed by target root** and rebuilds incrementally via `ScanDiff` against `FolderMetadata.content_hash`. Not by timestamp.
 
+## Multimodal Tier 2 (Phase 7)
+
+Image and audio classification are cross-modal contrastive lookups (SigLIP /
+CLAP) — `tidyup-embeddings-ort::siglip` and `…::clap`. Three invariants
+beyond the text Tier 2 rules:
+
+- **Latent-space isolation.** `EmbeddingBackend`, `ImageEmbeddingBackend`,
+  and `AudioEmbeddingBackend` produce vectors in disjoint latent spaces.
+  Never cosine-compare across them. The pipeline keeps each modality's
+  candidate list (`MultimodalContext.image.candidates`, `…audio.candidates`)
+  separate from the text candidates so a misconfigured caller can't compute
+  a cross-space cosine.
+- **Optional inclusion, automatic detection.** SigLIP and CLAP backends live
+  inside `tidyup-embeddings-ort` (no separate crate or feature gate — both
+  are pure-Rust ONNX with disjoint preprocessing). They are loaded only when
+  their bundles exist on disk, via `verify_siglip_model` /
+  `verify_clap_model`. Missing bundles are NOT an error — image/audio files
+  fall back to the text Tier 2 path, which falls back to Tier 1. Don't add a
+  `--multimodal` runtime flag; presence of the artifacts is the gate.
+- **Per-modality natural-language taxonomies.** The text taxonomy in
+  `default_taxonomy()` is keyword-soup tuned for `bge-small`. The image and
+  audio taxonomies in `default_image_taxonomy()` / `default_audio_taxonomy()`
+  are natural-language captions ("a photograph of a person", "a podcast
+  episode") because cross-modal contrastive encoders need that phrasing to
+  compare image/audio embeddings against text embeddings. Don't reuse text
+  taxonomy descriptions for image/audio.
+
 ## What NOT to do
 
 - **Don't violate the privacy model.** No HTTP clients, LLM deps, or phone-home code paths in the default binary. Network-capable code lives only in `tidyup-inference-remote` behind `--features remote`. LLM code lives only in `tidyup-inference-mistralrs` behind `--features llm-fallback`.
@@ -186,6 +213,8 @@ Both produce `ChangeProposal`s and `BundleProposal`s that flow through the same 
 - **Don't add a `tidyup-config` crate** (folded into `app` deliberately).
 - **Don't gate backend *selection* by cargo feature** (runtime registry). Backend *inclusion* is feature-gated only for network-capable and LLM backends.
 - **Don't add cross-impl-crate deps** (e.g., `storage-sqlite` depending on `inference-mistralrs`). Port traits in `core` are the only shared vocabulary.
+- **Don't compare embeddings across modality backends.** `EmbeddingBackend`, `ImageEmbeddingBackend`, and `AudioEmbeddingBackend` produce vectors in disjoint latent spaces. The pipeline keeps each modality's candidate list separate so a cross-space cosine is structurally impossible — don't try to cleverly route around it.
+- **Don't reuse the keyword-soup text taxonomy for image/audio scan candidates.** Cross-modal encoders need natural-language captions (`default_image_taxonomy()` / `default_audio_taxonomy()`). Mixing them silently wrecks classification.
 - **Don't add `sha2` or other slower hash crates** — use `blake3`.
 - **Don't pin dep versions inside a crate's `Cargo.toml`** — use `{ workspace = true }`.
 - **Don't skip hooks** (`--no-verify`) or bypass `cargo xtask ci`.

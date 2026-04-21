@@ -46,9 +46,11 @@ Consequence: adding a new frontend (web, TUI, MCP server) means implementing two
 
 Inference backends register by capability at runtime. Users **select** among available backends via `tidyup-app::config::InferenceConfig.backends` — an ordered list of backend IDs (`"mistralrs"`, `"remote-openai"`, `"ollama"`) — no rebuild needed to switch between backends that are compiled in.
 
-New backends are added by (a) creating a new `tidyup-inference-*` crate that implements `TextBackend` / `VisionBackend` / `EmbeddingBackend`, and (b) registering it in the registry on startup. No changes to `pipeline/` or `app/` required.
+New backends are added by (a) creating a new `tidyup-inference-*` crate that implements `TextBackend` / `VisionBackend` / `EmbeddingBackend` (or the cross-modal `ImageEmbeddingBackend` / `AudioEmbeddingBackend` from Phase 7), and (b) registering it in the registry on startup. No changes to `pipeline/` or `app/` required.
 
 **Inclusion is separate from selection.** Whether a backend is *compiled into the binary at all* is governed by cargo features. Network-capable backends (`tidyup-inference-remote`) are gated behind `--features remote`; LLM backends (`tidyup-inference-mistralrs`) are gated behind `--features llm-fallback`. **Both are excluded from the default binary** — the default classifier is `bge-small-en-v1.5` via `tidyup-embeddings-ort`, which is always compiled in. See [Privacy model](#privacy-model).
+
+**Cross-modal Tier 2 (Phase 7).** Image and audio classification use SigLIP and CLAP via the `siglip` and `clap` modules of `tidyup-embeddings-ort` — same crate as the default text encoder, no separate feature gate. Each backend is held as `Option<Arc<dyn …>>` on `ServiceContext` and loaded only when the corresponding ONNX bundle is present in the platform model cache. Per-modality latent spaces are isolated: each backend's vectors are not comparable to other backends' vectors, and the pipeline keeps each modality's `ScanCandidate` list separate so a cross-space cosine is structurally impossible.
 
 ## Privacy model
 

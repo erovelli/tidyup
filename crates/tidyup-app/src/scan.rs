@@ -21,7 +21,9 @@ use serde::{Deserialize, Serialize};
 use tidyup_core::frontend::Level;
 use tidyup_core::{ProgressReporter, Result, ReviewHandler};
 use tidyup_domain::{RunMode, RunRecord, RunState};
-use tidyup_pipeline::scan::{run_scan, ScanCandidate};
+use tidyup_pipeline::scan::{
+    run_scan, AudioContext, ImageContext, MultimodalContext, ScanCandidate,
+};
 use uuid::Uuid;
 
 use crate::executor::{
@@ -92,12 +94,19 @@ impl ScanService {
     /// stays serializable for UI state and so the service doesn't hardcode a
     /// specific embedding-backend crate.
     ///
+    /// `image_candidates` / `audio_candidates` are the per-modality scan
+    /// taxonomies, embedded in the modality-specific space (`SigLIP` / `CLAP`).
+    /// Pass `&[]` when the modality backend isn't loaded — the routing
+    /// short-circuits and the file falls through to the text Tier 2 path.
+    ///
     /// # Errors
     /// Propagates pipeline, storage, review, and apply errors.
     pub async fn run(
         &self,
         request: ScanRequest,
         candidates: &[ScanCandidate],
+        image_candidates: &[ScanCandidate],
+        audio_candidates: &[ScanCandidate],
         progress: &dyn ProgressReporter,
         review: &dyn ReviewHandler,
     ) -> Result<ScanReport> {
@@ -106,7 +115,15 @@ impl ScanService {
         self.ctx.run_log.record_run(&run).await?;
 
         let outcome_result = self
-            .try_run(&request, candidates, progress, review, run_id)
+            .try_run(
+                &request,
+                candidates,
+                image_candidates,
+                audio_candidates,
+                progress,
+                review,
+                run_id,
+            )
             .await;
 
         match &outcome_result {
@@ -125,21 +142,46 @@ impl ScanService {
         outcome_result
     }
 
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn try_run(
         &self,
         request: &ScanRequest,
         candidates: &[ScanCandidate],
+        image_candidates: &[ScanCandidate],
+        audio_candidates: &[ScanCandidate],
         progress: &dyn ProgressReporter,
         review: &dyn ReviewHandler,
         run_id: Uuid,
     ) -> Result<ScanReport> {
         let output_root = request.root.clone();
 
+        let multimodal = MultimodalContext {
+            image: self
+                .ctx
+                .image_embeddings
+                .as_ref()
+                .filter(|_| !image_candidates.is_empty())
+                .map(|backend| ImageContext {
+                    backend: backend.as_ref(),
+                    candidates: image_candidates,
+                }),
+            audio: self
+                .ctx
+                .audio_embeddings
+                .as_ref()
+                .filter(|_| !audio_candidates.is_empty())
+                .map(|backend| AudioContext {
+                    backend: backend.as_ref(),
+                    candidates: audio_candidates,
+                }),
+        };
+
         let outcome = run_scan(
             &request.root,
             &output_root,
             candidates,
             self.ctx.embeddings.as_ref(),
+            &multimodal,
             &self.ctx.extractors,
             &tidyup_domain::ClassifierConfig::default(),
             progress,
