@@ -37,7 +37,10 @@ use tidyup_domain::{
 };
 use uuid::Uuid;
 
-use crate::context::{build, build_default_scan_candidates, quick_model_check};
+use crate::context::{
+    build, build_audio_scan_candidates, build_default_scan_candidates, build_image_scan_candidates,
+    quick_model_check,
+};
 use crate::reporter::DioxusReporter;
 use crate::review::DioxusReviewHandler;
 use crate::state::{Busy, LastReport, SharedState, SignalBundle};
@@ -1673,6 +1676,10 @@ fn launch_scan(state: &SharedState, source: PathBuf) {
             let cfg = config::load()?;
             let ctx = build(&cfg, true).await?;
             let candidates = build_default_scan_candidates(ctx.embeddings.as_ref()).await?;
+            let image_candidates =
+                build_image_scan_candidates(ctx.image_embeddings.as_deref()).await?;
+            let audio_candidates =
+                build_audio_scan_candidates(ctx.audio_embeddings.as_deref()).await?;
             let reporter = DioxusReporter::new(signals);
             let reviewer = DioxusReviewHandler::new(signals, slot);
 
@@ -1687,6 +1694,8 @@ fn launch_scan(state: &SharedState, source: PathBuf) {
                         bundle_min_confidence: 0.85,
                     },
                     &candidates,
+                    &image_candidates,
+                    &audio_candidates,
                     &reporter,
                     &reviewer,
                 )
