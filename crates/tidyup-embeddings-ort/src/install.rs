@@ -135,6 +135,156 @@ pub fn installation_instructions() -> String {
     )
 }
 
+// ---------------------------------------------------------------------------
+// SigLIP (image / text) — Phase 7 multimodal Tier 2 image classifier.
+// ---------------------------------------------------------------------------
+
+/// Vision tower ONNX. Source: HF `nielsr/siglip-base-patch16-224` ONNX export.
+pub const SIGLIP_VISION_ARTIFACT: ArtifactSpec = ArtifactSpec {
+    filename: "vision_model.onnx",
+    url:
+        "https://huggingface.co/nielsr/siglip-base-patch16-224/resolve/main/onnx/vision_model.onnx",
+    size_bytes: 0,
+    blake3_hex: "",
+};
+
+/// Text tower ONNX (sentencepiece-style, but exported with WordPiece-shaped IO).
+pub const SIGLIP_TEXT_ARTIFACT: ArtifactSpec = ArtifactSpec {
+    filename: "text_model.onnx",
+    url: "https://huggingface.co/nielsr/siglip-base-patch16-224/resolve/main/onnx/text_model.onnx",
+    size_bytes: 0,
+    blake3_hex: "",
+};
+
+/// Tokenizer JSON for the text tower.
+pub const SIGLIP_TOKENIZER_ARTIFACT: ArtifactSpec = ArtifactSpec {
+    filename: "tokenizer.json",
+    url: "https://huggingface.co/nielsr/siglip-base-patch16-224/resolve/main/tokenizer.json",
+    size_bytes: 0,
+    blake3_hex: "",
+};
+
+/// Verify the `SigLIP` bundle is present. Returns the bundle directory on
+/// success.
+///
+/// # Errors
+/// Surfaces missing-artifact errors via [`verify_artifact`].
+pub fn verify_siglip_model() -> Result<PathBuf> {
+    let dir = crate::paths::model_cache_dir()
+        .ok_or_else(|| {
+            anyhow::anyhow!("platform cache directory unavailable; set TIDYUP_MODEL_CACHE")
+        })?
+        .join(crate::paths::SIGLIP_DIR);
+    verify_artifact(
+        &dir.join(SIGLIP_VISION_ARTIFACT.filename),
+        &SIGLIP_VISION_ARTIFACT,
+    )?;
+    verify_artifact(
+        &dir.join(SIGLIP_TEXT_ARTIFACT.filename),
+        &SIGLIP_TEXT_ARTIFACT,
+    )?;
+    verify_artifact(
+        &dir.join(SIGLIP_TOKENIZER_ARTIFACT.filename),
+        &SIGLIP_TOKENIZER_ARTIFACT,
+    )?;
+    Ok(dir)
+}
+
+/// User-facing instructions for installing the `SigLIP` bundle by hand.
+#[must_use]
+pub fn siglip_installation_instructions() -> String {
+    let dir = crate::paths::model_cache_dir().map_or_else(
+        || {
+            format!(
+                "<platform cache>/tidyup/models/{}/",
+                crate::paths::SIGLIP_DIR
+            )
+        },
+        |d| format!("{}/", d.join(crate::paths::SIGLIP_DIR).display()),
+    );
+    format!(
+        "Missing SigLIP image encoder (Phase 7 multimodal — optional).\n\
+         Place these three files under\n  {dir}\n\n  \
+         - vision_model.onnx from {vision}\n  \
+         - text_model.onnx   from {text}\n  \
+         - tokenizer.json    from {tok}\n\n\
+         From a local checkout you can also run `cargo xtask download-models --siglip`.",
+        vision = SIGLIP_VISION_ARTIFACT.url,
+        text = SIGLIP_TEXT_ARTIFACT.url,
+        tok = SIGLIP_TOKENIZER_ARTIFACT.url,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// CLAP (audio / text) — Phase 7 multimodal Tier 2 audio classifier.
+// ---------------------------------------------------------------------------
+
+/// Audio tower ONNX. Source: HF `laion/clap-htsat-unfused` ONNX export.
+pub const CLAP_AUDIO_ARTIFACT: ArtifactSpec = ArtifactSpec {
+    filename: "audio_model.onnx",
+    url: "https://huggingface.co/Xenova/clap-htsat-unfused/resolve/main/onnx/audio_model.onnx",
+    size_bytes: 0,
+    blake3_hex: "",
+};
+
+/// Text tower ONNX.
+pub const CLAP_TEXT_ARTIFACT: ArtifactSpec = ArtifactSpec {
+    filename: "text_model.onnx",
+    url: "https://huggingface.co/Xenova/clap-htsat-unfused/resolve/main/onnx/text_model.onnx",
+    size_bytes: 0,
+    blake3_hex: "",
+};
+
+/// Tokenizer JSON for the text tower.
+pub const CLAP_TOKENIZER_ARTIFACT: ArtifactSpec = ArtifactSpec {
+    filename: "tokenizer.json",
+    url: "https://huggingface.co/Xenova/clap-htsat-unfused/resolve/main/tokenizer.json",
+    size_bytes: 0,
+    blake3_hex: "",
+};
+
+/// Verify the `CLAP` bundle is present. Returns the bundle directory on success.
+///
+/// # Errors
+/// Surfaces missing-artifact errors via [`verify_artifact`].
+pub fn verify_clap_model() -> Result<PathBuf> {
+    let dir = crate::paths::model_cache_dir()
+        .ok_or_else(|| {
+            anyhow::anyhow!("platform cache directory unavailable; set TIDYUP_MODEL_CACHE")
+        })?
+        .join(crate::paths::CLAP_DIR);
+    verify_artifact(
+        &dir.join(CLAP_AUDIO_ARTIFACT.filename),
+        &CLAP_AUDIO_ARTIFACT,
+    )?;
+    verify_artifact(&dir.join(CLAP_TEXT_ARTIFACT.filename), &CLAP_TEXT_ARTIFACT)?;
+    verify_artifact(
+        &dir.join(CLAP_TOKENIZER_ARTIFACT.filename),
+        &CLAP_TOKENIZER_ARTIFACT,
+    )?;
+    Ok(dir)
+}
+
+/// User-facing instructions for installing the `CLAP` bundle by hand.
+#[must_use]
+pub fn clap_installation_instructions() -> String {
+    let dir = crate::paths::model_cache_dir().map_or_else(
+        || format!("<platform cache>/tidyup/models/{}/", crate::paths::CLAP_DIR),
+        |d| format!("{}/", d.join(crate::paths::CLAP_DIR).display()),
+    );
+    format!(
+        "Missing CLAP audio encoder (Phase 7 multimodal — optional).\n\
+         Place these three files under\n  {dir}\n\n  \
+         - audio_model.onnx from {audio}\n  \
+         - text_model.onnx  from {text}\n  \
+         - tokenizer.json   from {tok}\n\n\
+         From a local checkout you can also run `cargo xtask download-models --clap`.",
+        audio = CLAP_AUDIO_ARTIFACT.url,
+        text = CLAP_TEXT_ARTIFACT.url,
+        tok = CLAP_TOKENIZER_ARTIFACT.url,
+    )
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

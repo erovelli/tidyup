@@ -90,6 +90,11 @@ calamine     = "0.34"
 image        = "0.25"
 kamadak-exif = "0.6"
 lofty        = "0.24"
+# Pure-Rust audio decoder. Used by tidyup-embeddings-ort's CLAP backend to
+# decode audio samples for the audio tower. Wide format support (WAV, FLAC,
+# MP3, AAC, OGG). Maintained by the pdeltah/symphonia team, MPL-2.0,
+# well over the dep-policy DL threshold.
+symphonia    = { version = "0.5", default-features = false, features = ["wav", "flac", "mp3", "aac", "isomp4", "vorbis", "ogg"] }
 
 # Embeddings (tidyup-embeddings-ort).
 # `load-dynamic` keeps build-time TLS out of the dep graph — the runtime

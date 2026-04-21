@@ -436,7 +436,10 @@ fn push_padded(out: &mut Vec<i64>, src: &[u32], seq_len: usize, pad: i64) {
 /// Ensure `ort::init()` runs exactly once per process. `commit` returns
 /// `true` on first install, `false` if the global env options were already
 /// set — either outcome is fine.
-fn ensure_ort_initialized() {
+///
+/// Public-in-crate so the multimodal modules ([`crate::siglip`],
+/// [`crate::clap`]) can share the same one-shot initialization.
+pub(crate) fn ensure_ort_initialized() {
     static INIT: OnceLock<()> = OnceLock::new();
     INIT.get_or_init(|| {
         let _ = ort::init().with_name("tidyup").commit();
