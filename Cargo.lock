@@ -8457,7 +8457,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tidyup-core",
  "tidyup-domain",
- "tokenizers 0.21.4",
+ "tokenizers 0.22.2",
  "tokio",
  "tracing",
 ]
@@ -8664,7 +8664,6 @@ dependencies = [
  "log",
  "macro_rules_attribute",
  "monostate",
- "onig",
  "paste",
  "rand 0.9.4",
  "rayon",

@@ -102,7 +102,7 @@ symphonia    = { version = "0.5", default-features = false, features = ["wav", "
 # path set by tidyup at startup. First-run setup fetches the library and
 # model alongside each other into `dirs::cache_dir()/tidyup/models/`.
 ort          = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "load-dynamic", "api-23"] }
-tokenizers   = { version = "0.21", default-features = false, features = ["onig"] }
+tokenizers   = { version = "0.22", default-features = false, features = ["onig"] }
 ndarray      = "0.17"
 
 # Feature-gated LLM inference (tidyup-inference-mistralrs).
