@@ -176,12 +176,14 @@ impl ScanService {
                 }),
         };
 
+        let text_backend = self.ctx.text.as_deref();
         let outcome = run_scan(
             &request.root,
             &output_root,
             candidates,
             self.ctx.embeddings.as_ref(),
             &multimodal,
+            text_backend,
             &self.ctx.extractors,
             &tidyup_domain::ClassifierConfig::default(),
             progress,

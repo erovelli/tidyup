@@ -43,13 +43,19 @@ pub use scan::{ScanReport, ScanService};
 /// because the model artifacts ship out-of-band — the default install path
 /// (text-only) leaves them `None` and the pipeline falls back to text-tier
 /// classification for image/audio files.
+///
+/// [`text`](Self::text) is `Option` for the same reason on the LLM side: the
+/// default build is LLM-silent (no `tidyup-inference-mistralrs` linked) and
+/// the Tier-3 fallback only runs when the context builder both wires a real
+/// [`TextBackend`] *and* the per-invocation activation gate fires. `None` is
+/// the privacy-preserving default — see `CLAUDE.md` → "Privacy model".
 #[allow(missing_debug_implementations)] // trait objects don't implement Debug
 pub struct ServiceContext {
     pub file_index: std::sync::Arc<dyn tidyup_core::storage::FileIndex>,
     pub change_log: std::sync::Arc<dyn tidyup_core::storage::ChangeLog>,
     pub backup_store: std::sync::Arc<dyn tidyup_core::storage::BackupStore>,
     pub run_log: std::sync::Arc<dyn tidyup_core::storage::RunLog>,
-    pub text: std::sync::Arc<dyn tidyup_core::inference::TextBackend>,
+    pub text: Option<std::sync::Arc<dyn tidyup_core::inference::TextBackend>>,
     pub embeddings: std::sync::Arc<dyn tidyup_core::inference::EmbeddingBackend>,
     pub vision: Option<std::sync::Arc<dyn tidyup_core::inference::VisionBackend>>,
     pub image_embeddings: Option<std::sync::Arc<dyn tidyup_core::inference::ImageEmbeddingBackend>>,
