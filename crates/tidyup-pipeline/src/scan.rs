@@ -16,9 +16,15 @@
 //!    pre-computed description embeddings; the pipeline embeds the file
 //!    content and picks the highest-cosine candidate. Fires at
 //!    `embedding_threshold` (default 0.35) with `ambiguity_gap`.
-//! 4. **Below thresholds**: surface to review via `needs_review = true`.
-//!    Tier 3 LLM fallback is out of scope for this module — the migration
-//!    pipeline owns the feature-gated call-out.
+//! 4. **Tier 3 — LLM fallback** (optional): when a [`TextBackend`] is provided
+//!    and Tier 2 lands in the review zone (below threshold or inside the
+//!    ambiguity gap), the LLM classifies the content and the resulting
+//!    `summary + category + tags` is re-embedded and re-ranked against the
+//!    same candidate list. If the re-ranked top scores higher than Tier 2's,
+//!    we adopt it with [`Tier::Llm`] reasoning. The activation gate is the
+//!    caller passing `Some(text_backend)` — this module is feature-flag-free
+//!    by design.
+//! 5. **Below all tiers**: surface to review via `needs_review = true`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -29,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use tidyup_core::extractor::ContentExtractor;
 use tidyup_core::frontend::{Level, ProgressItem, ProgressReporter};
 use tidyup_core::inference::{
-    AudioEmbeddingBackend, EmbeddingBackend, FileModality, ImageEmbeddingBackend,
+    AudioEmbeddingBackend, EmbeddingBackend, FileModality, ImageEmbeddingBackend, TextBackend,
 };
 use tidyup_domain::change::{ChangeProposal, ChangeStatus, ChangeType};
 use tidyup_domain::{BundleKind, BundleProposal, ClassifierConfig, Phase};
@@ -113,6 +119,12 @@ pub struct ScanOutcome {
 /// modality candidate lists. Pass [`MultimodalContext::default()`] for the
 /// text-only cascade.
 ///
+/// `text_backend` is the optional Tier 3 LLM. Pass `None` (the default-build
+/// case) and the cascade stops at Tier 2; pass `Some` and low-confidence
+/// Tier 2 verdicts get a chance to be re-ranked through an LLM-cleaned query.
+/// The pipeline never invokes the backend when Tier 2 already cleared its
+/// thresholds, so the cost is paid only on hard cases.
+///
 /// # Errors
 /// Propagates source-read and embedding-backend failures. Per-file extraction
 /// or classification errors are logged via `progress.message(Level::Warn, …)`
@@ -124,6 +136,7 @@ pub async fn run_scan(
     candidates: &[ScanCandidate],
     embeddings: &dyn EmbeddingBackend,
     multimodal: &MultimodalContext<'_>,
+    text_backend: Option<&dyn TextBackend>,
     extractors: &[Arc<dyn ContentExtractor>],
     config: &ClassifierConfig,
     progress: &dyn ProgressReporter,
@@ -160,7 +173,17 @@ pub async fn run_scan(
         .await;
 
     for (idx, path) in tree.loose_files.iter().enumerate() {
-        match classify_file(path, candidates, embeddings, multimodal, extractors, config).await {
+        match classify_file(
+            path,
+            candidates,
+            embeddings,
+            multimodal,
+            text_backend,
+            extractors,
+            config,
+        )
+        .await
+        {
             Ok(Some(classified)) => {
                 let proposal = build_proposal(path, output_root, &classified);
                 outcome.proposals.push(proposal);
@@ -209,7 +232,11 @@ struct ClassifiedFile {
     rename_mismatch_score: Option<f32>,
 }
 
-/// Classify a single loose file through Tiers 1→2 and return the best verdict.
+/// Classify a single loose file through Tiers 1→2→3 and return the best verdict.
+///
+/// Tier 3 fires only when (a) Tier 2 produced a `needs_review` result, (b) a
+/// `text_backend` was supplied by the caller, and (c)
+/// `config.enable_llm_fallback` is true. Otherwise the cascade stops at Tier 2.
 ///
 /// Returns `Ok(None)` when no tier produced any signal (typically: unknown
 /// extension and extraction failure).
@@ -219,6 +246,7 @@ async fn classify_file(
     candidates: &[ScanCandidate],
     embeddings: &dyn EmbeddingBackend,
     multimodal: &MultimodalContext<'_>,
+    text_backend: Option<&dyn TextBackend>,
     extractors: &[Arc<dyn ContentExtractor>],
     config: &ClassifierConfig,
 ) -> Result<Option<ClassifiedFile>> {
@@ -334,8 +362,38 @@ async fn classify_file(
         return Ok(None);
     }
     let idx = best_idx.unwrap_or(0);
-    let candidate = &candidates[idx];
+    let mut chosen_idx = idx;
+    let mut chosen_score = best_score;
+    let mut chosen_gap = gap;
+    let mut tier3_used = false;
+    let mut tier3_model: Option<String> = None;
     let needs_review = best_score < config.embedding_threshold || gap < config.ambiguity_gap;
+
+    // Tier 3 — LLM fallback. Only fires when Tier 2 was uncertain *and* the
+    // caller wired in a text backend *and* config gates haven't disabled it.
+    // We never call the LLM when Tier 2 was already confident — the cost only
+    // shows up on the hard cases.
+    if needs_review && config.enable_llm_fallback {
+        if let Some(backend) = text_backend {
+            match tier3_rerank(backend, embeddings, text, &filename, candidates).await {
+                Ok(Some((llm_idx, llm_score, llm_gap, model_id))) if llm_score > chosen_score => {
+                    chosen_idx = llm_idx;
+                    chosen_score = llm_score;
+                    chosen_gap = llm_gap;
+                    tier3_used = true;
+                    tier3_model = Some(model_id);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "tier3 llm fallback failed; staying with tier2");
+                }
+            }
+        }
+    }
+
+    let candidate = &candidates[chosen_idx];
+    let final_needs_review =
+        chosen_score < config.embedding_threshold || chosen_gap < config.ambiguity_gap;
 
     let year = year_from_path_and_text(path, Some(text));
     let keywords = yake::extract_keywords(text, 8);
@@ -347,7 +405,7 @@ async fn classify_file(
         &metadata_json,
         &keywords,
         year,
-        best_score,
+        chosen_score,
         embeddings,
         Some(text),
         &filename,
@@ -355,20 +413,73 @@ async fn classify_file(
     )
     .await?;
 
+    let reasoning = if tier3_used {
+        let model = tier3_model.as_deref().unwrap_or("unknown");
+        format!(
+            "tier3 llm-rerank: cos={chosen_score:.3} gap={chosen_gap:.3} \
+             tier2_cos={best_score:.3} llm={model} embed={}",
+            embeddings.model_id(),
+        )
+    } else {
+        format!(
+            "tier2 embedding: cos={chosen_score:.3} gap={chosen_gap:.3} model={}",
+            embeddings.model_id(),
+        )
+    };
+
     Ok(Some(ClassifiedFile {
         folder_path: candidate.folder_path.clone(),
-        confidence: best_score,
-        reasoning: format!(
-            "tier2 embedding: cos={best_score:.3} gap={gap:.3} model={}",
-            embeddings.model_id(),
-        ),
-        needs_review,
+        confidence: chosen_score,
+        reasoning,
+        needs_review: final_needs_review,
         year,
         temporal: candidate.temporal,
         rename: rename.proposal,
-        classification_confidence: Some(best_score),
+        classification_confidence: Some(chosen_score),
         rename_mismatch_score: rename.mismatch_score,
     }))
+}
+
+/// Tier 3: ask the LLM to classify the content, then re-embed its summary +
+/// category + tags as a richer query and re-rank the candidate list. Returns
+/// `(idx, score, gap, model_id)` for the new top, or `None` when the LLM
+/// produced no usable output.
+///
+/// We deliberately ignore the LLM's `suggested_name` — rename proposals are
+/// extractive only, never LLM-fabricated (per the project's rename policy).
+async fn tier3_rerank(
+    text_backend: &dyn TextBackend,
+    embeddings: &dyn EmbeddingBackend,
+    text: &str,
+    filename: &str,
+    candidates: &[ScanCandidate],
+) -> Result<Option<(usize, f32, f32, String)>> {
+    let classification = text_backend.classify_text(text, filename).await?;
+    let model_id = text_backend.model_id().to_string();
+    let query = build_llm_query(&classification);
+    if query.is_empty() {
+        return Ok(None);
+    }
+    let llm_embedding = embeddings.embed_text(&query).await?;
+    let (idx, score, gap) = best_match(&llm_embedding, candidates);
+    Ok(idx.map(|i| (i, score, gap, model_id)))
+}
+
+/// Build a single dense query string from a [`ContentClassification`]. The
+/// summary carries most of the signal, but category + tags add lexical
+/// overlap with taxonomy descriptions (which use keyword-soup).
+fn build_llm_query(c: &tidyup_core::inference::ContentClassification) -> String {
+    let mut parts = Vec::with_capacity(3);
+    if !c.category.is_empty() {
+        parts.push(c.category.clone());
+    }
+    if !c.tags.is_empty() {
+        parts.push(c.tags.join(" "));
+    }
+    if !c.summary.is_empty() {
+        parts.push(c.summary.clone());
+    }
+    parts.join(" ")
 }
 
 /// Decide a file's modality from its extension + MIME. Used to pick which
@@ -881,6 +992,7 @@ mod tests {
             &candidates,
             &eb,
             &MultimodalContext::default(),
+            None,
             &ex,
             &ClassifierConfig::default(),
             &NullProgress,
@@ -913,6 +1025,7 @@ mod tests {
             &candidates,
             &eb,
             &MultimodalContext::default(),
+            None,
             &ex,
             &ClassifierConfig::default(),
             &NullProgress,
@@ -948,6 +1061,7 @@ mod tests {
             &candidates,
             &eb,
             &MultimodalContext::default(),
+            None,
             &ex,
             &cfg,
             &NullProgress,
@@ -975,6 +1089,7 @@ mod tests {
             &[],
             &eb,
             &MultimodalContext::default(),
+            None,
             &[],
             &ClassifierConfig::default(),
             &NullProgress,
@@ -1004,6 +1119,7 @@ mod tests {
             &candidates,
             &eb,
             &MultimodalContext::default(),
+            None,
             &ex,
             &cfg,
             &NullProgress,
@@ -1102,6 +1218,7 @@ mod tests {
             &[],
             &eb,
             &multimodal,
+            None,
             &ex,
             &cfg,
             &NullProgress,
@@ -1171,5 +1288,201 @@ mod tests {
         assert_eq!(find_year("file12024.pdf"), None);
         assert_eq!(find_year("1999"), None);
         assert_eq!(find_year("2040"), None);
+    }
+
+    /// Stub `TextBackend` returning a fixed `ContentClassification`. Used to
+    /// drive the Tier 3 path deterministically without loading a real LLM.
+    struct StubTextBackend {
+        category: &'static str,
+        tags: Vec<&'static str>,
+        summary: &'static str,
+    }
+    #[async_trait]
+    impl TextBackend for StubTextBackend {
+        async fn classify_text(
+            &self,
+            _text: &str,
+            _filename: &str,
+        ) -> tidyup_core::Result<tidyup_core::inference::ContentClassification> {
+            Ok(tidyup_core::inference::ContentClassification {
+                category: self.category.to_string(),
+                tags: self.tags.iter().map(|s| (*s).to_string()).collect(),
+                summary: self.summary.to_string(),
+                suggested_name: None,
+            })
+        }
+        async fn classify_audio(
+            &self,
+            _filename: &str,
+            _metadata: &str,
+        ) -> tidyup_core::Result<tidyup_core::inference::ContentClassification> {
+            unreachable!("audio path not exercised by these tests")
+        }
+        async fn classify_video(
+            &self,
+            _filename: &str,
+            _frame_captions: &[String],
+        ) -> tidyup_core::Result<tidyup_core::inference::ContentClassification> {
+            unreachable!("video path not exercised by these tests")
+        }
+        async fn classify_image_description(
+            &self,
+            _filename: &str,
+            _description: &str,
+        ) -> tidyup_core::Result<tidyup_core::inference::ContentClassification> {
+            unreachable!("image-desc path not exercised by these tests")
+        }
+        async fn complete(
+            &self,
+            _prompt: &str,
+            _opts: &tidyup_core::inference::GenerationOptions,
+        ) -> tidyup_core::Result<String> {
+            unreachable!("complete not exercised by these tests")
+        }
+        fn model_id(&self) -> &'static str {
+            "stub-llm"
+        }
+    }
+
+    #[tokio::test]
+    async fn tier3_llm_rerank_replaces_uncertain_tier2_verdict() {
+        // Setup: a file whose raw bytes embed poorly against any candidate,
+        // forcing Tier 2 below threshold. The stub LLM's summary embeds well
+        // against the Finance/Taxes candidate, so Tier 3 should override.
+        let td = TempDir::new().unwrap();
+        // Content chosen so its bucket-embedding cosine with the Finance
+        // description is mediocre — it's mostly punctuation/short words that
+        // don't share many bytes with the tax keyword soup.
+        fs::write(td.path().join("anonymous.dat"), b"x x x x x x").unwrap();
+
+        let eb = BucketEmbeddings;
+        let candidates = sample_candidates(&eb).await;
+        let ex: Vec<Arc<dyn ContentExtractor>> = vec![Arc::new(PlainExtractor)];
+
+        // High thresholds force Tier 2 to mark needs_review even on its top hit.
+        let cfg = ClassifierConfig {
+            embedding_threshold: 0.99,
+            ambiguity_gap: 0.50,
+            enable_llm_fallback: true,
+            ..ClassifierConfig::default()
+        };
+
+        // category + tags are prepended to the LLM query in production; here
+        // we leave them empty so the query is exactly the Finance candidate's
+        // description. This isolates the test from the toy bucket embedder's
+        // byte-collision behaviour and keeps the assertion about *wiring*,
+        // not embedder fidelity.
+        let llm = StubTextBackend {
+            category: "",
+            tags: vec![],
+            summary: "tax return W-2 1099 1040 IRS refund withholding",
+        };
+
+        let out = run_scan(
+            td.path(),
+            td.path(),
+            &candidates,
+            &eb,
+            &MultimodalContext::default(),
+            Some(&llm),
+            &ex,
+            &cfg,
+            &NullProgress,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.proposals.len(), 1);
+        let p = &out.proposals[0];
+        assert!(
+            p.reasoning.contains("tier3 llm-rerank"),
+            "expected tier3 reasoning, got {}",
+            p.reasoning,
+        );
+        assert!(
+            p.proposed_path.to_string_lossy().contains("Finance"),
+            "expected Finance route, got {:?}",
+            p.proposed_path,
+        );
+    }
+
+    #[tokio::test]
+    async fn tier3_disabled_in_config_does_not_call_llm() {
+        // If `enable_llm_fallback = false`, the LLM is never consulted even
+        // when a backend is supplied. Stub returns a category that *would*
+        // re-route — the test asserts it does not.
+        struct ExplodingTextBackend;
+        #[async_trait]
+        impl TextBackend for ExplodingTextBackend {
+            async fn classify_text(
+                &self,
+                _text: &str,
+                _filename: &str,
+            ) -> tidyup_core::Result<tidyup_core::inference::ContentClassification> {
+                panic!("Tier 3 must not be invoked when enable_llm_fallback is false");
+            }
+            async fn classify_audio(
+                &self,
+                _f: &str,
+                _m: &str,
+            ) -> tidyup_core::Result<tidyup_core::inference::ContentClassification> {
+                unreachable!()
+            }
+            async fn classify_video(
+                &self,
+                _f: &str,
+                _c: &[String],
+            ) -> tidyup_core::Result<tidyup_core::inference::ContentClassification> {
+                unreachable!()
+            }
+            async fn classify_image_description(
+                &self,
+                _f: &str,
+                _d: &str,
+            ) -> tidyup_core::Result<tidyup_core::inference::ContentClassification> {
+                unreachable!()
+            }
+            async fn complete(
+                &self,
+                _p: &str,
+                _o: &tidyup_core::inference::GenerationOptions,
+            ) -> tidyup_core::Result<String> {
+                unreachable!()
+            }
+            fn model_id(&self) -> &'static str {
+                "exploding"
+            }
+        }
+
+        let td = TempDir::new().unwrap();
+        fs::write(td.path().join("anonymous.dat"), b"x x x x x x").unwrap();
+
+        let eb = BucketEmbeddings;
+        let candidates = sample_candidates(&eb).await;
+        let ex: Vec<Arc<dyn ContentExtractor>> = vec![Arc::new(PlainExtractor)];
+        let cfg = ClassifierConfig {
+            embedding_threshold: 0.99,
+            ambiguity_gap: 0.50,
+            enable_llm_fallback: false,
+            ..ClassifierConfig::default()
+        };
+
+        let out = run_scan(
+            td.path(),
+            td.path(),
+            &candidates,
+            &eb,
+            &MultimodalContext::default(),
+            Some(&ExplodingTextBackend),
+            &ex,
+            &cfg,
+            &NullProgress,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.proposals.len(), 1);
+        assert!(out.proposals[0].needs_review);
+        assert!(out.proposals[0].reasoning.contains("tier2"));
     }
 }

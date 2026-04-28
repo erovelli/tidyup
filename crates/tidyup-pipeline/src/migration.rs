@@ -14,6 +14,17 @@
 //! 0.10 hierarchy`). When a folder's `content_centroid` is `None` (the v0.1
 //! default), the centroid weight is redistributed to `name` so the composite
 //! stays in `[0, 1]`.
+//!
+//! # Tier 3
+//!
+//! When a caller supplies `Some(text_backend)` and Tier 2's top profile lands
+//! in the review zone, the LLM classifies the content and the resulting
+//! `summary + category + tags` is re-embedded and re-ranked against the same
+//! profile cache under the same scoring rules. The LLM-reranked top is
+//! adopted only if it scores higher than Tier 2's. The verdict's
+//! `resolved_at` is set to [`Tier::Llm`] when this fires. The activation gate
+//! is the caller passing `Some(text_backend)` — this module is
+//! feature-flag-free by design.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -22,7 +33,7 @@ use anyhow::Result;
 use chrono::Utc;
 use tidyup_core::extractor::ContentExtractor;
 use tidyup_core::frontend::{Level, ProgressItem, ProgressReporter};
-use tidyup_core::inference::EmbeddingBackend;
+use tidyup_core::inference::{EmbeddingBackend, TextBackend};
 use tidyup_domain::change::{ChangeProposal, ChangeStatus, ChangeType};
 use tidyup_domain::migration::{
     Candidate, ClassificationResult, ScoreBreakdown, ScoreWeights, Tier,
@@ -54,14 +65,21 @@ pub struct MigrationOutcome {
 
 /// Drive the migration cascade end-to-end.
 ///
+/// `text_backend` is the optional Tier 3 LLM. Pass `None` and the cascade
+/// stops at Tier 2; pass `Some` and low-confidence Tier 2 verdicts get a
+/// chance to be re-ranked through an LLM-cleaned query against the same
+/// folder profiles.
+///
 /// # Errors
 /// Propagates source-read and embedding-backend failures. Per-file
 /// extraction / classification failures are logged via `progress.message`
 /// and surface through [`MigrationOutcome::unclassified`].
+#[allow(clippy::too_many_arguments)]
 pub async fn run_migration(
     source_root: &Path,
     profiles: &ProfileCache,
     embeddings: &dyn EmbeddingBackend,
+    text_backend: Option<&dyn TextBackend>,
     extractors: &[Arc<dyn ContentExtractor>],
     config: &ClassifierConfig,
     progress: &dyn ProgressReporter,
@@ -100,7 +118,7 @@ pub async fn run_migration(
         .await;
 
     for (idx, path) in tree.loose_files.iter().enumerate() {
-        match classify_file(path, profiles, embeddings, extractors, config).await {
+        match classify_file(path, profiles, embeddings, text_backend, extractors, config).await {
             Ok(Some(verdict)) => {
                 let proposal = build_proposal(path, &verdict);
                 outcome.proposals.push(proposal);
@@ -148,11 +166,12 @@ struct Verdict {
     rename_mismatch_score: Option<f32>,
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn classify_file(
     path: &Path,
     profiles: &ProfileCache,
     embeddings: &dyn EmbeddingBackend,
+    text_backend: Option<&dyn TextBackend>,
     extractors: &[Arc<dyn ContentExtractor>],
     config: &ClassifierConfig,
 ) -> Result<Option<Verdict>> {
@@ -251,13 +270,62 @@ async fn classify_file(
         return Ok(None);
     }
 
-    let (top_folder, top_score, top_breakdown) = ranked[0].clone();
-    let gap = if ranked.len() >= 2 {
-        top_score - ranked[1].1
+    let (tier2_folder, tier2_score, tier2_breakdown) = ranked[0].clone();
+    let tier2_gap = if ranked.len() >= 2 {
+        tier2_score - ranked[1].1
     } else {
-        top_score
+        tier2_score
     };
-    let needs_review = top_score < config.embedding_threshold || gap < config.ambiguity_gap;
+    let tier2_needs_review =
+        tier2_score < config.embedding_threshold || tier2_gap < config.ambiguity_gap;
+
+    // Tier 3 — only fires when Tier 2 was uncertain and a backend is wired.
+    let mut chosen_folder = tier2_folder.clone();
+    let mut chosen_score = tier2_score;
+    let mut chosen_gap = tier2_gap;
+    let mut chosen_breakdown = tier2_breakdown.clone();
+    let mut chosen_ranked = ranked.clone();
+    let mut tier3_used = false;
+    let mut tier3_model: Option<String> = None;
+
+    if tier2_needs_review && config.enable_llm_fallback {
+        if let Some(backend) = text_backend {
+            match tier3_rerank(
+                backend,
+                embeddings,
+                profiles,
+                path,
+                text,
+                &filename,
+                &config.weights,
+            )
+            .await
+            {
+                Ok(Some((rerank, model_id))) if rerank[0].1 > chosen_score => {
+                    let (f, s, b) = rerank[0].clone();
+                    let g = if rerank.len() >= 2 {
+                        s - rerank[1].1
+                    } else {
+                        s
+                    };
+                    chosen_folder = f;
+                    chosen_score = s;
+                    chosen_gap = g;
+                    chosen_breakdown = b;
+                    chosen_ranked = rerank;
+                    tier3_used = true;
+                    tier3_model = Some(model_id);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "tier3 llm fallback failed; staying with tier2");
+                }
+            }
+        }
+    }
+
+    let needs_review =
+        chosen_score < config.embedding_threshold || chosen_gap < config.ambiguity_gap;
 
     let metadata_json = extracted
         .as_ref()
@@ -269,7 +337,7 @@ async fn classify_file(
         &metadata_json,
         &keywords,
         year,
-        top_score,
+        chosen_score,
         embeddings,
         Some(text),
         &filename,
@@ -277,7 +345,7 @@ async fn classify_file(
     )
     .await?;
 
-    let candidates_out: Vec<Candidate> = ranked
+    let candidates_out: Vec<Candidate> = chosen_ranked
         .iter()
         .take(5)
         .map(|(folder, score, breakdown)| Candidate {
@@ -287,11 +355,36 @@ async fn classify_file(
         })
         .collect();
 
+    let resolved_at = if tier3_used {
+        Tier::Llm
+    } else {
+        Tier::Embedding
+    };
+    let reasoning = if tier3_used {
+        let model = tier3_model.as_deref().unwrap_or("unknown");
+        format!(
+            "tier3 llm-rerank: top={chosen_score:.3} gap={chosen_gap:.3} \
+             tier2_top={tier2_score:.3} llm={model} embed={}",
+            embeddings.model_id(),
+        )
+    } else {
+        format!(
+            "tier2 composite: top={chosen_score:.3} gap={chosen_gap:.3} name={:.3} centroid={} \
+             metadata={:.3} hierarchy={:.3}",
+            chosen_breakdown.name_similarity,
+            chosen_breakdown
+                .centroid_similarity
+                .map_or_else(|| "n/a".to_string(), |v| format!("{v:.3}")),
+            chosen_breakdown.metadata_score,
+            chosen_breakdown.hierarchy_adjustment,
+        )
+    };
+
     Ok(Some(Verdict {
         result: ClassificationResult {
             source_file: path.to_path_buf(),
             candidates: candidates_out,
-            resolved_at: Tier::Embedding,
+            resolved_at,
             needs_review,
             suggested_rename: match &rename.proposal {
                 RenameProposal::Rename { name, .. } => Some(name.clone()),
@@ -299,21 +392,61 @@ async fn classify_file(
             },
         },
         rename: rename.proposal,
-        destination_folder: top_folder,
-        confidence: top_score,
-        reasoning: format!(
-            "tier2 composite: top={top_score:.3} gap={gap:.3} name={:.3} centroid={} \
-             metadata={:.3} hierarchy={:.3}",
-            top_breakdown.name_similarity,
-            top_breakdown
-                .centroid_similarity
-                .map_or_else(|| "n/a".to_string(), |v| format!("{v:.3}")),
-            top_breakdown.metadata_score,
-            top_breakdown.hierarchy_adjustment,
-        ),
-        classification_confidence: Some(top_score),
+        destination_folder: chosen_folder,
+        confidence: chosen_score,
+        reasoning,
+        classification_confidence: Some(chosen_score),
         rename_mismatch_score: rename.mismatch_score,
     }))
+}
+
+/// Tier 3 for migration mode: ask the LLM to classify the content, then
+/// re-rank profiles using an embedding of `summary + category + tags` instead
+/// of the raw content.
+///
+/// Returns the new ranked list (same shape as [`rank_profiles`]) plus the
+/// backend's model id, or `None` when the LLM produced no usable output. We
+/// deliberately ignore the LLM's `suggested_name` — rename proposals are
+/// extractive only (per project rename policy).
+#[allow(clippy::too_many_arguments)]
+async fn tier3_rerank(
+    text_backend: &dyn TextBackend,
+    embeddings: &dyn EmbeddingBackend,
+    profiles: &ProfileCache,
+    source_path: &Path,
+    text: &str,
+    filename: &str,
+    weights: &ScoreWeights,
+) -> Result<Option<(Vec<(PathBuf, f32, ScoreBreakdown)>, String)>> {
+    let classification = text_backend.classify_text(text, filename).await?;
+    let model_id = text_backend.model_id().to_string();
+    let query = build_llm_query(&classification);
+    if query.is_empty() {
+        return Ok(None);
+    }
+    let llm_embedding = embeddings.embed_text(&query).await?;
+    let ranked = rank_profiles(&llm_embedding, profiles, source_path, weights);
+    if ranked.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((ranked, model_id)))
+}
+
+/// Build a single dense query string from a [`ContentClassification`]. Mirrors
+/// the scan-mode helper — same idea: combine the LLM's structured output into
+/// one string that embeds well against folder name/centroid descriptions.
+fn build_llm_query(c: &tidyup_core::inference::ContentClassification) -> String {
+    let mut parts = Vec::with_capacity(3);
+    if !c.category.is_empty() {
+        parts.push(c.category.clone());
+    }
+    if !c.tags.is_empty() {
+        parts.push(c.tags.join(" "));
+    }
+    if !c.summary.is_empty() {
+        parts.push(c.summary.clone());
+    }
+    parts.join(" ")
 }
 
 fn weak_heuristic(hit: &HeuristicMatch, folder: PathBuf, path: &Path) -> Verdict {
@@ -855,7 +988,7 @@ mod tests {
             ..ClassifierConfig::default()
         };
 
-        let out = run_migration(src.path(), &profiles, &eb, &ex, &cfg, &NullProgress)
+        let out = run_migration(src.path(), &profiles, &eb, None, &ex, &cfg, &NullProgress)
             .await
             .unwrap();
 
@@ -889,6 +1022,7 @@ mod tests {
             src.path(),
             &profiles,
             &eb,
+            None,
             &ex,
             &ClassifierConfig::default(),
             &NullProgress,
@@ -922,6 +1056,7 @@ mod tests {
             src.path(),
             &profiles,
             &eb,
+            None,
             &ex,
             &ClassifierConfig::default(),
             &NullProgress,
@@ -968,6 +1103,7 @@ mod tests {
             src.path(),
             &profiles,
             &eb,
+            None,
             &ex,
             &ClassifierConfig::default(),
             &NullProgress,
@@ -976,6 +1112,116 @@ mod tests {
         .unwrap();
         assert_eq!(out.proposals.len(), 0);
         assert_eq!(out.unclassified.len(), 1);
+    }
+
+    /// Stub `TextBackend` for Tier 3 tests. Returns a fixed
+    /// `ContentClassification`; non-text methods are unreachable.
+    struct StubTextBackend {
+        category: &'static str,
+        tags: Vec<&'static str>,
+        summary: &'static str,
+    }
+    #[async_trait]
+    impl TextBackend for StubTextBackend {
+        async fn classify_text(
+            &self,
+            _text: &str,
+            _filename: &str,
+        ) -> tidyup_core::Result<tidyup_core::inference::ContentClassification> {
+            Ok(tidyup_core::inference::ContentClassification {
+                category: self.category.to_string(),
+                tags: self.tags.iter().map(|s| (*s).to_string()).collect(),
+                summary: self.summary.to_string(),
+                suggested_name: None,
+            })
+        }
+        async fn classify_audio(
+            &self,
+            _f: &str,
+            _m: &str,
+        ) -> tidyup_core::Result<tidyup_core::inference::ContentClassification> {
+            unreachable!()
+        }
+        async fn classify_video(
+            &self,
+            _f: &str,
+            _c: &[String],
+        ) -> tidyup_core::Result<tidyup_core::inference::ContentClassification> {
+            unreachable!()
+        }
+        async fn classify_image_description(
+            &self,
+            _f: &str,
+            _d: &str,
+        ) -> tidyup_core::Result<tidyup_core::inference::ContentClassification> {
+            unreachable!()
+        }
+        async fn complete(
+            &self,
+            _p: &str,
+            _o: &tidyup_core::inference::GenerationOptions,
+        ) -> tidyup_core::Result<String> {
+            unreachable!()
+        }
+        fn model_id(&self) -> &'static str {
+            "stub-llm"
+        }
+    }
+
+    #[tokio::test]
+    async fn tier3_llm_rerank_overrides_uncertain_tier2() {
+        let src = TempDir::new().unwrap();
+        let tgt = TempDir::new().unwrap();
+        // Content embeds poorly against the Finance profile via raw bytes,
+        // forcing Tier 2 needs_review. The stub LLM emits a Finance-shaped
+        // summary, which re-embeds strongly against the Finance profile.
+        fs::write(src.path().join("anonymous.dat"), b"x x x x x x").unwrap();
+
+        let eb = BucketEmbeddings;
+        let profiles = sample_cache(tgt.path(), &eb).await;
+        let ex: Vec<Arc<dyn ContentExtractor>> = vec![Arc::new(PlainExtractor)];
+
+        let cfg = ClassifierConfig {
+            embedding_threshold: 0.99,
+            ambiguity_gap: 0.50,
+            enable_llm_fallback: true,
+            ..ClassifierConfig::default()
+        };
+        // Empty category/tags so the LLM query is exactly the Finance
+        // profile's description — keeps the assertion about *wiring*, not
+        // embedder fidelity (the bucket embedder is byte-collision-prone).
+        let llm = StubTextBackend {
+            category: "",
+            tags: vec![],
+            summary: "tax return W-2 1099 1040 IRS refund withholding",
+        };
+
+        let out = run_migration(
+            src.path(),
+            &profiles,
+            &eb,
+            Some(&llm),
+            &ex,
+            &cfg,
+            &NullProgress,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.proposals.len(), 1);
+        let p = &out.proposals[0];
+        assert!(
+            p.reasoning.contains("tier3 llm-rerank"),
+            "expected tier3 reasoning, got {}",
+            p.reasoning,
+        );
+        assert!(
+            p.proposed_path.starts_with(tgt.path().join("Finance")),
+            "expected Finance route, got {:?}",
+            p.proposed_path,
+        );
+        assert_eq!(out.classifications.len(), 1);
+        assert_eq!(out.classifications[0].resolved_at, Tier::Llm);
     }
 
     #[test]
