@@ -21,7 +21,7 @@ tidyup classifies via a three-tier cascade, each tier cheaper than the last, sho
 2. **Tier 2 — Embedding similarity (~50 ms).** Content embedded to a vector; scored against target folder profiles. The UES spine. Default Tier 2.
 3. **Tier 3 — Local LLM fallback (optional, opt-in, ~1–10 s).** Feature-gated under `--features llm-fallback`, off by default. When compiled in and enabled per-invocation, files that fall below Tier 2 confidence thresholds can be routed to a local LLM for a second opinion. Default builds exclude this tier entirely.
 
-**Non-LLM AI on the default path.** The default binary ships Tier 1 and Tier 2 only. Classification is deterministic, auditable, bit-reproducible, and runs in ~50 ms per file on CPU. Tier 3 sits symmetrically with remote inference under the same two-gate pattern (compile-time feature + runtime config + per-invocation flag).
+**Non-LLM AI on the default path.** The default binary ships Tier 1 and Tier 2 only. Classification is deterministic, auditable, bit-reproducible, and runs in ~50 ms per file on CPU. Tier 3 sits symmetrically with remote inference under the same **three-gate** pattern (compile-time feature + runtime config + per-invocation flag).
 
 ## The unified-pattern property
 
@@ -174,7 +174,7 @@ Every constraint in `README.md`, `CLAUDE.md`, and `ARCHITECTURE.md` scores embed
 | Atomic bundles, reversible moves | Classifier choice irrelevant | Same |
 | Pure-Rust-preferred | `mistralrs`/`candle` (Rust, but deep tree) | `ort` — FFI cost already accepted |
 
-Migration mode already bans LLM fallback in `CLAUDE.md`: *"CPU inference is 25–50s/file and the review step is the safety net."* Promoting Tier 1 + Tier 2 to the default everywhere and demoting LLM to a feature flag removes the scan-vs-migration asymmetry without losing the LLM escape hatch for users who want it.
+Both modes treat the LLM as an optional Tier 3 escape hatch rather than a default — the cost of CPU inference (25–50s/file) makes embedding-default the right baseline, with the human review step as the final safety net for low-confidence Tier 2 verdicts. Tier 3 sits behind the three-gate activation in both scan and migration mode; same code path, same threshold logic, same review fallback when the LLM still produces a low-confidence verdict.
 
 ## What embeddings give up — honestly
 
@@ -188,15 +188,27 @@ None of these break a spec invariant. They shift judgment to the human review st
 
 ## Tier 3: the LLM-fallback escape hatch
 
-`tidyup-inference-mistralrs` is retained but demoted to a feature flag, symmetric with `tidyup-inference-remote`:
+`tidyup-inference-mistralrs` is retained but feature-gated, symmetric with `tidyup-inference-remote`:
 
 - Default builds **exclude** `tidyup-inference-mistralrs` from the dependency graph entirely (no `mistralrs`, no `candle`, no heavy tokenizer tree). Privacy check: `cargo tree -p tidyup-cli | grep -E 'mistralrs|candle'` returns nothing.
 - `cargo build --features llm-fallback` includes the crate.
-- Runtime activation requires explicit config (`[inference] llm_fallback = true`) **and** a per-invocation flag (`--llm-fallback`).
+- Runtime activation requires explicit config (`[inference] llm_fallback = true`) **and** a per-invocation flag (`--llm-fallback` / `TIDYUP_LLM_FALLBACK=1`). The CLI rejects activation without the matching cargo feature compiled in.
 - Never recommended in first-run UX or default docs.
 - `cargo-deny` ban on `mistralrs`/`candle` outside the `llm-fallback` feature (same pattern as the existing `remote` rule).
 
-Activation routes files with low Tier 2 confidence (or pathological extraction failures: encrypted PDFs, corrupt metadata) through a local LLM for a second opinion. The LLM still produces a `ClassificationResult` — the port contract doesn't change.
+### What Tier 3 actually does (current implementation)
+
+When Tier 2 lands in the **review zone** (`needs_review = true` — below `embedding_threshold` or inside `ambiguity_gap`) and a `TextBackend` is wired in, the pipeline:
+
+1. Calls `text_backend.classify_text(content, filename)` — the LLM emits a `ContentClassification { category, tags, summary, suggested_name }`.
+2. Builds a query string from `category + tags + summary` (the `suggested_name` is **deliberately dropped** — renames stay extractive per the rename policy).
+3. Re-embeds the query via the same `EmbeddingBackend` Tier 2 used.
+4. Re-ranks the same candidate list (scan: `ScanCandidate[]`; migration: `FolderProfile[]`) under the same scoring rules.
+5. Adopts the LLM-reranked top **only if** it scores higher than the Tier 2 top. Otherwise the Tier 2 verdict stands.
+
+The cost (1–10 s of inference) is paid only on hard cases — Tier 2 hits that already cleared their thresholds skip Tier 3 entirely. The verdict's `reasoning` field records `tier3 llm-rerank: …` so post-hoc auditing can tell which tier resolved each file. In migration mode the result also carries `Tier::Llm` in `ClassificationResult.resolved_at`.
+
+`tidyup-inference-remote` plugs into the same seam: it implements `TextBackend`, so `--remote` swaps the local mistralrs engine for a remote OpenAI-compatible / Anthropic / Ollama endpoint without any pipeline changes.
 
 ## Architectural implications
 

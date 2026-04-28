@@ -173,6 +173,34 @@ Both produce `ChangeProposal`s and `BundleProposal`s that flow through the same 
 - **Taxonomy embedding cache invalidates by hash of taxonomy text**, not by version number.
 - **`ProfileCache` is keyed by target root** and rebuilds incrementally via `ScanDiff` against `FolderMetadata.content_hash`. Not by timestamp.
 
+## Tier 3 LLM fallback
+
+The pipeline accepts `Option<&dyn TextBackend>` and only consults it when
+Tier 2 lands in the review zone (`needs_review = true`) AND
+`config.enable_llm_fallback` is true. Three invariants future work must
+preserve:
+
+- **Three-gate activation.** The privacy model requires (a) the cargo
+  feature compiled in (`--features llm-fallback` / `--features remote`),
+  (b) the matching config bool (`[inference] llm_fallback = true`) or
+  `[inference.remote]` section, and (c) the per-invocation flag
+  (`--llm-fallback` / `--remote` or `TIDYUP_LLM_FALLBACK=1` /
+  `TIDYUP_REMOTE=1`). The CLI rejects activation without the cargo
+  feature; default builds and default invocations stay LLM-silent and
+  network-silent. Don't shortcut the gate — don't auto-enable Tier 3 in
+  default invocations, don't read `[inference] llm_fallback = true` from
+  config alone, don't infer activation from environment heuristics.
+- **`ServiceContext.text` is `Option`.** `None` is the privacy-preserving
+  default. The pipeline's optional `text_backend` parameter is fed from
+  `ctx.text.as_deref()`. A `NullTextBackend` stand-in is deliberately
+  not used — absence is the signal, not a no-op trait object.
+- **Tier 3 never produces renames.** The cascade calls
+  `text_backend.classify_text(content, filename)` and re-embeds
+  `category + tags + summary` for re-ranking, but the LLM's
+  `suggested_name` field is deliberately dropped. The rename gate is
+  driven by Tier 2's confidence, not the post-Tier-3 rerank score, so
+  Tier 3 reroutes never produce renames — by design.
+
 ## Multimodal Tier 2 (Phase 7)
 
 Image and audio classification are cross-modal contrastive lookups (SigLIP /
