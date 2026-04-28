@@ -12,17 +12,23 @@ Your files stay where they belong — with you.
 
 > **Warning — tidyup is still under active construction.**
 >
-> As of Phase 5, `tidyup migrate`, `tidyup scan`, and `tidyup rollback` run
-> end-to-end on the default binary: proposals are generated, reviewed,
-> shelved, moved, and reversible. First-run fails fast with installer
-> instructions when the embedding model is missing. Phase 6 adds the
-> `tidyup-desktop` Dioxus UI on top of the same `ServiceContext` — the
-> plug-and-play seam promised by the architecture: CLI and UI differ only in
-> how they report progress and gather review decisions. That said, the
-> confidence thresholds, default taxonomy, and rename cascade have not yet
-> been calibrated against a real corpus, interactive bundle review is still
-> TODO, and the multimodal encoders aren't wired in — so please do not yet
-> point tidyup at files you care about.
+> `tidyup migrate`, `tidyup scan`, and `tidyup rollback` run end-to-end on
+> the default binary: proposals are generated, reviewed, shelved, moved, and
+> reversible. First-run fails fast with installer instructions when the
+> embedding model is missing. The `tidyup-desktop` Dioxus UI is wired on top
+> of the same `ServiceContext` — the plug-and-play seam promised by the
+> architecture: CLI and UI differ only in how they report progress and
+> gather review decisions. Phase 7 added optional cross-modal Tier 2 for
+> images (SigLIP) and audio (CLAP) in scan mode; both load when their ONNX
+> bundles are present. The Tier 3 LLM fallback is now wired through the
+> same pipeline seam — opt in with `--features llm-fallback` (or
+> `--features remote`) plus the matching config + flag activation, and
+> low-confidence Tier 2 verdicts get a second-opinion re-rank. That said:
+> confidence thresholds aren't calibrated against a real corpus,
+> interactive bundle review is still TODO, the desktop UI has no per-
+> invocation Tier 3 toggle yet, and migration mode still profiles target
+> folders in the bge-small text space (so image/audio routing in migrate is
+> weaker than in scan). Don't point tidyup at files you care about.
 >
 > Everything below describes the target design. Check the
 > [roadmap](#roadmap) for what actually works today.
@@ -55,7 +61,7 @@ This is a portfolio project and a personal tool. It is also a statement: useful 
 - **Classifies each loose file by its contents** via a three-tier cascade, cheapest first:
   1. **Heuristics** (~1ms) — extension, MIME, keyword rules.
   2. **Embeddings** (~50ms, default) — cosine similarity against learned target-folder profiles via `bge-small-en-v1.5` on ONNX Runtime. Deterministic, auditable, offline.
-  3. **Local LLM fallback** (1–10s, optional) — available only with `--features llm-fallback`, off by default. Provides a second opinion on files that fall below Tier 2 confidence thresholds. Default builds exclude this tier entirely; low-confidence files surface directly to review.
+  3. **Local LLM fallback** (1–10s, optional) — available only with `--features llm-fallback`, off by default. When Tier 2 lands in the review zone, the LLM classifies the content; its `summary + category + tags` is re-embedded and re-ranked against the same candidate list. The LLM-reranked top is adopted only if it scores higher than Tier 2's. Renames stay extractive — the LLM's `suggested_name` is deliberately ignored. Default builds exclude this tier entirely; low-confidence files surface directly to review.
 - **Proposes a destination folder** — with a plain-English reason.
 - **Proposes a rename** when filename and contents disagree — using two tunable signals (classification confidence × filename-content mismatch). Renames never auto-apply even with `--yes`; they always go through explicit review.
 - **Shows you a diff-style review UI** — approve, edit, or reject per file or per bundle.
@@ -81,7 +87,7 @@ Two modes:
 | Atomic bundle moves   | Coding projects, photo albums, and other groupings move as a single unit or not at all.                |
 | Extractive renames only | Rename proposals come from embedded metadata, keyword-template fill, or nearest-neighbor adaptation — never fabricated. Structurally incapable of generating a name without evidence. |
 
-**Remote inference and LLM fallback are symmetric power-user opt-ins**, not defaults. Each requires the same two-gate opt-in: (a) compile with the feature flag (`--features remote` or `--features llm-fallback`), (b) enable in config (`[inference] backends = ["remote-..."]` or `[inference] llm_fallback = true`), and (c) pass the per-invocation flag (`--remote` or `--llm-fallback`). First-run and onboarding never recommend either; the tool is designed to be excellent offline with embedding-based classification as the spine.
+**Remote inference and LLM fallback are symmetric power-user opt-ins**, not defaults. Each requires the same **three-gate** opt-in: (a) compile with the feature flag (`--features remote` or `--features llm-fallback`), (b) configure (`[inference.remote]` section or `[inference] llm_fallback = true`), and (c) pass the per-invocation flag (`--remote` / `TIDYUP_REMOTE=1` or `--llm-fallback` / `TIDYUP_LLM_FALLBACK=1`). The CLI rejects activation without the matching cargo feature. The two flags are mutually exclusive. First-run and onboarding never recommend either; the tool is designed to be excellent offline with embedding-based classification as the spine.
 
 If you find a privacy claim here that doesn't match the code, that's a bug — please open an issue.
 
@@ -156,7 +162,8 @@ tidyup is being built in phases. Each phase lands an independently compilable sl
 - `tidyup-embeddings-ort`: `bge-small-en-v1.5` ONNX classifier, taxonomy cache (BLAKE3-invalidated), inline YAKE, model-install verifier
 - `tidyup-inference-mistralrs` (opt-in `--features llm-fallback`): `TextBackend` + lazy `VisionBackend` via `mistralrs`; Metal/CUDA pass-through features
 - `tidyup-inference-remote` (opt-in `--features remote`): `TextBackend` over OpenAI-compatible, Anthropic, and Ollama endpoints
-- `tidyup-pipeline`: Tier 1 heuristics, bundle detection (Cargo/npm/pyproject/Gradle/Xcode/.git/Jupyter), target-tree profiler with name+centroid embeddings, extractive rename cascade (metadata → keywords → adapt → keep), scan-mode classifier against a fixed taxonomy, migration-mode classifier against an existing hierarchy
+- `tidyup-pipeline`: Tier 1 heuristics, bundle detection (Cargo/npm/pyproject/Gradle/Xcode/.git/Jupyter), target-tree profiler with name+centroid embeddings, extractive rename cascade (metadata → keywords → adapt → keep), Tier 3 LLM-rerank fallback on low-confidence verdicts (off-by-default; activated via the triple-gate below), scan-mode classifier against a fixed taxonomy, migration-mode classifier against an existing hierarchy
+- **Tier 3 LLM fallback (optional, off-by-default)**: when Tier 2 lands in the review zone (below threshold or inside the ambiguity gap), an optional `TextBackend` re-classifies the content; the LLM's `summary + category + tags` is re-embedded and re-ranked against the same candidate list. Adopted only if it scores above Tier 2. Triple-gated activation per the privacy model: compile with `--features llm-fallback` (or `--features remote`), set `[inference] llm_fallback = true` (or `[inference.remote]`) in config, and pass `--llm-fallback` (or `--remote`) at invocation. Renames stay extractive — the LLM's `suggested_name` is deliberately ignored
 - `tidyup-app`: `ScanService`, `MigrationService`, and `RollbackService` driving the pipeline end-to-end — shelve → move → mark applied → per-run rollback via the `RunLog`
 - First-run model check: scan/migrate surface `cargo xtask download-models` (or a manual placement hint) when the embedding bundle is missing, without linking an HTTP client
 - `tidyup-ui`: Dioxus 0.7 desktop binary (`cargo run -p tidyup-ui --bin tidyup-desktop`) with Dashboard / Review / Runs / Settings pages, signal-backed `ProgressReporter` and oneshot-channel `ReviewHandler`. Same `ServiceContext` construction, extractors, and embedding model as the CLI — the only difference is the frontend port impls. Styled per `DESIGN.md` ("The Verdant Archive")
@@ -168,6 +175,7 @@ tidyup is being built in phases. Each phase lands an independently compilable sl
 - Migration-mode multimodal. Phase 7 wires SigLIP/CLAP into scan mode; migration mode still classifies images/audio against text-embedded folder profiles, which is a weaker signal until folder profiles also gain image/audio centroids.
 - Video keyframe encoder. Video files still classify via Tier 1 only — pure-Rust frame-extraction is gated on the `ffmpeg-next` FFI vs metadata-only decision.
 - Calibrated confidence. v0.1 confidence is raw weighted-cosine; calibration is a v0.2 story.
+- UI Tier 3 toggle. The CLI exposes `--llm-fallback` / `--remote`; the desktop UI has no per-invocation activation surface yet, so it stays on the default Tier 1 + Tier 2 path. A settings-page toggle is the natural next step.
 - Signed binaries, Homebrew/winget packaging.
 
 The invariants the finished tool will uphold — human-in-the-loop review, reversible moves, bundle atomicity, no-network-by-default, extractive-only renames — are now enforced at the code path, not just the design.

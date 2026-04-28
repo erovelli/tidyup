@@ -166,7 +166,7 @@ fn make_ctx_with_shelf(shelf: Option<std::path::PathBuf>) -> (Arc<ServiceContext
         change_log: Arc::new(store.clone()),
         backup_store: Arc::new(store.clone()),
         run_log: Arc::new(store.clone()),
-        text: Arc::new(StubText),
+        text: Some(Arc::new(StubText) as Arc<dyn TextBackend>),
         embeddings: Arc::new(BucketEmbeddings),
         vision: None,
         image_embeddings: None,

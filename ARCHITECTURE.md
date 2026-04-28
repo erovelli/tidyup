@@ -44,27 +44,33 @@ Consequence: adding a new frontend (web, TUI, MCP server) means implementing two
 
 ## Model interchange
 
-Inference backends register by capability at runtime. Users **select** among available backends via `tidyup-app::config::InferenceConfig.backends` — an ordered list of backend IDs (`"mistralrs"`, `"remote-openai"`, `"ollama"`) — no rebuild needed to switch between backends that are compiled in.
+Inference backends fit through the same port traits — `TextBackend`, `VisionBackend`, `EmbeddingBackend`, and the cross-modal `ImageEmbeddingBackend` / `AudioEmbeddingBackend` from Phase 7. The pipeline consumes them as trait objects and never names a concrete backend.
 
-New backends are added by (a) creating a new `tidyup-inference-*` crate that implements `TextBackend` / `VisionBackend` / `EmbeddingBackend` (or the cross-modal `ImageEmbeddingBackend` / `AudioEmbeddingBackend` from Phase 7), and (b) registering it in the registry on startup. No changes to `pipeline/` or `app/` required.
+**Backend activation today (CLI).** The CLI exposes a one-of-N choice for the optional Tier 3 `TextBackend` via mutually-exclusive flags `--llm-fallback` and `--remote` (with env-var equivalents `TIDYUP_LLM_FALLBACK=1` / `TIDYUP_REMOTE=1`). The chosen flag, the matching cargo feature, and the matching config section together gate which `TextBackend` the context builder constructs. `ServiceContext.text` is `Option<Arc<dyn TextBackend>>`; `None` is the privacy-preserving default and means Tier 3 is off. The desktop UI binary has no per-invocation activation surface yet — it always builds a context with `text: None`.
 
-**Inclusion is separate from selection.** Whether a backend is *compiled into the binary at all* is governed by cargo features. Network-capable backends (`tidyup-inference-remote`) are gated behind `--features remote`; LLM backends (`tidyup-inference-mistralrs`) are gated behind `--features llm-fallback`. **Both are excluded from the default binary** — the default classifier is `bge-small-en-v1.5` via `tidyup-embeddings-ort`, which is always compiled in. See [Privacy model](#privacy-model).
+**The future shape.** `tidyup-app::config::InferenceConfig.backends` is an ordered list of backend IDs (`"mistralrs"`, `"remote-openai"`, `"ollama"`) reserved for a runtime registry that picks among multiple compiled-in backends without a rebuild. The registry isn't wired yet — the field is read by `serde` for forward-compat but unused by the context builder, which currently just consults `llm_fallback` / `remote` directly. Adding a backend today still means: implement the port trait, gate the crate behind a cargo feature symmetric with the existing `llm-fallback` / `remote` features, and extend the activation enum in `tidyup-cli/src/context.rs::InferenceActivation`. Pipeline and app stay untouched.
+
+**Inclusion is separate from activation.** Whether a backend is *compiled into the binary at all* is governed by cargo features. Network-capable backends (`tidyup-inference-remote`) are gated behind `--features remote`; LLM backends (`tidyup-inference-mistralrs`) are gated behind `--features llm-fallback`. **Both are excluded from the default binary** — the default classifier is `bge-small-en-v1.5` via `tidyup-embeddings-ort`, which is always compiled in. See [Privacy model](#privacy-model).
 
 **Cross-modal Tier 2 (Phase 7).** Image and audio classification use SigLIP and CLAP via the `siglip` and `clap` modules of `tidyup-embeddings-ort` — same crate as the default text encoder, no separate feature gate. Each backend is held as `Option<Arc<dyn …>>` on `ServiceContext` and loaded only when the corresponding ONNX bundle is present in the platform model cache. Per-modality latent spaces are isolated: each backend's vectors are not comparable to other backends' vectors, and the pipeline keeps each modality's `ScanCandidate` list separate so a cross-space cosine is structurally impossible.
+
+**Tier 3 LLM fallback wiring.** The pipeline's `run_scan` and `run_migration` accept `Option<&dyn TextBackend>`. When supplied and the Tier 2 verdict's `needs_review` is true, the LLM classifies the content and the resulting `summary + category + tags` is re-embedded and re-ranked against the same candidate list (scan-mode `ScanCandidate[]` or migration-mode `FolderProfile[]`). The LLM-reranked top is adopted only if it scores higher than Tier 2's. The LLM's `suggested_name` is deliberately ignored — renames remain extractive (see [Rename policy](#rename-policy)).
 
 ## Privacy model
 
 tidyup's default binary is both **network-silent and LLM-silent** for inference. This is an architectural guarantee, not a runtime toggle.
 
 - The default `cargo build -p tidyup-cli` produces a binary with **no HTTP client** (`reqwest` / `hyper` / `rustls` are not linked) AND **no LLM inference** (`mistralrs` / `candle` / `hf-hub` / heavy tokenizer tree are not linked). Classification on the default path is deterministic embedding similarity only (Tier 1 heuristics + Tier 2 `bge-small-en-v1.5` via `ort`). See `CLASSIFICATION.md`.
-- Two symmetric opt-in inference features exist, each behind the same two-gate pattern:
+- Two symmetric opt-in inference features exist, each behind the same **three-gate pattern**:
 
-  **`tidyup-inference-remote`** — optional workspace member, gated by `--features remote`. Compiling without the feature removes the crate from the dependency graph entirely. Runtime activation additionally requires `[inference] backends = ["remote-..."]` in the config TOML plus a `--remote` flag or env var per invocation.
+  **`tidyup-inference-remote`** — optional workspace member, gated by `--features remote`. Compiling without the feature removes the crate from the dependency graph entirely. Runtime activation additionally requires (b) an `[inference.remote]` section in the config TOML and (c) a per-invocation flag `--remote` (or `TIDYUP_REMOTE=1`).
 
-  **`tidyup-inference-mistralrs`** — optional workspace member, gated by `--features llm-fallback`. Compiling without the feature removes the crate from the dependency graph entirely. Runtime activation additionally requires `[inference] llm_fallback = true` in config plus a `--llm-fallback` flag or env var per invocation.
+  **`tidyup-inference-mistralrs`** — optional workspace member, gated by `--features llm-fallback`. Compiling without the feature removes the crate from the dependency graph entirely. Runtime activation additionally requires (b) `[inference] llm_fallback = true` in config and (c) a per-invocation flag `--llm-fallback` (or `TIDYUP_LLM_FALLBACK=1`).
 
+- The CLI rejects activation when the matching cargo feature wasn't compiled in (with a rebuild hint). The two activation flags are mutually exclusive — only one Tier 3 backend may be active per invocation.
+- `ServiceContext.text` is `Option<Arc<dyn TextBackend>>`. `None` is the privacy-preserving default; the pipeline calls Tier 3 only when both `Some(backend)` is present and `config.enable_llm_fallback` is true. There is **no** `NullTextBackend` stand-in — absence is the signal, not a no-op trait object that the pipeline could mistake for a real backend.
 - Both features are positioned as power-user escape hatches. First-run UX and default docs never recommend either; the tool is designed to be excellent offline with embedding-based classification.
-- `cargo-deny` enforces the guarantee on both axes: `reqwest` and transitive network deps banned outside the `remote` feature flag; `mistralrs` / `candle` / `hf-hub` banned outside the `llm-fallback` feature flag.
+- `cargo-deny` enforces the guarantee on both axes: `reqwest` and transitive network deps banned outside the `remote` feature flag; `mistralrs` / `candle` / `hf-hub` banned outside the `llm-fallback` feature flag. `cargo xtask check-privacy` re-checks the default `tidyup-cli` dep graph in CI.
 
 This is the single most load-bearing decision in the project. Every other architectural choice (embedding-default classification, local-only models, first-run model download, SQLite-only storage, extractive-only renames) flows from it.
 
@@ -132,8 +138,8 @@ Content-addressed dedup is a first-class concern: `FileIndex` is keyed by `Conte
 | `tidyup-pipeline` | Classification logic — heavy enough to deserve isolation | yes |
 | `tidyup-extract` | Per-format deps are heavyweight (pdf, excel, image, audio) | yes |
 | `tidyup-storage-sqlite` | Default impl; future alternates want a peer slot | yes |
-| `tidyup-inference-mistralrs` | Local LLM — pure-Rust via candle; optional Tier 3 fallback (cold-start + pathological extraction) | **no — `--features llm-fallback`** |
-| `tidyup-inference-remote` | HTTP backend; network-capable | **no — `--features remote`** |
+| `tidyup-inference-mistralrs` | Local LLM — pure-Rust via candle. Wired as Tier 3 LLM-rerank fallback in scan + migration pipelines. Power-user opt-in (cold-start + pathological extraction) | **no — `--features llm-fallback`** |
+| `tidyup-inference-remote` | HTTP backend; network-capable. Plugs into the same Tier 3 seam as the local LLM | **no — `--features remote`** |
 | `tidyup-embeddings-ort` | ONNX runtime; hosts `bge-small-en-v1.5` — the default Tier 2 classifier | yes |
 | `tidyup-cli` / `tidyup-ui` | Distinct binaries with different dep trees | yes |
 | `xtask` | Cross-platform workspace automation | n/a |

@@ -17,10 +17,7 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use tidyup_app::config::{resolve_data_dir, TidyupConfig};
 use tidyup_app::ServiceContext;
-use tidyup_core::inference::{
-    AudioEmbeddingBackend, ContentClassification, GenerationOptions, ImageEmbeddingBackend,
-    TextBackend,
-};
+use tidyup_core::inference::{AudioEmbeddingBackend, ImageEmbeddingBackend};
 use tidyup_embeddings_ort::{
     installation_instructions, verify_clap_model, verify_default_model, verify_siglip_model,
     ClapEmbeddings, OrtEmbeddings, SigLipEmbeddings,
@@ -71,7 +68,10 @@ pub(crate) async fn build(
         change_log: Arc::new(store.clone()),
         backup_store: Arc::new(store.clone()),
         run_log: Arc::new(store),
-        text: Arc::new(NullTextBackend),
+        // The UI has no Tier 3 activation surface yet — keeping `text: None`
+        // upholds the privacy model (no per-invocation gate => no Tier 3).
+        // A settings-page toggle is the natural next step.
+        text: None,
         embeddings,
         vision: None,
         image_embeddings,
@@ -214,8 +214,9 @@ pub(crate) async fn build_audio_scan_candidates(
 }
 
 // ---------------------------------------------------------------------------
-// Null backends. The default embedding-only path in v0.1 doesn't need a text
-// backend; keep a stand-in until the Phase 6+ registry lands.
+// Null embedding backend — only used when the model bundle is missing on the
+// rollback / runs-listing path. The text backend port is `Option`, so no null
+// stand-in is needed there.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Default)]
@@ -231,53 +232,6 @@ impl tidyup_core::inference::EmbeddingBackend for NullEmbeddings {
     }
     fn dimensions(&self) -> usize {
         0
-    }
-    fn model_id(&self) -> &'static str {
-        "null"
-    }
-}
-
-#[derive(Debug)]
-struct NullTextBackend;
-
-#[async_trait]
-impl TextBackend for NullTextBackend {
-    async fn classify_text(
-        &self,
-        _text: &str,
-        _filename: &str,
-    ) -> tidyup_core::Result<ContentClassification> {
-        Err(anyhow!(
-            "text backend not enabled (default build has no LLM)"
-        ))
-    }
-    async fn classify_audio(
-        &self,
-        _filename: &str,
-        _metadata: &str,
-    ) -> tidyup_core::Result<ContentClassification> {
-        Err(anyhow!("text backend not enabled"))
-    }
-    async fn classify_video(
-        &self,
-        _filename: &str,
-        _frame_captions: &[String],
-    ) -> tidyup_core::Result<ContentClassification> {
-        Err(anyhow!("text backend not enabled"))
-    }
-    async fn classify_image_description(
-        &self,
-        _filename: &str,
-        _description: &str,
-    ) -> tidyup_core::Result<ContentClassification> {
-        Err(anyhow!("text backend not enabled"))
-    }
-    async fn complete(
-        &self,
-        _prompt: &str,
-        _opts: &GenerationOptions,
-    ) -> tidyup_core::Result<String> {
-        Err(anyhow!("text backend not enabled"))
     }
     fn model_id(&self) -> &'static str {
         "null"

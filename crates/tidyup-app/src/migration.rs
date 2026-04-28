@@ -120,10 +120,12 @@ impl MigrationService {
             .phase_finished(tidyup_domain::Phase::ProfilingTarget)
             .await;
 
+        let text_backend = self.ctx.text.as_deref();
         let outcome = run_migration(
             &request.source,
             &profile_cache,
             self.ctx.embeddings.as_ref(),
+            text_backend,
             &self.ctx.extractors,
             &tidyup_domain::ClassifierConfig::default(),
             progress,

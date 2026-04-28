@@ -12,40 +12,60 @@
 //! (`--llm-fallback` / `--remote` or the matching env vars). See
 //! `CLAUDE.md` → "Privacy model".
 //!
-//! Phase 5 ships without backend selection wiring — the default embedding-only
-//! path is the only one exercised. A no-op `TextBackend` stands in for the
-//! port; the pipeline doesn't need a text backend on the default cascade.
+//! [`InferenceActivation`] captures the per-invocation gate. The CLI parses
+//! flags + env vars and builds it before calling [`build`]. With the default
+//! activation (`llm_fallback: false`, `remote: false`) the context's
+//! [`text`](tidyup_app::ServiceContext::text) field is `None` and Tier 3 is
+//! never invoked — same shape as the default build with neither feature
+//! compiled in.
 
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use async_trait::async_trait;
 use tidyup_app::config::{resolve_data_dir, TidyupConfig};
 use tidyup_app::ServiceContext;
-use tidyup_core::inference::{
-    AudioEmbeddingBackend, ContentClassification, GenerationOptions, ImageEmbeddingBackend,
-    TextBackend,
-};
+use tidyup_core::inference::{AudioEmbeddingBackend, ImageEmbeddingBackend, TextBackend};
 use tidyup_embeddings_ort::{
     installation_instructions, verify_clap_model, verify_default_model, verify_siglip_model,
     ClapEmbeddings, OrtEmbeddings, SigLipEmbeddings,
 };
 use tidyup_storage_sqlite::SqliteStore;
 
-/// Top-level build: given a parsed config, produce a ready-to-use
-/// [`ServiceContext`] with the default storage + embedding backend and the
-/// default content extractors.
+/// Per-invocation inference activation gate.
+///
+/// Constructed in `commands::dispatch` from CLI flags + environment + config.
+/// Only the cargo features compiled in can produce `true` values; with no
+/// features the struct is always all-false and the loader treats the
+/// activation as a no-op (Tier 3 stays off).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct InferenceActivation {
+    /// Triple-gated activation for the local LLM fallback (mistralrs).
+    pub llm_fallback: bool,
+    /// Triple-gated activation for the remote text backend.
+    pub remote: bool,
+}
+
+/// Top-level build: given a parsed config + activation gate, produce a
+/// ready-to-use [`ServiceContext`].
 ///
 /// `strict_model` controls the first-run behaviour: when `true` (the default
 /// for migrate/scan), a missing or corrupt model bundle is a hard error with
 /// user-facing installation instructions. Rollback may pass `false` since it
 /// does not invoke the classifier.
 ///
+/// `activation` carries the triple-gated per-invocation flags. When both
+/// fields are `false` (the default), the [`ServiceContext::text`] field is
+/// `None` and Tier 3 is never invoked — same shape as the default build with
+/// neither LLM nor remote features compiled in. When activation requests a
+/// backend the corresponding feature wasn't compiled in, the loader fails
+/// fast with a rebuild hint.
+///
 /// # Errors
 /// Propagates model-verification, database-open, and embedding-load errors.
 pub(crate) async fn build(
     config: &TidyupConfig,
     strict_model: bool,
+    activation: InferenceActivation,
 ) -> Result<Arc<ServiceContext>> {
     let data_dir = resolve_data_dir(&config.storage)?;
     std::fs::create_dir_all(&data_dir)
@@ -59,14 +79,13 @@ pub(crate) async fn build(
         .with_context(|| format!("opening sqlite at {}", db_path.display()))?
         .with_backup_root(shelf);
 
-    let embeddings = if strict_model {
+    let embeddings: Arc<dyn tidyup_core::inference::EmbeddingBackend> = if strict_model {
         verify_and_load_default_embeddings().await?
     } else {
         // Rollback doesn't classify — a degraded fallback is fine.
-        match verify_and_load_default_embeddings().await {
-            Ok(e) => e,
-            Err(_) => Arc::new(NullEmbeddings),
-        }
+        verify_and_load_default_embeddings()
+            .await
+            .unwrap_or_else(|_| Arc::new(NullEmbeddings))
     };
 
     // Phase 7: optional image/audio backends. Each is loaded only if its
@@ -76,6 +95,10 @@ pub(crate) async fn build(
     let image_embeddings = try_load_siglip();
     let audio_embeddings = try_load_clap();
 
+    // Tier 3 text backend. Loaded sequentially after the embedding model per
+    // operational rule in CLAUDE.md (concurrent model loads OOM on 8GB hosts).
+    let text = build_text_backend(config, activation).await?;
+
     let extractors = default_extractors();
 
     Ok(Arc::new(ServiceContext {
@@ -83,13 +106,91 @@ pub(crate) async fn build(
         change_log: Arc::new(store.clone()),
         backup_store: Arc::new(store.clone()),
         run_log: Arc::new(store),
-        text: Arc::new(NullTextBackend),
+        text,
         embeddings,
         vision: None,
         image_embeddings,
         audio_embeddings,
         extractors,
     }))
+}
+
+/// Build the optional Tier 3 [`TextBackend`] from the per-invocation
+/// activation + config.
+///
+/// Precedence: `--remote` wins over `--llm-fallback` if both fire (a remote
+/// endpoint is more likely to be the intentional choice when configured —
+/// it's not the default for any path). Returns `Ok(None)` for the
+/// privacy-preserving case where neither activation gate fires.
+async fn build_text_backend(
+    config: &TidyupConfig,
+    activation: InferenceActivation,
+) -> Result<Option<Arc<dyn TextBackend>>> {
+    if activation.remote {
+        return build_remote_backend(config).map(Some);
+    }
+    if activation.llm_fallback {
+        return build_llm_backend(config).await.map(Some);
+    }
+    Ok(None)
+}
+
+#[cfg(feature = "llm-fallback")]
+async fn build_llm_backend(config: &TidyupConfig) -> Result<Arc<dyn TextBackend>> {
+    if !config.inference.llm_fallback {
+        return Err(anyhow!(
+            "--llm-fallback flag set but [inference] llm_fallback is false in config; \
+             the privacy model requires both to enable Tier 3 LLM fallback"
+        ));
+    }
+    let model_id = "Qwen/Qwen3-0.6B";
+    tracing::info!(model_id, "loading mistralrs text backend (Tier 3)");
+    let engine = tidyup_inference_mistralrs::MistralRsEngine::load(model_id)
+        .await
+        .context("loading mistralrs Tier 3 backend")?;
+    Ok(engine as Arc<dyn TextBackend>)
+}
+
+#[cfg(not(feature = "llm-fallback"))]
+#[allow(clippy::unused_async)] // signature mirrors the feature-on variant
+async fn build_llm_backend(_config: &TidyupConfig) -> Result<Arc<dyn TextBackend>> {
+    Err(anyhow!(
+        "--llm-fallback was passed but this binary was built without the `llm-fallback` feature.\n\
+         Rebuild with: cargo build --release -p tidyup-cli --features llm-fallback"
+    ))
+}
+
+#[cfg(feature = "remote")]
+fn build_remote_backend(config: &TidyupConfig) -> Result<Arc<dyn TextBackend>> {
+    use tidyup_inference_remote::{RemoteEndpoint, RemoteText};
+    let remote_cfg = config.inference.remote.as_ref().ok_or_else(|| {
+        anyhow!(
+            "--remote flag set but [inference.remote] is missing from config. \
+             Add an `[inference.remote]` section with `endpoint`, `api_key_env`, and `model`."
+        )
+    })?;
+    let api_key = std::env::var(&remote_cfg.api_key_env).map_err(|_| {
+        anyhow!(
+            "remote backend requires the API key env var `{}` to be set",
+            remote_cfg.api_key_env
+        )
+    })?;
+    let endpoint = RemoteEndpoint::OpenAi {
+        url: remote_cfg.endpoint.clone(),
+        api_key,
+        model: remote_cfg.model.clone(),
+    };
+    tracing::info!(model = %remote_cfg.model, "loading remote text backend (Tier 3)");
+    let backend = RemoteText::new(endpoint).context("constructing remote text backend")?;
+    Ok(Arc::new(backend))
+}
+
+#[cfg(not(feature = "remote"))]
+fn build_remote_backend(_config: &TidyupConfig) -> Result<Arc<dyn TextBackend>> {
+    Err(anyhow!(
+        "--remote was passed but this binary was built without the `remote` feature.\n\
+         Rebuild with: cargo build --release -p tidyup-cli --features remote"
+    ))
 }
 
 /// Best-effort load of the `SigLIP` image encoder. Returns `None` when the
@@ -169,14 +270,15 @@ pub(crate) fn describe_data_dir(config: &TidyupConfig) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Minimal stand-in backends used by the default path. A proper registry lands
-// in Phase 6+; for v0.1 the classifier only consumes the embedding backend.
+// Null embedding backend — used only on the rollback path when the model
+// bundle is missing. The text backend port is `Option`, so no null stand-in
+// is needed there: absence is the privacy-preserving default.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Default)]
 struct NullEmbeddings;
 
-#[async_trait]
+#[async_trait::async_trait]
 impl tidyup_core::inference::EmbeddingBackend for NullEmbeddings {
     async fn embed_text(&self, _text: &str) -> tidyup_core::Result<Vec<f32>> {
         Err(anyhow!("embedding backend not loaded"))
@@ -186,53 +288,6 @@ impl tidyup_core::inference::EmbeddingBackend for NullEmbeddings {
     }
     fn dimensions(&self) -> usize {
         0
-    }
-    fn model_id(&self) -> &'static str {
-        "null"
-    }
-}
-
-#[derive(Debug)]
-struct NullTextBackend;
-
-#[async_trait]
-impl TextBackend for NullTextBackend {
-    async fn classify_text(
-        &self,
-        _text: &str,
-        _filename: &str,
-    ) -> tidyup_core::Result<ContentClassification> {
-        Err(anyhow!(
-            "text backend not enabled (default build has no LLM)"
-        ))
-    }
-    async fn classify_audio(
-        &self,
-        _filename: &str,
-        _metadata: &str,
-    ) -> tidyup_core::Result<ContentClassification> {
-        Err(anyhow!("text backend not enabled"))
-    }
-    async fn classify_video(
-        &self,
-        _filename: &str,
-        _frame_captions: &[String],
-    ) -> tidyup_core::Result<ContentClassification> {
-        Err(anyhow!("text backend not enabled"))
-    }
-    async fn classify_image_description(
-        &self,
-        _filename: &str,
-        _description: &str,
-    ) -> tidyup_core::Result<ContentClassification> {
-        Err(anyhow!("text backend not enabled"))
-    }
-    async fn complete(
-        &self,
-        _prompt: &str,
-        _opts: &GenerationOptions,
-    ) -> tidyup_core::Result<String> {
-        Err(anyhow!("text backend not enabled"))
     }
     fn model_id(&self) -> &'static str {
         "null"

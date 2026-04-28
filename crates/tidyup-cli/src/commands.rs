@@ -10,7 +10,7 @@ use tidyup_app::{
 
 use crate::context::{
     build, build_audio_scan_candidates, build_default_scan_candidates, build_image_scan_candidates,
-    describe_data_dir,
+    describe_data_dir, InferenceActivation,
 };
 use crate::reporter::CliReporter;
 use crate::review::{AutoApproveHandler, InteractiveHandler};
@@ -27,17 +27,26 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<()> {
     let cfg = config::load().context("loading tidyup config")?;
     let yes = cli.yes;
     let json = cli.json;
+    if cli.llm_fallback && cli.remote {
+        anyhow::bail!(
+            "--llm-fallback and --remote are mutually exclusive; pick one Tier 3 backend"
+        );
+    }
+    let activation = InferenceActivation {
+        llm_fallback: cli.llm_fallback,
+        remote: cli.remote,
+    };
     match cli.command {
         Command::Migrate {
             source,
             target,
             dry_run,
-        } => run_migrate(yes, json, &cfg, source, target, dry_run).await,
+        } => run_migrate(yes, json, activation, &cfg, source, target, dry_run).await,
         Command::Scan {
             root,
             taxonomy,
             dry_run,
-        } => run_scan(yes, json, &cfg, root, taxonomy, dry_run).await,
+        } => run_scan(yes, json, activation, &cfg, root, taxonomy, dry_run).await,
         Command::Rollback { run_id, list } => {
             if list {
                 run_list_runs(json, &cfg).await
@@ -51,15 +60,17 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<()> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_migrate(
     yes: bool,
     json: bool,
+    activation: InferenceActivation,
     cfg: &config::TidyupConfig,
     source: std::path::PathBuf,
     target: std::path::PathBuf,
     dry_run: bool,
 ) -> Result<()> {
-    let ctx = build(cfg, true).await?;
+    let ctx = build(cfg, true, activation).await?;
     let reporter = CliReporter::new(json);
     let reviewer = reviewer_for(yes);
 
@@ -97,15 +108,17 @@ async fn run_migrate(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_scan(
     yes: bool,
     json: bool,
+    activation: InferenceActivation,
     cfg: &config::TidyupConfig,
     root: std::path::PathBuf,
     taxonomy: Option<std::path::PathBuf>,
     dry_run: bool,
 ) -> Result<()> {
-    let ctx = build(cfg, true).await?;
+    let ctx = build(cfg, true, activation).await?;
     let reporter = CliReporter::new(json);
     let reviewer = reviewer_for(yes);
 
@@ -151,7 +164,8 @@ async fn run_scan(
 }
 
 async fn run_list_runs(json: bool, cfg: &config::TidyupConfig) -> Result<()> {
-    let ctx = build(cfg, false).await?;
+    // Rollback never invokes the classifier, so Tier 3 activation is irrelevant.
+    let ctx = build(cfg, false, InferenceActivation::default()).await?;
     let service = RollbackService::new(ctx);
     let runs = service.list_runs().await?;
 
@@ -198,7 +212,8 @@ async fn run_list_runs(json: bool, cfg: &config::TidyupConfig) -> Result<()> {
 }
 
 async fn run_rollback(json: bool, cfg: &config::TidyupConfig, run_id: uuid::Uuid) -> Result<()> {
-    let ctx = build(cfg, false).await?;
+    // Rollback never invokes the classifier, so Tier 3 activation is irrelevant.
+    let ctx = build(cfg, false, InferenceActivation::default()).await?;
     let reporter = CliReporter::new(json);
     let service = RollbackService::new(ctx);
     let report = service.rollback_run(run_id, &reporter).await?;
