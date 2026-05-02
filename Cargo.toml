@@ -120,7 +120,7 @@ console      = "0.16"
 # UI (tidyup-ui). Only the UI binary depends on dioxus — the default CLI build
 # does not, by design. The `check-privacy` xtask guarantees the default CLI
 # dep graph stays free of the network/LLM crates dioxus-desktop pulls in.
-dioxus       = { version = "0.7.5", features = ["desktop", "router"] }
+dioxus       = { version = "0.7.7", features = ["desktop", "router"] }
 # Native file/folder picker for the UI's path fields. Pure Rust wrappers over
 # NSOpenPanel (macOS), the XDG portal (Linux), and IFileDialog (Windows). No
 # network code path.
