@@ -25,12 +25,13 @@ Your files stay where they belong — with you.
 > `--features remote`) plus the matching config + flag activation, and
 > low-confidence Tier 2 verdicts get a second-opinion re-rank. Interactive
 > bundle review now works in the CLI — each detected bundle gets an atomic
-> approve/reject prompt instead of silently staying pending. That said:
-> confidence thresholds aren't calibrated against a real corpus, the desktop
-> UI has no bundle-review surface yet (bundles still show as "held") and no
-> per-invocation Tier 3 toggle, and migration mode still profiles target
-> folders in the bge-small text space (so image/audio routing in migrate is
-> weaker than in scan). Don't point tidyup at files you care about.
+> approve/reject prompt instead of silently staying pending. Migration mode
+> now also profiles target folders with cross-modal image/audio centroids
+> when the SigLIP/CLAP bundles are installed, so image and audio files route
+> on their own embeddings instead of folder-name text. That said: confidence
+> thresholds aren't calibrated against a real corpus, and the desktop UI has
+> no bundle-review surface yet (bundles still show as "held") and no
+> per-invocation Tier 3 toggle. Don't point tidyup at files you care about.
 >
 > Everything below describes the target design. Check the
 > [roadmap](#roadmap) for what actually works today.
@@ -169,12 +170,12 @@ tidyup is being built in phases. Each phase lands an independently compilable sl
 - `tidyup-app`: `ScanService`, `MigrationService`, and `RollbackService` driving the pipeline end-to-end — shelve → move → mark applied → per-run rollback via the `RunLog`. Bundles are decided through the `ReviewHandler::review_bundles` seam — `--yes` auto-applies above a confidence threshold, otherwise each bundle gets an atomic approve/reject — and move all-or-nothing.
 - First-run model check: scan/migrate surface `cargo xtask download-models` (or a manual placement hint) when the embedding bundle is missing, without linking an HTTP client
 - `tidyup-ui`: Dioxus 0.7 desktop binary (`cargo run -p tidyup-ui --bin tidyup-desktop`) with Dashboard / Review / Runs / Settings pages, signal-backed `ProgressReporter` and oneshot-channel `ReviewHandler`. Same `ServiceContext` construction, extractors, and embedding model as the CLI — the only difference is the frontend port impls. Styled per `DESIGN.md` ("The Verdant Archive")
-- **Phase 7 multimodal Tier 2 (optional, off-by-default)**: SigLIP-base for cross-modal image classification and CLAP-htsat-unfused for audio. Both are pure-Rust ONNX (no FFI beyond `ort`/`symphonia`/`image`) and load only when their model bundles exist on disk. Default install ships text-only — image and audio files fall back to Tier 1 heuristics when the multimodal bundles aren't installed. Fetch them with `cargo xtask download-models --multimodal`. Wired identically into both CLI and UI `ServiceContext`
+- **Phase 7 multimodal Tier 2 (optional, off-by-default)**: SigLIP-base for cross-modal image classification and CLAP-htsat-unfused for audio. Both are pure-Rust ONNX (no FFI beyond `ort`/`symphonia`/`image`) and load only when their model bundles exist on disk. Default install ships text-only — image and audio files fall back to Tier 1 heuristics when the multimodal bundles aren't installed. Fetch them with `cargo xtask download-models --multimodal`. Wired identically into both CLI and UI `ServiceContext`. **Both scan and migration use it**: scan ranks against per-modality taxonomies, migration ranks against per-folder image/audio centroids the profiler builds from a bounded sample of each target folder's images/audio (each in its own latent space — never cross-compared)
 
 **What does not yet work:**
 
 - Interactive bundle review in the **desktop UI**. The CLI now prompts to approve or reject each detected bundle atomically (or auto-applies above-threshold bundles under `--yes`); the Dioxus UI still only lists bundles as "held for review". The UI bundle-review surface lands in a follow-up.
-- Migration-mode multimodal. Phase 7 wires SigLIP/CLAP into scan mode; migration mode still classifies images/audio against text-embedded folder profiles, which is a weaker signal until folder profiles also gain image/audio centroids.
+- ~~Migration-mode multimodal.~~ **Now shipped:** when the SigLIP/CLAP bundles are installed, the migration profiler builds per-folder image/audio centroids and routes image/audio source files against them in their own latent space (falling back to the text path when a bundle holds no images/audio or the encoders aren't installed). Folder *content* centroids in the text space remain a v0.2 item.
 - Video keyframe encoder. Video files still classify via Tier 1 only — pure-Rust frame-extraction is gated on the `ffmpeg-next` FFI vs metadata-only decision.
 - Calibrated confidence. v0.1 confidence is raw weighted-cosine; calibration is a v0.2 story.
 - UI Tier 3 toggle. The CLI exposes `--llm-fallback` / `--remote`; the desktop UI has no per-invocation activation surface yet, so it stays on the default Tier 1 + Tier 2 path. A settings-page toggle is the natural next step.

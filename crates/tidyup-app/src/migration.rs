@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 use tidyup_core::frontend::Level;
 use tidyup_core::{ProgressReporter, Result, ReviewHandler};
 use tidyup_domain::{RunMode, RunRecord, RunState};
-use tidyup_pipeline::{migration::run_migration, profiler};
+use tidyup_pipeline::migration::{run_migration, MigrationMultimodal};
+use tidyup_pipeline::profiler::{self, MultimodalProfilers};
 use uuid::Uuid;
 
 use crate::executor::{
@@ -105,6 +106,7 @@ impl MigrationService {
         result
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn try_run(
         &self,
         request: &MigrationRequest,
@@ -116,8 +118,24 @@ impl MigrationService {
             .phase_started(tidyup_domain::Phase::ProfilingTarget, None)
             .await;
         let target_scan = profiler::scan_target(&request.target)?;
-        let profile_cache =
-            profiler::build_profile_cache(&target_scan, self.ctx.embeddings.as_ref()).await?;
+        // Optional cross-modal backends: when their bundles are loaded, target
+        // folders gain image/audio centroids and image/audio source files route
+        // against them. Absent (the default install) → text-only profiles, and
+        // image/audio fall through to the text Tier 2 path.
+        let multimodal = MigrationMultimodal {
+            image: self.ctx.image_embeddings.as_deref(),
+            audio: self.ctx.audio_embeddings.as_deref(),
+        };
+        let profilers = MultimodalProfilers {
+            image: multimodal.image,
+            audio: multimodal.audio,
+        };
+        let profile_cache = profiler::build_profile_cache_multimodal(
+            &target_scan,
+            self.ctx.embeddings.as_ref(),
+            profilers,
+        )
+        .await?;
         progress
             .phase_finished(tidyup_domain::Phase::ProfilingTarget)
             .await;
@@ -128,6 +146,7 @@ impl MigrationService {
             &profile_cache,
             self.ctx.embeddings.as_ref(),
             text_backend,
+            multimodal,
             &self.ctx.extractors,
             &tidyup_domain::ClassifierConfig::default(),
             progress,
