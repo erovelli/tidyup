@@ -11,8 +11,10 @@
 //! 3. Review loose proposals via the supplied [`ReviewHandler`].
 //! 4. Apply approved loose proposals via the [`crate::executor`] (shelve → move →
 //!    mark applied).
-//! 5. Auto-apply bundles iff `--yes` + confidence threshold; otherwise leave them
-//!    pending with a message (bundle review UX is Phase 6+).
+//! 5. Decide bundles via [`crate::executor::select_bundle_decisions`]: under
+//!    `--yes`, auto-apply those clearing the confidence threshold; otherwise
+//!    defer to the [`ReviewHandler`]'s interactive per-bundle approve/reject.
+//!    Bundles move atomically or stay pending — never partially.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -27,7 +29,7 @@ use tidyup_pipeline::scan::{
 use uuid::Uuid;
 
 use crate::executor::{
-    apply_bundles, apply_loose_decisions, select_auto_applied_bundles, ApplyReport, ExecutorDeps,
+    apply_bundles, apply_loose_decisions, select_bundle_decisions, ApplyReport, ExecutorDeps,
 };
 use crate::ServiceContext;
 
@@ -41,9 +43,10 @@ pub struct ScanRequest {
     pub root: std::path::PathBuf,
     pub taxonomy_path: Option<std::path::PathBuf>,
     pub dry_run: bool,
-    /// When true, auto-apply bundles whose confidence clears
-    /// `bundle_min_confidence`. Required for bundles to apply in v0.1 (no
-    /// interactive bundle review yet). Set by the CLI only if `--yes` is passed.
+    /// When true (the `--yes` path), auto-apply bundles whose confidence clears
+    /// `bundle_min_confidence` without prompting. When false, bundles are
+    /// surfaced to the `ReviewHandler` for interactive per-bundle approval. Set
+    /// by the CLI only if `--yes` is passed.
     #[serde(default)]
     pub auto_approve_bundles: bool,
     /// Lower bound on confidence for auto-applied bundles.
@@ -231,21 +234,25 @@ impl ScanService {
             apply_loose_decisions(&outcome.proposals, &decisions, &deps, request.dry_run).await?
         };
 
-        let auto_apply_ids = select_auto_applied_bundles(
+        let auto_apply_ids = select_bundle_decisions(
             &outcome.bundles,
             request.auto_approve_bundles,
             request.bundle_min_confidence,
-        );
+            review,
+        )
+        .await?;
         if !outcome.bundles.is_empty() && auto_apply_ids.is_empty() {
-            progress
-                .message(
-                    Level::Info,
-                    &format!(
-                        "{} bundle(s) held for review; run with --yes to auto-apply those above {:.2} confidence",
-                        outcome.bundles.len(),
-                        request.bundle_min_confidence,
-                    ),
+            let held = outcome.bundles.len();
+            let detail = if request.auto_approve_bundles {
+                format!(
+                    "none cleared the {:.2} auto-apply threshold",
+                    request.bundle_min_confidence
                 )
+            } else {
+                "none approved in review".to_string()
+            };
+            progress
+                .message(Level::Info, &format!("{held} bundle(s) held; {detail}"))
                 .await;
         }
         let bundle_report =

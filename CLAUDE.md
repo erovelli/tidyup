@@ -126,6 +126,8 @@ Files are not always independent. A coding project, photo burst, or music album 
 
 **Domain shape.** Bundles are a first-class aggregate: `BundleProposal { root, kind, members: Vec<ChangeProposal>, target_parent, confidence, status }`. Individual member proposals are never approved, applied, or rolled back independently. Member proposals cannot carry rename suggestions. The SQL schema: a `bundles` table plus a `bundle_id` foreign key on `change_proposals`.
 
+**Bundle review is per-bundle, never per-member.** `ReviewHandler::review_bundles` returns the ids of approved *bundles* (not `ReviewDecision`s and no `Override` — members carry their own paths). The default impl approves nothing, so a frontend without a bundle surface holds every bundle. `--yes` skips the handler and applies the confidence threshold directly. Don't add a per-member bundle decision path.
+
 **Do not** introduce partial-bundle apply paths, per-member rollback, or any code that allows some members to move while others don't. This invariant has no exceptions.
 
 ## Rename policy
@@ -145,7 +147,7 @@ Both produce `ChangeProposal`s and `BundleProposal`s that flow through the same 
 
 1. **Scan mode** (`tidyup-pipeline::scan`) — classify against a fixed taxonomy with a 3-tier cascade: Tier 1 heuristics (~1ms) → Tier 2 embeddings (~50ms, `bge-small-en-v1.5`) → **optional** Tier 3 LLM fallback (1–10s, only when `--features llm-fallback` is compiled and enabled at runtime). Each tier short-circuits above its confidence threshold. On default builds Tier 3 is absent entirely and low-confidence files surface directly to review.
 
-2. **Migration mode** (`tidyup-pipeline::migration`) — classify against an *existing* target hierarchy. Same tier cascade: heuristic+date routing, then batch embeddings against pre-built `FolderProfile`s, with optional Tier 3 LLM fallback under the same feature gate. Review is the primary safety net for low-confidence cases; `--llm-fallback` is the remedy for cold-start (empty target hierarchy) and pathological-extraction workflows.
+2. **Migration mode** (`tidyup-pipeline::migration`) — classify against an *existing* target hierarchy. Same tier cascade: heuristic+date routing, then batch embeddings against pre-built `FolderProfile`s, with optional Tier 3 LLM fallback under the same feature gate. The profiler builds each folder's text `content_centroid` from its documents; when the SigLIP/CLAP bundles are present it also builds `image_centroid`/`audio_centroid`s, and source files route against the centroid in their own latent space. Review is the primary safety net for low-confidence cases; `--llm-fallback` is the remedy for cold-start (empty target hierarchy) and pathological-extraction workflows.
 
 **Hash-based dedup** is a first-class pipeline concept, not an optimization. `FileIndex` is keyed by `ContentHash`; classification happens once per unique content hash and applies to every path sharing it. Real-world dedup on a home directory is 15–30% — worth enforcing in the schema, not bolting on later.
 
@@ -209,10 +211,15 @@ beyond the text Tier 2 rules:
 
 - **Latent-space isolation.** `EmbeddingBackend`, `ImageEmbeddingBackend`,
   and `AudioEmbeddingBackend` produce vectors in disjoint latent spaces.
-  Never cosine-compare across them. The pipeline keeps each modality's
-  candidate list (`MultimodalContext.image.candidates`, `…audio.candidates`)
-  separate from the text candidates so a misconfigured caller can't compute
-  a cross-space cosine.
+  Never cosine-compare across them. In scan mode the pipeline keeps each
+  modality's candidate list (`MultimodalContext.image.candidates`,
+  `…audio.candidates`) separate from the text candidates. In migration mode
+  the same rule applies to folder profiles: `FolderProfile` carries separate
+  `image_centroid` (SigLIP space) and `audio_centroid` (CLAP space) alongside
+  the text `name_embedding` / `content_centroid`, and an image source file is
+  only ever ranked against `image_centroid`, audio only against
+  `audio_centroid`. A modality with no matching centroid falls through to the
+  text path — never a cross-space cosine.
 - **Optional inclusion, automatic detection.** SigLIP and CLAP backends live
   inside `tidyup-embeddings-ort` (no separate crate or feature gate — both
   are pure-Rust ONNX with disjoint preprocessing). They are loaded only when

@@ -84,16 +84,45 @@ pub struct ScanDiff {
 // ---------------------------------------------------------------------------
 
 /// Semantic profile for a target folder.
+///
+/// # Latent-space isolation
+///
+/// The three centroid-style fields live in **disjoint** latent spaces and must
+/// never be cosine-compared against each other:
+/// - [`name_embedding`](Self::name_embedding) and
+///   [`content_centroid`](Self::content_centroid) — text space (`bge-small`).
+/// - [`image_centroid`](Self::image_centroid) — cross-modal image space
+///   (`SigLIP`); compare only against `SigLIP` image embeddings.
+/// - [`audio_centroid`](Self::audio_centroid) — cross-modal audio space
+///   (`CLAP`); compare only against `CLAP` audio embeddings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FolderProfile {
     /// Absolute path to the folder.
     pub path: PathBuf,
-    /// Embedding of synthesized natural-language description.
+    /// Embedding of synthesized natural-language description (text space).
     pub name_embedding: Vec<f32>,
-    /// Mean embedding of sampled file contents within this folder.
+    /// Mean text embedding of sampled document bodies within this folder (text
+    /// space, same backend as `name_embedding`). `None` when the folder holds no
+    /// extractable text documents or the profiler was run without extractors.
     pub content_centroid: Option<Vec<f32>>,
     /// Number of files that contributed to the content centroid.
     pub centroid_sample_count: u32,
+    /// Mean `SigLIP` image embedding of sampled images directly in this folder.
+    /// `None` when no image backend was available at profile time or the folder
+    /// holds no images. Compare only against `SigLIP` image embeddings.
+    #[serde(default)]
+    pub image_centroid: Option<Vec<f32>>,
+    /// Number of images that contributed to [`image_centroid`](Self::image_centroid).
+    #[serde(default)]
+    pub image_centroid_sample_count: u32,
+    /// Mean `CLAP` audio embedding of sampled audio directly in this folder.
+    /// `None` when no audio backend was available at profile time or the folder
+    /// holds no audio. Compare only against `CLAP` audio embeddings.
+    #[serde(default)]
+    pub audio_centroid: Option<Vec<f32>>,
+    /// Number of audio files that contributed to [`audio_centroid`](Self::audio_centroid).
+    #[serde(default)]
+    pub audio_centroid_sample_count: u32,
     /// Structural metadata.
     pub metadata: FolderMetadata,
     /// Detected organizational dimension.

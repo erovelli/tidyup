@@ -11,9 +11,11 @@
 //! # Composite score
 //!
 //! Per [`ScoreWeights`] (defaults `0.25 name + 0.55 centroid + 0.10 metadata +
-//! 0.10 hierarchy`). When a folder's `content_centroid` is `None` (the v0.1
-//! default), the centroid weight is redistributed to `name` so the composite
-//! stays in `[0, 1]`.
+//! 0.10 hierarchy`). The profiler populates `content_centroid` from each target
+//! folder's documents when extractors are supplied; when a folder has no text
+//! documents (or extractors weren't supplied) its `content_centroid` is `None`
+//! and the centroid weight is redistributed to `name` so the composite stays in
+//! `[0, 1]`.
 //!
 //! # Tier 3
 //!
@@ -33,7 +35,9 @@ use anyhow::Result;
 use chrono::Utc;
 use tidyup_core::extractor::ContentExtractor;
 use tidyup_core::frontend::{Level, ProgressItem, ProgressReporter};
-use tidyup_core::inference::{EmbeddingBackend, TextBackend};
+use tidyup_core::inference::{
+    AudioEmbeddingBackend, EmbeddingBackend, FileModality, ImageEmbeddingBackend, TextBackend,
+};
 use tidyup_domain::change::{ChangeProposal, ChangeStatus, ChangeType};
 use tidyup_domain::migration::{
     Candidate, ClassificationResult, ScoreBreakdown, ScoreWeights, Tier,
@@ -47,6 +51,24 @@ use crate::heuristics::{self, HeuristicMatch};
 use crate::naming::{propose_rename, RenameProposal};
 use crate::scanner::{self, DetectedBundle};
 use crate::yake;
+
+/// Optional cross-modal backends for routing image/audio source files.
+///
+/// Both `None` on the default install — image and audio files then fall through
+/// to the text Tier 2 path (today's behaviour). When present, image source
+/// files route against folder image centroids and audio against audio centroids.
+///
+/// Latent-space isolation: the image backend is only ever used to embed image
+/// source files for comparison against [`FolderProfile::image_centroid`], and
+/// audio likewise against [`FolderProfile::audio_centroid`]. There is no path
+/// that compares one modality's embedding against another's centroid or against
+/// the text `name_embedding`.
+#[derive(Default, Clone, Copy)]
+#[allow(missing_debug_implementations)] // trait objects don't implement Debug
+pub struct MigrationMultimodal<'a> {
+    pub image: Option<&'a dyn ImageEmbeddingBackend>,
+    pub audio: Option<&'a dyn AudioEmbeddingBackend>,
+}
 
 /// Output of one migration pass.
 #[derive(Debug, Clone)]
@@ -70,6 +92,11 @@ pub struct MigrationOutcome {
 /// chance to be re-ranked through an LLM-cleaned query against the same
 /// folder profiles.
 ///
+/// `multimodal` carries optional image/audio backends. When present, image and
+/// audio source files are routed against the folders' cross-modal centroids
+/// (`SigLIP` / `CLAP`) instead of the text path; when absent (the default
+/// install) those files fall through to the text Tier 2 cascade unchanged.
+///
 /// # Errors
 /// Propagates source-read and embedding-backend failures. Per-file
 /// extraction / classification failures are logged via `progress.message`
@@ -80,6 +107,7 @@ pub async fn run_migration(
     profiles: &ProfileCache,
     embeddings: &dyn EmbeddingBackend,
     text_backend: Option<&dyn TextBackend>,
+    multimodal: MigrationMultimodal<'_>,
     extractors: &[Arc<dyn ContentExtractor>],
     config: &ClassifierConfig,
     progress: &dyn ProgressReporter,
@@ -118,7 +146,17 @@ pub async fn run_migration(
         .await;
 
     for (idx, path) in tree.loose_files.iter().enumerate() {
-        match classify_file(path, profiles, embeddings, text_backend, extractors, config).await {
+        match classify_file(
+            path,
+            profiles,
+            embeddings,
+            text_backend,
+            multimodal,
+            extractors,
+            config,
+        )
+        .await
+        {
             Ok(Some(verdict)) => {
                 let proposal = build_proposal(path, &verdict);
                 outcome.proposals.push(proposal);
@@ -172,6 +210,7 @@ async fn classify_file(
     profiles: &ProfileCache,
     embeddings: &dyn EmbeddingBackend,
     text_backend: Option<&dyn TextBackend>,
+    multimodal: MigrationMultimodal<'_>,
     extractors: &[Arc<dyn ContentExtractor>],
     config: &ClassifierConfig,
 ) -> Result<Option<Verdict>> {
@@ -250,6 +289,23 @@ async fn classify_file(
                 }));
             }
         }
+    }
+
+    // Tier 2 (cross-modal) — image/audio files route against the folders'
+    // image/audio centroids when the matching backend is loaded. A miss
+    // (backend absent, no folder has a centroid, unreadable file) falls through
+    // to the text Tier 2 path below.
+    if let Some(verdict) = classify_modality_file(
+        path,
+        file_modality(path, effective_mime.as_deref()),
+        effective_mime.as_deref(),
+        multimodal,
+        profiles,
+        config,
+    )
+    .await
+    {
+        return Ok(Some(verdict));
     }
 
     // Tier 2 — composite scoring against all leaf profiles.
@@ -473,6 +529,166 @@ fn weak_heuristic(hit: &HeuristicMatch, folder: PathBuf, path: &Path) -> Verdict
         reasoning: format!("tier1 heuristic (below threshold): {}", hit.reason),
         classification_confidence: Some(hit.confidence),
         rename_mismatch_score: None,
+    }
+}
+
+/// Cross-modal Tier 2 for one file: if it's an image/audio file and the
+/// matching backend is loaded, embed it and rank against the folders' centroids
+/// in that modality's latent space. Returns `None` (fall through to text) when
+/// the modality has no backend, the file can't be read or embedded, or no
+/// folder carries a centroid in that space.
+async fn classify_modality_file(
+    path: &Path,
+    modality: FileModality,
+    mime: Option<&str>,
+    multimodal: MigrationMultimodal<'_>,
+    profiles: &ProfileCache,
+    config: &ClassifierConfig,
+) -> Option<Verdict> {
+    let mime_str = mime.unwrap_or("application/octet-stream");
+    let bytes = tokio::fs::read(path).await.ok()?;
+    match modality {
+        FileModality::Image => {
+            let backend = multimodal.image?;
+            let embedding = backend.embed_image(&bytes, mime_str).await.ok()?;
+            rank_centroids(
+                path,
+                &embedding,
+                profiles,
+                config,
+                |p| p.image_centroid.as_deref(),
+                "image",
+                backend.model_id(),
+            )
+        }
+        FileModality::Audio => {
+            let backend = multimodal.audio?;
+            let embedding = backend.embed_audio(&bytes, mime_str).await.ok()?;
+            rank_centroids(
+                path,
+                &embedding,
+                profiles,
+                config,
+                |p| p.audio_centroid.as_deref(),
+                "audio",
+                backend.model_id(),
+            )
+        }
+        _ => None,
+    }
+}
+
+/// Rank leaf folders that carry a centroid in `select`'s latent space by cosine
+/// against `embedding`, returning a [`Verdict`] for the best match.
+///
+/// `select` extracts the modality-appropriate centroid from a profile
+/// (`image_centroid` or `audio_centroid`) — `embedding` must come from the same
+/// backend, so the cosine is meaningful and never crosses latent spaces.
+/// Returns `None` when no leaf folder has a centroid in this space, so the
+/// caller falls through to the text Tier 2 path.
+///
+/// Bundle members and renames are irrelevant here: this is a loose-file
+/// placement, and image/audio renames stay on the (text) EXIF/metadata path
+/// exactly as in scan mode, so the verdict is always `RenameProposal::Keep`.
+fn rank_centroids(
+    path: &Path,
+    embedding: &[f32],
+    profiles: &ProfileCache,
+    config: &ClassifierConfig,
+    select: impl Fn(&FolderProfile) -> Option<&[f32]>,
+    modality_label: &str,
+    model_id: &str,
+) -> Option<Verdict> {
+    let mut ranked: Vec<(PathBuf, f32)> = Vec::new();
+    for folder in &profiles.last_scan.leaf_folders {
+        if let Some(profile) = profiles.profiles.get(folder) {
+            if let Some(centroid) = select(profile) {
+                let score = cosine(embedding, centroid).max(0.0);
+                ranked.push((folder.clone(), score));
+            }
+        }
+    }
+    if ranked.is_empty() {
+        return None;
+    }
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let (folder, score) = ranked[0].clone();
+    let gap = if ranked.len() >= 2 {
+        score - ranked[1].1
+    } else {
+        score
+    };
+    let needs_review = score < config.embedding_threshold || gap < config.ambiguity_gap;
+
+    let candidates: Vec<Candidate> = ranked
+        .iter()
+        .take(5)
+        .map(|(f, s)| Candidate {
+            folder: f.clone(),
+            score: *s,
+            score_breakdown: ScoreBreakdown {
+                name_similarity: 0.0,
+                centroid_similarity: Some(*s),
+                metadata_score: 0.0,
+                hierarchy_adjustment: 0.0,
+            },
+        })
+        .collect();
+
+    Some(Verdict {
+        result: ClassificationResult {
+            source_file: path.to_path_buf(),
+            candidates,
+            resolved_at: Tier::Embedding,
+            needs_review,
+            suggested_rename: None,
+        },
+        rename: RenameProposal::Keep,
+        destination_folder: folder,
+        confidence: score,
+        reasoning: format!(
+            "tier2 {modality_label}-centroid: cos={score:.3} gap={gap:.3} model={model_id}"
+        ),
+        classification_confidence: Some(score),
+        rename_mismatch_score: None,
+    })
+}
+
+/// Decide a file's modality from MIME + extension. Mirrors the scan pipeline's
+/// helper; kept local so migration mode doesn't depend on scan internals.
+fn file_modality(path: &Path, mime: Option<&str>) -> FileModality {
+    if let Some(m) = mime {
+        if m.starts_with("image/") {
+            return FileModality::Image;
+        }
+        if m.starts_with("audio/") {
+            return FileModality::Audio;
+        }
+        if m.starts_with("video/") {
+            return FileModality::Video;
+        }
+        if m.starts_with("text/") || m == "application/pdf" {
+            return FileModality::Text;
+        }
+    }
+    let Some(ext) = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(str::to_ascii_lowercase)
+    else {
+        return FileModality::Skip;
+    };
+    match ext.as_str() {
+        "jpg" | "jpeg" | "png" | "gif" | "bmp" | "tiff" | "tif" | "webp" | "ico" | "avif"
+        | "jxl" | "heic" | "heif" | "raw" | "cr2" | "cr3" | "nef" | "arw" | "orf" | "dng"
+        | "rw2" | "raf" => FileModality::Image,
+        "mp3" | "flac" | "m4a" | "wav" | "ogg" | "opus" | "aiff" | "aif" | "ape" | "wma"
+        | "alac" | "aac" | "mka" => FileModality::Audio,
+        "mp4" | "mov" | "mkv" | "avi" | "wmv" | "flv" | "webm" | "m4v" | "mpg" | "mpeg" => {
+            FileModality::Video
+        }
+        _ => FileModality::Text,
     }
 }
 
@@ -900,6 +1116,10 @@ mod tests {
             name_embedding: emb,
             content_centroid: None,
             centroid_sample_count: 0,
+            image_centroid: None,
+            image_centroid_sample_count: 0,
+            audio_centroid: None,
+            audio_centroid_sample_count: 0,
             metadata: make_node(path, "x", dominant).metadata,
             organization_type: OrganizationType::Semantic,
             profile_confidence: 0.9,
@@ -988,9 +1208,18 @@ mod tests {
             ..ClassifierConfig::default()
         };
 
-        let out = run_migration(src.path(), &profiles, &eb, None, &ex, &cfg, &NullProgress)
-            .await
-            .unwrap();
+        let out = run_migration(
+            src.path(),
+            &profiles,
+            &eb,
+            None,
+            MigrationMultimodal::default(),
+            &ex,
+            &cfg,
+            &NullProgress,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(out.proposals.len(), 1);
         let p = &out.proposals[0];
@@ -1023,6 +1252,7 @@ mod tests {
             &profiles,
             &eb,
             None,
+            MigrationMultimodal::default(),
             &ex,
             &ClassifierConfig::default(),
             &NullProgress,
@@ -1057,6 +1287,7 @@ mod tests {
             &profiles,
             &eb,
             None,
+            MigrationMultimodal::default(),
             &ex,
             &ClassifierConfig::default(),
             &NullProgress,
@@ -1104,6 +1335,7 @@ mod tests {
             &profiles,
             &eb,
             None,
+            MigrationMultimodal::default(),
             &ex,
             &ClassifierConfig::default(),
             &NullProgress,
@@ -1201,6 +1433,7 @@ mod tests {
             &profiles,
             &eb,
             Some(&llm),
+            MigrationMultimodal::default(),
             &ex,
             &cfg,
             &NullProgress,
@@ -1254,6 +1487,10 @@ mod tests {
             name_embedding: eb_emb,
             content_centroid: None,
             centroid_sample_count: 0,
+            image_centroid: None,
+            image_centroid_sample_count: 0,
+            audio_centroid: None,
+            audio_centroid_sample_count: 0,
             metadata: make_node(Path::new("/tgt/Code"), "Code", &[".rs"]).metadata,
             organization_type: OrganizationType::Semantic,
             profile_confidence: 1.0,
@@ -1290,5 +1527,208 @@ mod tests {
             "Photos/Bursts"
         );
         assert_eq!(default_bundle_taxonomy(&BundleKind::Generic), "Archives");
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 8 — migration-mode multimodal centroids
+    // -----------------------------------------------------------------------
+
+    /// Toy cross-modal image backend: embeds image bytes and text into the same
+    /// 4-bucket L2-normalized space, so a folder centroid built from sample
+    /// images is comparable to a source image's embedding. Deterministic on the
+    /// leading bytes, so "similar" fixtures land near each other.
+    struct BucketImageBackend;
+    #[async_trait]
+    impl ImageEmbeddingBackend for BucketImageBackend {
+        async fn embed_image(&self, bytes: &[u8], _mime: &str) -> Result<Vec<f32>> {
+            Ok(bucket4(bytes))
+        }
+        async fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
+            Ok(bucket4(text.as_bytes()))
+        }
+        async fn embed_texts(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|t| bucket4(t.as_bytes())).collect())
+        }
+        fn dimensions(&self) -> usize {
+            4
+        }
+        fn model_id(&self) -> &'static str {
+            "bucket-image"
+        }
+    }
+
+    fn bucket4(bytes: &[u8]) -> Vec<f32> {
+        let mut v = vec![0.0_f32; 4];
+        for (i, b) in bytes.iter().enumerate() {
+            v[i % 4] += f32::from(*b);
+        }
+        let n = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+        for x in &mut v {
+            *x /= n;
+        }
+        v
+    }
+
+    /// Two folders, one with an image centroid: an image source file matching
+    /// that folder's images routes there via the image-centroid path, and the
+    /// reasoning records it came from the cross-modal tier — not text.
+    #[tokio::test]
+    async fn image_source_routes_against_image_centroid() {
+        use crate::profiler::{build_profile_cache_multimodal, scan_target, MultimodalProfilers};
+
+        let tgt = TempDir::new().unwrap();
+        // Photos/ holds a couple of "images" (PNG bytes). Docs/ holds none.
+        let photos = tgt.path().join("Photos");
+        let docs = tgt.path().join("Docs");
+        fs::create_dir_all(&photos).unwrap();
+        fs::create_dir_all(&docs).unwrap();
+        let png = make_png_bytes();
+        fs::write(photos.join("a.png"), &png).unwrap();
+        fs::write(photos.join("b.png"), &png).unwrap();
+        fs::write(docs.join("note.txt"), b"just some prose here").unwrap();
+
+        let eb = BucketEmbeddings;
+        let img = BucketImageBackend;
+        let scan = scan_target(tgt.path()).unwrap();
+        let profiles = build_profile_cache_multimodal(
+            &scan,
+            &eb,
+            MultimodalProfilers {
+                image: Some(&img),
+                audio: None,
+                extractors: &[],
+            },
+        )
+        .await
+        .unwrap();
+
+        // Photos got an image centroid; Docs did not.
+        assert!(
+            profiles.profiles[&photos].image_centroid.is_some(),
+            "Photos should have an image centroid built from its 2 images",
+        );
+        assert_eq!(profiles.profiles[&photos].image_centroid_sample_count, 2);
+        assert!(
+            profiles.profiles[&docs].image_centroid.is_none(),
+            "Docs has no images → no image centroid",
+        );
+
+        // A source image identical to the Photos fixtures must route to Photos
+        // via the image-centroid tier. No extractors: a text extractor would
+        // advertise text/plain and short-circuit modality detection — we want
+        // the real PNG MIME (sniffed by `tidyup_extract::mime::detect`) to drive
+        // the image branch.
+        let src = TempDir::new().unwrap();
+        fs::write(src.path().join("vacation.png"), &png).unwrap();
+
+        let ex: Vec<Arc<dyn ContentExtractor>> = vec![];
+        let cfg = ClassifierConfig {
+            heuristic_threshold: 0.99, // force Tier 1 to miss
+            embedding_threshold: 0.0,
+            ambiguity_gap: 0.0,
+            ..ClassifierConfig::default()
+        };
+        let out = run_migration(
+            src.path(),
+            &profiles,
+            &eb,
+            None,
+            MigrationMultimodal {
+                image: Some(&img),
+                audio: None,
+            },
+            &ex,
+            &cfg,
+            &NullProgress,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.proposals.len(), 1);
+        let p = &out.proposals[0];
+        assert!(
+            p.reasoning.contains("tier2 image-centroid"),
+            "expected image-centroid routing, got: {}",
+            p.reasoning,
+        );
+        assert!(
+            p.proposed_path.starts_with(&photos),
+            "image should route to Photos, got {:?}",
+            p.proposed_path,
+        );
+        assert_eq!(out.classifications[0].resolved_at, Tier::Embedding);
+    }
+
+    /// With no folder carrying an image centroid (backend present at classify
+    /// time but profiles built without one), an image source file falls through
+    /// to the text Tier 2 path — it must never be force-placed by cross-comparing
+    /// the image embedding against a text `name_embedding`. Here the image has no
+    /// extractable text either, so the honest outcome is "unclassified": no
+    /// proposal is fabricated across latent spaces.
+    #[tokio::test]
+    async fn image_source_falls_through_when_no_centroid() {
+        let tgt = TempDir::new().unwrap();
+        let eb = BucketEmbeddings;
+        // Text-only profiles: no image centroids anywhere.
+        let profiles = sample_cache(tgt.path(), &eb).await;
+
+        let src = TempDir::new().unwrap();
+        fs::write(src.path().join("photo.png"), make_png_bytes()).unwrap();
+
+        let img = BucketImageBackend;
+        // No extractor → real PNG MIME drives modality routing, and there's no
+        // text to fall back on. Force Tier 1 to miss so the test exercises the
+        // modality fall-through, not heuristic image-extension routing.
+        let ex: Vec<Arc<dyn ContentExtractor>> = vec![];
+        let cfg = ClassifierConfig {
+            heuristic_threshold: 1.01, // unreachable → Tier 1 never resolves
+            embedding_threshold: 0.0,
+            ambiguity_gap: 0.0,
+            ..ClassifierConfig::default()
+        };
+        let out = run_migration(
+            src.path(),
+            &profiles,
+            &eb,
+            None,
+            MigrationMultimodal {
+                image: Some(&img),
+                audio: None,
+            },
+            &ex,
+            &cfg,
+            &NullProgress,
+        )
+        .await
+        .unwrap();
+
+        // No image centroid to match → the image-centroid branch returns None
+        // and the file falls through to the text path. Crucially it is NOT
+        // placed via the image tier: the only signal left is the filename
+        // heuristic (a text-space, name-based fallback), never a cross-space
+        // cosine of the image embedding against a text `name_embedding`.
+        assert_eq!(out.proposals.len(), 1);
+        let p = &out.proposals[0];
+        assert!(
+            !p.reasoning.contains("image-centroid"),
+            "must not route via the image tier when no image centroid exists, got: {}",
+            p.reasoning,
+        );
+        assert!(
+            p.reasoning.contains("tier1 heuristic"),
+            "fall-through should be the text-space heuristic, got: {}",
+            p.reasoning,
+        );
+    }
+
+    /// A minimal valid PNG so `tidyup_extract::mime::detect` identifies the
+    /// fixture as `image/` and the modality router sends it down the image path.
+    fn make_png_bytes() -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        let img = image::RgbImage::new(2, 2);
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .unwrap();
+        buf.into_inner()
     }
 }

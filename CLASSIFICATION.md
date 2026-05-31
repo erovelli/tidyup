@@ -47,9 +47,12 @@ One input, one output, same for every modality and every operation. That is the 
 v0.1 ships text Tier 2 via `bge-small-en-v1.5` by default. Phase 7 added
 optional cross-modal Tier 2 for images (`SigLIP-base-patch16-224`) and audio
 (`CLAP-htsat-unfused`); both are off by default and only activate when their
-ONNX bundles are present in the platform model cache. Video still routes
-through Tier 1 heuristics — keyframe extraction is gated on the `ffmpeg-next`
-FFI decision.
+ONNX bundles are present in the platform model cache. Cross-modal Tier 2 now
+applies in **both** scan and migration mode: scan ranks against per-modality
+taxonomies, migration ranks against per-folder image/audio centroids built by
+the profiler (see "Migration-mode multimodal centroids" below). Video still
+routes through Tier 1 heuristics — keyframe extraction is gated on the
+`ffmpeg-next` FFI decision.
 
 | Modality | Default handling | Phase 7 (opt-in) | Post-Phase-7 |
 |---|---|---|---|
@@ -90,13 +93,50 @@ score(v, folder) = w_cent · cos(v, folder.content_centroid)
 
 Default weights (from `ClassifierConfig::ScoreWeights` in `tidyup-domain`): `w_cent = 0.55`, `w_name = 0.25`, `w_meta = 0.10`, `w_hier = 0.10`. Tunable per-config.
 
-**Centroid-absent fallback (v0.1).** Target folders start with `content_centroid = None` on first scan — centroids are populated only once a folder has enough member embeddings to average meaningfully. When a profile's centroid is missing, the pipeline redistributes `w_cent` onto `w_name` (so the effective `w_name` is `0.80` and the centroid term is `0`), keeping the composite on the same `[0, 1]` scale rather than shrinking it. Folder names are the only semantic signal for a cold target; name-embedding similarity is what carries those placements.
+**Centroid-absent fallback.** The profiler populates `content_centroid` from a bounded sample of each folder's documents (see "Migration-mode multimodal centroids" below). A folder with no extractable text documents — an empty/cold target folder, or one holding only images/audio — keeps `content_centroid = None`. When the centroid is missing, the pipeline redistributes `w_cent` onto `w_name` (so the effective `w_name` is `0.80` and the centroid term is `0`), keeping the composite on the same `[0, 1]` scale rather than shrinking it. For a cold target, folder-name embedding similarity is what carries placements until the folder accumulates documents.
 
 Decision per file:
 
 1. Compute `score` against every candidate folder.
 2. Top score above `embedding_threshold` (default 0.35) AND gap-to-second above `ambiguity_gap` (default 0.05) ⇒ confident proposal, exit cascade.
 3. Below either threshold ⇒ surface to review. If `--features llm-fallback` is compiled in and enabled per-invocation, route to Tier 3 instead of surfacing directly to review.
+
+### Migration-mode centroids (text + cross-modal)
+
+Migration profiles carry up to three centroids, each built from a bounded
+sample (`CENTROID_SAMPLE_CAP` = 24) of a folder's *direct* files and each in its
+own latent space:
+
+- **`content_centroid` (text).** The profiler extracts the bodies of the
+  folder's text documents (everything that isn't image/audio/video) and embeds
+  them with the same `bge-small` backend as `name_embedding`. This is the
+  `w_cent = 0.55` term — the dominant signal — so a folder full of tax PDFs
+  attracts tax-like source files by *content*, not just folder name. A folder
+  with no text documents keeps `content_centroid = None` (see fallback above).
+- **`image_centroid` (SigLIP) / `audio_centroid` (CLAP).** When the cross-modal
+  bundles are installed, the profiler also samples the folder's image / audio
+  files and averages + L2-normalizes them into the matching centroid. Built only
+  when the corresponding backend is loaded; the default install leaves both
+  `None`.
+
+Source files then route by modality:
+
+- **Text** files score against `content_centroid` + `name_embedding` via the
+  composite above.
+- **Image / audio** files are embedded with SigLIP / CLAP and ranked by cosine
+  **only** against folders that carry an `image_centroid` / `audio_centroid`,
+  gated by the same `embedding_threshold` / `ambiguity_gap`. The verdict
+  reasoning records `tier2 image-centroid: …` / `tier2 audio-centroid: …`.
+
+**Latent-space isolation.** An image embedding is never compared against
+`name_embedding`, `content_centroid`, or `audio_centroid` — they live in
+disjoint spaces. When no folder has a centroid in the file's modality (or the
+file can't be read/embedded), the cascade falls through to the text Tier 2 /
+Tier 1 path rather than fabricating a cross-space match.
+
+**Renames stay on the text path.** As in scan mode, cross-modal placement does
+not generate a rename — image/audio renames remain extractive (EXIF / ID3
+metadata → keyword fill → adapt → keep).
 
 ## Confidence in v0.1: raw cosine with documented thresholds
 
@@ -222,7 +262,7 @@ The cost (1–10 s of inference) is paid only on hard cases — Tier 2 hits that
 
 - **Held-out corpus for calibration (v0.2).** Ship a synthetic fixture corpus? Calibrate on first run against a labelled sample? Defer until there's real-world feedback to mine (with user opt-in)?
 - **Multilingual support.** When to swap to `bge-m3` or `multilingual-e5`? Gate on binary-size impact vs observed demand.
-- **Migration-mode multimodal.** Phase 7 wires SigLIP/CLAP into scan mode only. Migration-mode profiling builds folder centroids in the bge-small text space; image/audio files still route through that text-space match in migration mode. Adding `image_name_embedding` / `audio_name_embedding` to `FolderProfile` (and recomputing from existing folder contents) would make migration-mode multimodal symmetric with scan-mode.
+- ~~**Migration-mode multimodal.**~~ **Resolved** — see "Migration-mode centroids" above. `FolderProfile` now carries `content_centroid` (text), `image_centroid` (SigLIP), and `audio_centroid` (CLAP); the migration cascade routes each source file against the centroid in its own latent space, falling back to name embeddings when a folder lacks the matching centroid. Remaining: image-side rename gating (below).
 - **Image-side rename gating.** Phase 7 image classification produces a folder choice but no rename proposal. The rename cascade still runs against text Tier 2 (EXIF metadata → keyword fill → adapt → keep). A future enhancement: cross-modal mismatch gate using SigLIP text + image embeddings of filename and content.
 - **Video keyframe extraction.** Still pending the `ffmpeg-next` FFI vs metadata-only decision.
 - **Cold-start UX mitigation.** Does tidyup detect "target hierarchy has no files yet" and advise the user about `--features llm-fallback`, or silently surface all proposals to review with low confidence? A `--bootstrap` mode that seeds profiles from folder-name embeddings only?

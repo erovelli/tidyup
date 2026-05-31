@@ -9,11 +9,12 @@ use serde::{Deserialize, Serialize};
 use tidyup_core::frontend::Level;
 use tidyup_core::{ProgressReporter, Result, ReviewHandler};
 use tidyup_domain::{RunMode, RunRecord, RunState};
-use tidyup_pipeline::{migration::run_migration, profiler};
+use tidyup_pipeline::migration::{run_migration, MigrationMultimodal};
+use tidyup_pipeline::profiler::{self, MultimodalProfilers};
 use uuid::Uuid;
 
 use crate::executor::{
-    apply_bundles, apply_loose_decisions, select_auto_applied_bundles, ApplyReport, ExecutorDeps,
+    apply_bundles, apply_loose_decisions, select_bundle_decisions, ApplyReport, ExecutorDeps,
 };
 use crate::ServiceContext;
 
@@ -27,8 +28,10 @@ pub struct MigrationRequest {
     pub source: std::path::PathBuf,
     pub target: std::path::PathBuf,
     pub dry_run: bool,
-    /// When true, auto-apply bundles whose confidence clears
-    /// `bundle_min_confidence`. Set by the CLI only if `--yes`.
+    /// When true (the `--yes` path), auto-apply bundles whose confidence clears
+    /// `bundle_min_confidence` without prompting. When false, bundles are
+    /// surfaced to the `ReviewHandler` for interactive per-bundle approval. Set
+    /// by the CLI only if `--yes`.
     #[serde(default)]
     pub auto_approve_bundles: bool,
     /// Lower bound on confidence for auto-applied bundles.
@@ -103,6 +106,7 @@ impl MigrationService {
         result
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn try_run(
         &self,
         request: &MigrationRequest,
@@ -114,8 +118,29 @@ impl MigrationService {
             .phase_started(tidyup_domain::Phase::ProfilingTarget, None)
             .await;
         let target_scan = profiler::scan_target(&request.target)?;
-        let profile_cache =
-            profiler::build_profile_cache(&target_scan, self.ctx.embeddings.as_ref()).await?;
+        // Profile-building signals beyond the always-present name embedding:
+        // - the extractors populate the text `content_centroid` from each target
+        //   folder's documents (so migration classifies by contents, not just
+        //   folder names);
+        // - the optional cross-modal backends populate image/audio centroids
+        //   when their bundles are loaded.
+        // Source files then route against the matching-space centroid; missing
+        // centroids fall back to the name/text path.
+        let multimodal = MigrationMultimodal {
+            image: self.ctx.image_embeddings.as_deref(),
+            audio: self.ctx.audio_embeddings.as_deref(),
+        };
+        let profilers = MultimodalProfilers {
+            image: multimodal.image,
+            audio: multimodal.audio,
+            extractors: &self.ctx.extractors,
+        };
+        let profile_cache = profiler::build_profile_cache_multimodal(
+            &target_scan,
+            self.ctx.embeddings.as_ref(),
+            profilers,
+        )
+        .await?;
         progress
             .phase_finished(tidyup_domain::Phase::ProfilingTarget)
             .await;
@@ -126,6 +151,7 @@ impl MigrationService {
             &profile_cache,
             self.ctx.embeddings.as_ref(),
             text_backend,
+            multimodal,
             &self.ctx.extractors,
             &tidyup_domain::ClassifierConfig::default(),
             progress,
@@ -173,21 +199,25 @@ impl MigrationService {
             apply_loose_decisions(&outcome.proposals, &decisions, &deps, request.dry_run).await?
         };
 
-        let auto_apply_ids = select_auto_applied_bundles(
+        let auto_apply_ids = select_bundle_decisions(
             &outcome.bundles,
             request.auto_approve_bundles,
             request.bundle_min_confidence,
-        );
+            review,
+        )
+        .await?;
         if !outcome.bundles.is_empty() && auto_apply_ids.is_empty() {
-            progress
-                .message(
-                    Level::Info,
-                    &format!(
-                        "{} bundle(s) held for review; run with --yes to auto-apply those above {:.2} confidence",
-                        outcome.bundles.len(),
-                        request.bundle_min_confidence,
-                    ),
+            let held = outcome.bundles.len();
+            let detail = if request.auto_approve_bundles {
+                format!(
+                    "none cleared the {:.2} auto-apply threshold",
+                    request.bundle_min_confidence
                 )
+            } else {
+                "none approved in review".to_string()
+            };
+            progress
+                .message(Level::Info, &format!("{held} bundle(s) held; {detail}"))
                 .await;
         }
         let bundle_report =
