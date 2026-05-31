@@ -20,7 +20,7 @@ use tidyup_core::frontend::{Level, ProgressItem, ProgressReporter};
 use tidyup_core::inference::{EmbeddingBackend, TextBackend};
 use tidyup_core::storage::ChangeLog;
 use tidyup_core::{Result as CoreResult, ReviewHandler};
-use tidyup_domain::{ChangeProposal, Phase, ReviewDecision};
+use tidyup_domain::{BundleProposal, ChangeProposal, Phase, ReviewDecision};
 use tidyup_storage_sqlite::SqliteStore;
 
 struct NullProgress;
@@ -57,6 +57,38 @@ impl ReviewHandler for AutoApprove {
         }
         self.seen.lock().unwrap().extend(proposals);
         Ok(out)
+    }
+}
+
+/// Interactive-style handler that approves every loose proposal *and* every
+/// bundle it is shown. Exercises the non-`--yes` bundle-review path end to end.
+struct ApproveEverything {
+    bundles_seen: Mutex<Vec<uuid::Uuid>>,
+}
+
+impl ApproveEverything {
+    const fn new() -> Self {
+        Self {
+            bundles_seen: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl ReviewHandler for ApproveEverything {
+    async fn review(&self, proposals: Vec<ChangeProposal>) -> CoreResult<Vec<ReviewDecision>> {
+        Ok(proposals
+            .into_iter()
+            .map(|p| ReviewDecision::Approve(p.id))
+            .collect())
+    }
+    async fn review_bundles(&self, bundles: Vec<BundleProposal>) -> CoreResult<Vec<uuid::Uuid>> {
+        let ids: Vec<_> = bundles.iter().map(|b| b.id).collect();
+        self.bundles_seen
+            .lock()
+            .unwrap()
+            .extend(ids.iter().copied());
+        Ok(ids)
     }
 }
 
@@ -435,4 +467,113 @@ async fn migration_service_skips_review_when_no_loose_proposals() {
     assert_eq!(report.approved, 0);
     // Reviewer was never called.
     assert!(reviewer.seen_ids().is_empty());
+}
+
+#[tokio::test]
+async fn interactive_bundle_review_applies_and_rollback_restores_it() {
+    use tidyup_app::RollbackService;
+
+    let workdir = TempDir::new().unwrap();
+    let shelf = workdir.path().join("shelf");
+    std::fs::create_dir_all(&shelf).unwrap();
+    let src_root = workdir.path().join("src");
+    let proj = src_root.join("myproj");
+    std::fs::create_dir_all(proj.join("src")).unwrap();
+    std::fs::write(proj.join("Cargo.toml"), b"[package]\nname='x'\n").unwrap();
+    std::fs::write(proj.join("src/main.rs"), b"fn main() {}").unwrap();
+
+    let (ctx, store) = make_ctx_with_shelf(Some(shelf));
+    let candidates = sample_scan_candidates().await;
+    let service = ScanService::new(Arc::clone(&ctx));
+    // NOT --yes: auto_approve_bundles = false. The bundle applies only because
+    // the interactive handler approves it via review_bundles.
+    let reviewer = ApproveEverything::new();
+
+    let report = service
+        .run(
+            tidyup_app::scan::ScanRequest {
+                root: src_root.clone(),
+                taxonomy_path: None,
+                dry_run: false,
+                auto_approve_bundles: false,
+                bundle_min_confidence: 0.85,
+            },
+            &candidates,
+            &[],
+            &[],
+            &NullProgress,
+            &reviewer,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.bundles, 1, "the Cargo project is one bundle");
+    assert_eq!(report.bundles_applied, 1, "interactive review approved it");
+    assert_eq!(report.bundles_skipped, 0);
+    assert_eq!(report.bundles_failed, 0);
+    assert_eq!(
+        reviewer.bundles_seen.lock().unwrap().len(),
+        1,
+        "the handler was shown the bundle",
+    );
+    assert!(!proj.exists(), "bundle root must be gone after atomic move");
+
+    // The whole subtree must be restorable atomically.
+    let rollback = RollbackService::new(Arc::clone(&ctx));
+    let rb = rollback
+        .rollback_run(report.run_id, &NullProgress)
+        .await
+        .unwrap();
+    assert_eq!(rb.bundles_restored, 1);
+    assert_eq!(rb.failures, 0);
+    assert!(
+        proj.join("Cargo.toml").exists(),
+        "rollback restores the bundle"
+    );
+    assert!(proj.join("src/main.rs").exists());
+
+    // No loose proposals were produced (bundle consumed all descendants).
+    let pending = store.pending().await.unwrap();
+    assert!(pending.is_empty());
+}
+
+#[tokio::test]
+async fn bundle_held_when_interactive_review_rejects_it() {
+    let workdir = TempDir::new().unwrap();
+    let shelf = workdir.path().join("shelf");
+    std::fs::create_dir_all(&shelf).unwrap();
+    let src_root = workdir.path().join("src");
+    let proj = src_root.join("myproj");
+    std::fs::create_dir_all(proj.join("src")).unwrap();
+    std::fs::write(proj.join("Cargo.toml"), b"[package]\nname='x'\n").unwrap();
+    std::fs::write(proj.join("src/main.rs"), b"fn main() {}").unwrap();
+
+    let (ctx, _store) = make_ctx_with_shelf(Some(shelf));
+    let candidates = sample_scan_candidates().await;
+    let service = ScanService::new(Arc::clone(&ctx));
+    // AutoApprove uses the default review_bundles (approve nothing) → bundle held.
+    let reviewer = AutoApprove::new();
+
+    let report = service
+        .run(
+            tidyup_app::scan::ScanRequest {
+                root: src_root.clone(),
+                taxonomy_path: None,
+                dry_run: false,
+                auto_approve_bundles: false,
+                bundle_min_confidence: 0.85,
+            },
+            &candidates,
+            &[],
+            &[],
+            &NullProgress,
+            &reviewer,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.bundles, 1);
+    assert_eq!(report.bundles_applied, 0, "rejected bundle must not move");
+    assert_eq!(report.bundles_skipped, 1);
+    assert!(proj.exists(), "rejected bundle stays in place");
 }

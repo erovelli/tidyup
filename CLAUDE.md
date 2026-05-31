@@ -126,6 +126,8 @@ Files are not always independent. A coding project, photo burst, or music album 
 
 **Domain shape.** Bundles are a first-class aggregate: `BundleProposal { root, kind, members: Vec<ChangeProposal>, target_parent, confidence, status }`. Individual member proposals are never approved, applied, or rolled back independently. Member proposals cannot carry rename suggestions. The SQL schema: a `bundles` table plus a `bundle_id` foreign key on `change_proposals`.
 
+**Bundle review is per-bundle, never per-member.** `ReviewHandler::review_bundles` returns the ids of approved *bundles* (not `ReviewDecision`s and no `Override` — members carry their own paths). The default impl approves nothing, so a frontend without a bundle surface holds every bundle. `--yes` skips the handler and applies the confidence threshold directly. Don't add a per-member bundle decision path.
+
 **Do not** introduce partial-bundle apply paths, per-member rollback, or any code that allows some members to move while others don't. This invariant has no exceptions.
 
 ## Rename policy

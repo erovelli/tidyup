@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{anyhow, Context};
-use tidyup_core::frontend::{Level, ProgressItem, ProgressReporter};
+use tidyup_core::frontend::{Level, ProgressItem, ProgressReporter, ReviewHandler};
 use tidyup_core::storage::{BackupStore, ChangeLog};
 use tidyup_core::Result;
 use tidyup_domain::{BundleProposal, ChangeProposal, FileId, IndexedFile, Phase, ReviewDecision};
@@ -410,14 +410,17 @@ fn indexed_stub(source: &Path, file_id: Option<FileId>) -> anyhow::Result<Indexe
     })
 }
 
-/// Decide which bundles to auto-apply based on confidence + `--yes`.
+/// Threshold-only bundle selection used on the `--yes` path.
 ///
-/// Phase 5 ships without a bundle review port, so the rule is simple:
+/// - `auto_approve_all = true` (i.e. `--yes`): approve bundles with confidence ≥
+///   `min_confidence`; skip the rest. This mirrors how `--yes` auto-approves
+///   loose moves above a confidence threshold.
+/// - `auto_approve_all = false`: approve nothing. Callers that want interactive
+///   per-bundle review go through [`select_bundle_decisions`] instead.
 ///
-/// - `auto_approve_all = true` (i.e. `--yes`): apply bundles with confidence ≥
-///   `min_confidence`; skip the rest.
-/// - `auto_approve_all = false`: leave every bundle pending; caller should
-///   emit a user-facing message that bundles need review.
+/// Bundles are atomic aggregates, so the decision is binary per bundle — there
+/// is no per-member selection and no `Override` (members carry their own paths
+/// and never receive rename proposals).
 #[must_use]
 pub fn select_auto_applied_bundles(
     bundles: &[BundleProposal],
@@ -432,6 +435,37 @@ pub fn select_auto_applied_bundles(
         .filter(|b| b.confidence >= min_confidence)
         .map(|b| b.id)
         .collect()
+}
+
+/// Decide which bundles to apply, honouring both the `--yes` threshold path and
+/// interactive per-bundle review.
+///
+/// - `auto_approve_all = true` (`--yes`): non-interactive — approve bundles
+///   clearing `min_confidence` via [`select_auto_applied_bundles`]. The bundle
+///   review handler is not consulted, consistent with `--yes` skipping prompts.
+/// - `auto_approve_all = false`: delegate to [`ReviewHandler::review_bundles`].
+///   The CLI's interactive handler prompts per bundle; the default trait impl
+///   (UI today, test stubs) approves nothing, so every bundle stays pending —
+///   exactly the pre-bundle-review behaviour.
+///
+/// Returns the ids the user (or threshold) approved. Renames are never involved:
+/// bundle members move as-is, so there is nothing to surface for rename review.
+///
+/// # Errors
+/// Propagates errors from the review handler.
+pub async fn select_bundle_decisions(
+    bundles: &[BundleProposal],
+    auto_approve_all: bool,
+    min_confidence: f32,
+    review: &dyn ReviewHandler,
+) -> Result<Vec<Uuid>> {
+    if bundles.is_empty() {
+        return Ok(Vec::new());
+    }
+    if auto_approve_all {
+        return Ok(select_auto_applied_bundles(bundles, true, min_confidence));
+    }
+    review.review_bundles(bundles.to_vec()).await
 }
 
 #[cfg(test)]
@@ -712,5 +746,124 @@ mod tests {
         assert_eq!(select_auto_applied_bundles(&bundles, false, 0.5).len(), 0);
         let ids = select_auto_applied_bundles(&bundles, true, 0.5);
         assert_eq!(ids, vec![high.id]);
+    }
+
+    fn sample_bundle(confidence: f32) -> BundleProposal {
+        BundleProposal {
+            id: Uuid::new_v4(),
+            root: PathBuf::from("/a"),
+            kind: tidyup_domain::BundleKind::Generic,
+            target_parent: PathBuf::from("/target"),
+            members: vec![],
+            confidence,
+            reasoning: "t".into(),
+            status: ChangeStatus::Pending,
+            created_at: chrono::Utc::now(),
+            applied_at: None,
+        }
+    }
+
+    /// Records the bundle ids it was shown and approves a configurable subset.
+    struct RecordingBundleReview {
+        approve: Vec<Uuid>,
+        seen: Mutex<Vec<Uuid>>,
+    }
+
+    #[async_trait]
+    impl ReviewHandler for RecordingBundleReview {
+        async fn review(&self, _p: Vec<ChangeProposal>) -> CoreResult<Vec<ReviewDecision>> {
+            Ok(Vec::new())
+        }
+        async fn review_bundles(&self, bundles: Vec<BundleProposal>) -> CoreResult<Vec<Uuid>> {
+            self.seen
+                .lock()
+                .unwrap()
+                .extend(bundles.iter().map(|b| b.id));
+            Ok(self.approve.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn select_bundle_decisions_yes_path_uses_threshold_not_handler() {
+        let low = sample_bundle(0.3);
+        let high = sample_bundle(0.9);
+        let bundles = vec![low, high.clone()];
+        // A handler that would approve everything — but --yes must NOT consult it.
+        let reviewer = RecordingBundleReview {
+            approve: bundles.iter().map(|b| b.id).collect(),
+            seen: Mutex::new(Vec::new()),
+        };
+
+        let ids = select_bundle_decisions(&bundles, true, 0.5, &reviewer)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            ids,
+            vec![high.id],
+            "only the high-confidence bundle clears the threshold"
+        );
+        assert!(
+            reviewer.seen.lock().unwrap().is_empty(),
+            "review_bundles must not be called on the --yes path",
+        );
+    }
+
+    #[tokio::test]
+    async fn select_bundle_decisions_interactive_path_delegates_to_handler() {
+        let a = sample_bundle(0.1);
+        let b = sample_bundle(0.99);
+        let bundles = vec![a.clone(), b];
+        // Interactive handler approves only the *low*-confidence bundle, proving
+        // the decision comes from the handler, not a confidence threshold.
+        let reviewer = RecordingBundleReview {
+            approve: vec![a.id],
+            seen: Mutex::new(Vec::new()),
+        };
+
+        let ids = select_bundle_decisions(&bundles, false, 0.85, &reviewer)
+            .await
+            .unwrap();
+
+        assert_eq!(ids, vec![a.id]);
+        assert_eq!(
+            reviewer.seen.lock().unwrap().len(),
+            2,
+            "handler sees every bundle"
+        );
+    }
+
+    #[tokio::test]
+    async fn select_bundle_decisions_empty_short_circuits() {
+        let reviewer = RecordingBundleReview {
+            approve: vec![Uuid::new_v4()],
+            seen: Mutex::new(Vec::new()),
+        };
+        let ids = select_bundle_decisions(&[], false, 0.85, &reviewer)
+            .await
+            .unwrap();
+        assert!(ids.is_empty());
+        assert!(
+            reviewer.seen.lock().unwrap().is_empty(),
+            "no bundles → handler not consulted",
+        );
+    }
+
+    #[tokio::test]
+    async fn default_review_bundles_approves_nothing() {
+        // A handler that only implements `review` inherits the trait default for
+        // `review_bundles` (approve nothing) — the pre-bundle-review behaviour.
+        struct LooseOnly;
+        #[async_trait]
+        impl ReviewHandler for LooseOnly {
+            async fn review(&self, _p: Vec<ChangeProposal>) -> CoreResult<Vec<ReviewDecision>> {
+                Ok(Vec::new())
+            }
+        }
+        let bundles = vec![sample_bundle(0.99)];
+        let ids = select_bundle_decisions(&bundles, false, 0.85, &LooseOnly)
+            .await
+            .unwrap();
+        assert!(ids.is_empty(), "default review_bundles holds every bundle");
     }
 }

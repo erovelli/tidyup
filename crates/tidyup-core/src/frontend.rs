@@ -6,7 +6,8 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tidyup_domain::{ChangeProposal, Phase, ReviewDecision};
+use tidyup_domain::{BundleProposal, ChangeProposal, Phase, ReviewDecision};
+use uuid::Uuid;
 
 use crate::Result;
 
@@ -52,6 +53,21 @@ pub trait ReviewHandler: Send + Sync {
     /// Implementations may batch (UI: show all, collect) or stream (CLI: prompt per item).
     /// The contract is the same from the service's perspective.
     async fn review(&self, proposals: Vec<ChangeProposal>) -> Result<Vec<ReviewDecision>>;
+
+    /// Present detected bundles for atomic approve/reject and return the ids of
+    /// the bundles the user approved. Bundles are all-or-nothing aggregates:
+    /// there is no per-member decision and no `Override` (members carry their
+    /// own paths and never receive rename proposals), so the decision is binary
+    /// per bundle — hence a plain id list rather than a `ReviewDecision` vec.
+    ///
+    /// The default implementation approves nothing (every bundle stays pending),
+    /// which preserves the pre-bundle-review behaviour for frontends that have
+    /// not yet grown an interactive bundle surface. Returning a bundle id that
+    /// isn't in `bundles` is harmless — the executor ignores unmatched ids.
+    async fn review_bundles(&self, bundles: Vec<BundleProposal>) -> Result<Vec<Uuid>> {
+        let _ = bundles;
+        Ok(Vec::new())
+    }
 }
 
 /// Supplies runtime configuration to services. Abstracts over file-backed config (CLI)
