@@ -11,9 +11,11 @@
 //! # Composite score
 //!
 //! Per [`ScoreWeights`] (defaults `0.25 name + 0.55 centroid + 0.10 metadata +
-//! 0.10 hierarchy`). When a folder's `content_centroid` is `None` (the v0.1
-//! default), the centroid weight is redistributed to `name` so the composite
-//! stays in `[0, 1]`.
+//! 0.10 hierarchy`). The profiler populates `content_centroid` from each target
+//! folder's documents when extractors are supplied; when a folder has no text
+//! documents (or extractors weren't supplied) its `content_centroid` is `None`
+//! and the centroid weight is redistributed to `name` so the composite stays in
+//! `[0, 1]`.
 //!
 //! # Tier 3
 //!
@@ -1594,6 +1596,7 @@ mod tests {
             MultimodalProfilers {
                 image: Some(&img),
                 audio: None,
+                extractors: &[],
             },
         )
         .await

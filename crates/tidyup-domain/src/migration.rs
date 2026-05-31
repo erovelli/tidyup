@@ -101,7 +101,9 @@ pub struct FolderProfile {
     pub path: PathBuf,
     /// Embedding of synthesized natural-language description (text space).
     pub name_embedding: Vec<f32>,
-    /// Mean text embedding of sampled file contents within this folder.
+    /// Mean text embedding of sampled document bodies within this folder (text
+    /// space, same backend as `name_embedding`). `None` when the folder holds no
+    /// extractable text documents or the profiler was run without extractors.
     pub content_centroid: Option<Vec<f32>>,
     /// Number of files that contributed to the content centroid.
     pub centroid_sample_count: u32,

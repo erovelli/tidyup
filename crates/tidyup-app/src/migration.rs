@@ -118,10 +118,14 @@ impl MigrationService {
             .phase_started(tidyup_domain::Phase::ProfilingTarget, None)
             .await;
         let target_scan = profiler::scan_target(&request.target)?;
-        // Optional cross-modal backends: when their bundles are loaded, target
-        // folders gain image/audio centroids and image/audio source files route
-        // against them. Absent (the default install) → text-only profiles, and
-        // image/audio fall through to the text Tier 2 path.
+        // Profile-building signals beyond the always-present name embedding:
+        // - the extractors populate the text `content_centroid` from each target
+        //   folder's documents (so migration classifies by contents, not just
+        //   folder names);
+        // - the optional cross-modal backends populate image/audio centroids
+        //   when their bundles are loaded.
+        // Source files then route against the matching-space centroid; missing
+        // centroids fall back to the name/text path.
         let multimodal = MigrationMultimodal {
             image: self.ctx.image_embeddings.as_deref(),
             audio: self.ctx.audio_embeddings.as_deref(),
@@ -129,6 +133,7 @@ impl MigrationService {
         let profilers = MultimodalProfilers {
             image: multimodal.image,
             audio: multimodal.audio,
+            extractors: &self.ctx.extractors,
         };
         let profile_cache = profiler::build_profile_cache_multimodal(
             &target_scan,
