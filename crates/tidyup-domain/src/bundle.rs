@@ -74,6 +74,22 @@ impl BundleKind {
             other => Err(ParseError::UnknownBundleKind(other.to_string())),
         }
     }
+
+    /// Whether this kind moves as a **set of individual files** (clustered loose
+    /// siblings) rather than by renaming a single root directory.
+    ///
+    /// Photo bursts, music albums, and document series have no shared directory
+    /// to relocate — their members move individually, but still all-or-nothing.
+    /// The executor and rollback consult this to pick the atomic-apply strategy:
+    /// `false` => rename the bundle root directory; `true` => move each member
+    /// to its own `proposed_path`, rolling all back on any failure.
+    #[must_use]
+    pub const fn moves_as_file_set(&self) -> bool {
+        matches!(
+            self,
+            Self::PhotoBurst | Self::MusicAlbum | Self::DocumentSeries { .. }
+        )
+    }
 }
 
 /// Atomic move proposal for a detected bundle. Either every member applies, or none do.
@@ -207,6 +223,21 @@ mod tests {
             let back = BundleKind::parse(s).unwrap();
             assert_eq!(k, back);
         }
+    }
+
+    #[test]
+    fn moves_as_file_set_only_for_content_clusters() {
+        assert!(BundleKind::PhotoBurst.moves_as_file_set());
+        assert!(BundleKind::MusicAlbum.moves_as_file_set());
+        assert!(BundleKind::DocumentSeries {
+            pattern: "invoice".into()
+        }
+        .moves_as_file_set());
+        // Marker (directory) bundles move by renaming their root.
+        assert!(!BundleKind::RustCrate.moves_as_file_set());
+        assert!(!BundleKind::GitRepository.moves_as_file_set());
+        assert!(!BundleKind::JupyterNotebookSet.moves_as_file_set());
+        assert!(!BundleKind::Generic.moves_as_file_set());
     }
 
     #[test]

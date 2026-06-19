@@ -8,6 +8,7 @@
 //! - [`naming`]    — filename sanitization + rendering from proposals.
 //! - [`yake`]      — inlined keyword extraction for the rename cascade.
 
+pub mod clustering;
 pub mod heuristics;
 pub mod migration;
 pub mod naming;

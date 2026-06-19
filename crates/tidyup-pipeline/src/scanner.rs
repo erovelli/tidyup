@@ -25,12 +25,13 @@
 //!
 //! # Scope
 //!
-//! v0.1 covers marker-file bundles only. EXIF-clustered photo bursts and
-//! ID3-clustered music albums are deferred — they require content reads the
-//! scanner intentionally avoids, and will land alongside the corresponding
-//! extractors. Soft `DocumentSeries` detection (filename families like
-//! `invoice-2024-01.pdf`, `invoice-2024-02.pdf`) is also deferred; the
-//! rename cascade still handles those files individually in the meantime.
+//! This module covers **marker-file (directory) bundles only** — it
+//! deliberately performs no content reads. Content-clustered bundles
+//! (EXIF photo bursts, ID3 music albums, filename `DocumentSeries`) are a
+//! separate pass over the loose files in [`crate::clustering`], which runs
+//! after this scanner and uses the content extractors. Those clusters move as
+//! file-sets (each member individually, atomically) rather than by renaming a
+//! shared root directory.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -59,6 +60,11 @@ pub struct DetectedBundle {
     /// Human-readable explanation of the detection, for proposal reasoning
     /// and audit logs.
     pub reasoning: String,
+    /// For file-set clusters (photo bursts, music albums, document series), the
+    /// subfolder name the members are grouped under at the destination (e.g.
+    /// `"Burst 2024-01-15"`, an album title, or a filename family). `None` for
+    /// directory bundles, which preserve their existing subtree layout.
+    pub target_subdir: Option<String>,
 }
 
 /// Walk `root`, classify each directory as bundle-root or transparent, and
@@ -90,6 +96,7 @@ fn scan_dir(dir: &Path, tree: &mut ScanTree) {
             kind,
             members,
             reasoning: reason.to_string(),
+            target_subdir: None,
         });
         return;
     }

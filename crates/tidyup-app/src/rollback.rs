@@ -173,6 +173,13 @@ impl RollbackService {
         bundle: &BundleProposal,
         progress: &dyn ProgressReporter,
     ) -> Result<()> {
+        // File-set bundles (photo bursts, music albums, document series) were
+        // applied by moving each member individually, so they restore the same
+        // way — per member, by the member's own shelf record.
+        if bundle.kind.moves_as_file_set() {
+            return self.rollback_file_set_bundle(bundle, progress).await;
+        }
+
         let record = self
             .ctx
             .backup_store
@@ -212,6 +219,59 @@ impl RollbackService {
                 },
             )
             .await;
+        Ok(())
+    }
+
+    /// Roll back a file-set bundle by restoring each member from its own shelf
+    /// record. Mirrors the directory path's contract: restore (which removes
+    /// each destination first), then mark the whole bundle `Unshelved` only on
+    /// full success — the first member failure propagates *before* the mark, so
+    /// a partially-failed rollback stays retryable.
+    async fn rollback_file_set_bundle(
+        &self,
+        bundle: &BundleProposal,
+        progress: &dyn ProgressReporter,
+    ) -> Result<()> {
+        for member in &bundle.members {
+            self.restore_file_set_member(member).await?;
+        }
+        self.ctx.change_log.mark_bundle_unshelved(bundle.id).await?;
+        progress
+            .item_completed(
+                Phase::Rollback,
+                ProgressItem {
+                    label: format!("{} ({} files)", bundle.kind.as_str(), bundle.members.len()),
+                    current: 1,
+                    total: None,
+                },
+            )
+            .await;
+        Ok(())
+    }
+
+    async fn restore_file_set_member(&self, member: &ChangeProposal) -> Result<()> {
+        let record = self
+            .ctx
+            .backup_store
+            .find_by_change_id(member.id)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no shelved backup for file-set member {} ({})",
+                    member.id,
+                    member.original_path.display(),
+                )
+            })?;
+
+        if member.proposed_path.exists() {
+            if member.proposed_path.is_dir() {
+                std::fs::remove_dir_all(&member.proposed_path)?;
+            } else {
+                std::fs::remove_file(&member.proposed_path)?;
+            }
+        }
+
+        self.ctx.backup_store.restore(&record).await?;
         Ok(())
     }
 

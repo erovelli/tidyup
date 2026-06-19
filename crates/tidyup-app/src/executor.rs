@@ -148,7 +148,16 @@ pub async fn apply_bundles(
             report.bundles_skipped += 1;
             continue;
         }
-        match apply_bundle_atomic(bundle, deps, dry_run).await {
+        // Two atomic strategies: directory bundles (code projects, etc.) move by
+        // a single root rename; file-set bundles (photo bursts, music albums,
+        // document series) are clustered loose siblings with no shared root, so
+        // each member moves individually with all-or-nothing rollback.
+        let result = if bundle.kind.moves_as_file_set() {
+            apply_file_set_bundle(bundle, deps, dry_run).await
+        } else {
+            apply_bundle_atomic(bundle, deps, dry_run).await
+        };
+        match result {
             Ok(()) => report.bundles_applied += 1,
             Err(e) => {
                 report.bundles_failed += 1;
@@ -223,6 +232,72 @@ async fn apply_bundle_atomic(
 
     deps.change_log.mark_bundle_applied(bundle.id).await?;
     Ok(())
+}
+
+/// Apply a **file-set** bundle: move each member to its own `proposed_path`,
+/// atomically as a group. Unlike [`apply_bundle_atomic`] (a single directory
+/// rename), the members are clustered loose siblings with no shared root, so
+/// each is shelved + moved individually and **every completed move is reversed
+/// if any member fails** — the bundle relocates whole or not at all.
+///
+/// Each member is shelved keyed by its own proposal id (the same id
+/// [`crate::rollback`] looks up), so a later `rollback` restores the originals.
+async fn apply_file_set_bundle(
+    bundle: &BundleProposal,
+    deps: &ExecutorDeps<'_>,
+    dry_run: bool,
+) -> Result<()> {
+    // Pre-flight: every source must exist and no target may be occupied, so the
+    // common failure modes are caught before we touch the filesystem.
+    for member in &bundle.members {
+        if !member.original_path.exists() {
+            return Err(anyhow!(
+                "file-set member missing: {}",
+                member.original_path.display()
+            ));
+        }
+        if member.proposed_path.exists() {
+            return Err(anyhow!(
+                "refusing to overwrite existing target: {}",
+                member.proposed_path.display()
+            ));
+        }
+    }
+    if dry_run {
+        return Ok(());
+    }
+
+    // Completed (dst, src) moves, for reverse-on-failure rollback (LIFO).
+    let mut moved: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+    for member in &bundle.members {
+        let src = member.original_path.clone();
+        let dst = member.proposed_path.clone();
+
+        let indexed = indexed_stub(&src, member.file_id.clone())?;
+        if let Err(e) = deps.backup_store.shelve(&indexed, member.id).await {
+            reverse_moves(&moved);
+            return Err(e).with_context(|| format!("shelving {}", src.display()));
+        }
+
+        if let Err(e) = ensure_parent(&dst).and_then(|()| move_path(&src, &dst)) {
+            reverse_moves(&moved);
+            return Err(e)
+                .with_context(|| format!("moving {} -> {}", src.display(), dst.display()));
+        }
+        moved.push((dst, src));
+    }
+
+    deps.change_log.mark_bundle_applied(bundle.id).await?;
+    Ok(())
+}
+
+/// Best-effort reversal of completed file-set moves, used only on the failure
+/// path (LIFO order). Errors are swallowed — the originals are also preserved
+/// on the backup shelf, so `rollback` can still recover even if a reverse fails.
+fn reverse_moves(moved: &[(std::path::PathBuf, std::path::PathBuf)]) {
+    for (dst, src) in moved.iter().rev() {
+        let _ = move_path(dst, src);
+    }
 }
 
 /// Fast-path same-volume rename with a cross-volume copy-verify-delete fallback.
@@ -865,5 +940,117 @@ mod tests {
             .await
             .unwrap();
         assert!(ids.is_empty(), "default review_bundles holds every bundle");
+    }
+
+    fn file_set_bundle(members: Vec<ChangeProposal>, target_parent: PathBuf) -> BundleProposal {
+        BundleProposal::new(
+            PathBuf::from("/src/cluster"),
+            tidyup_domain::BundleKind::PhotoBurst,
+            target_parent,
+            members,
+            0.9,
+            "photo burst".into(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn apply_file_set_bundle_moves_each_member_and_shelves() {
+        let dir = TempDir::new().unwrap();
+        let src1 = dir.path().join("IMG_001.jpg");
+        let src2 = dir.path().join("IMG_002.jpg");
+        std::fs::write(&src1, b"one").unwrap();
+        std::fs::write(&src2, b"two").unwrap();
+        let dst1 = dir.path().join("Photos/Bursts/x/IMG_001.jpg");
+        let dst2 = dir.path().join("Photos/Bursts/x/IMG_002.jpg");
+
+        let members = vec![
+            sample_proposal(src1.clone(), &dst1),
+            sample_proposal(src2.clone(), &dst2),
+        ];
+        let bundle = file_set_bundle(members, dir.path().join("Photos/Bursts/x"));
+
+        let log = RecordingLog::new();
+        let shelf = NoopBackup::new();
+        let deps = ExecutorDeps {
+            change_log: &log,
+            backup_store: &shelf,
+            progress: &NullProgress,
+        };
+
+        let report = apply_bundles(std::slice::from_ref(&bundle), &[bundle.id], &deps, false)
+            .await
+            .unwrap();
+
+        assert_eq!(report.bundles_applied, 1);
+        assert!(!src1.exists() && !src2.exists(), "originals must be moved");
+        assert!(
+            dst1.exists() && dst2.exists(),
+            "members must land at targets"
+        );
+        assert_eq!(std::fs::read(&dst1).unwrap(), b"one");
+        // Each member is shelved by its OWN id (the id rollback looks up).
+        let shelved = shelf.shelved.lock().unwrap().clone();
+        assert!(shelved.contains(&bundle.members[0].id));
+        assert!(shelved.contains(&bundle.members[1].id));
+        assert!(log.applied_bundles.lock().unwrap().contains(&bundle.id));
+    }
+
+    #[tokio::test]
+    async fn apply_file_set_bundle_is_atomic_when_a_target_is_occupied() {
+        let dir = TempDir::new().unwrap();
+        let src1 = dir.path().join("a.jpg");
+        let src2 = dir.path().join("b.jpg");
+        std::fs::write(&src1, b"a").unwrap();
+        std::fs::write(&src2, b"b").unwrap();
+        let dst1 = dir.path().join("out/a.jpg");
+        let dst2 = dir.path().join("out/b.jpg");
+        // Occupy the second target so pre-flight refuses the whole bundle.
+        std::fs::create_dir_all(dst2.parent().unwrap()).unwrap();
+        std::fs::write(&dst2, b"existing").unwrap();
+
+        let members = vec![
+            sample_proposal(src1.clone(), &dst1),
+            sample_proposal(src2.clone(), &dst2),
+        ];
+        let bundle = file_set_bundle(members, dir.path().join("out"));
+
+        let deps = ExecutorDeps {
+            change_log: &RecordingLog::new(),
+            backup_store: &NoopBackup::new(),
+            progress: &NullProgress,
+        };
+        let report = apply_bundles(std::slice::from_ref(&bundle), &[bundle.id], &deps, false)
+            .await
+            .unwrap();
+
+        assert_eq!(report.bundles_failed, 1);
+        // All-or-nothing: neither member moved, no partial state.
+        assert!(src1.exists() && src2.exists(), "no member may move");
+        assert!(!dst1.exists(), "first target must stay untouched");
+        assert_eq!(std::fs::read(&dst2).unwrap(), b"existing");
+    }
+
+    #[tokio::test]
+    async fn apply_file_set_bundle_dry_run_touches_nothing() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("c.jpg");
+        std::fs::write(&src, b"c").unwrap();
+        let dst = dir.path().join("out/c.jpg");
+        let bundle = file_set_bundle(
+            vec![sample_proposal(src.clone(), &dst)],
+            dir.path().join("out"),
+        );
+        let deps = ExecutorDeps {
+            change_log: &RecordingLog::new(),
+            backup_store: &NoopBackup::new(),
+            progress: &NullProgress,
+        };
+        let report = apply_bundles(std::slice::from_ref(&bundle), &[bundle.id], &deps, true)
+            .await
+            .unwrap();
+        assert_eq!(report.bundles_applied, 1);
+        assert!(src.exists(), "dry-run must not move the source");
+        assert!(!dst.exists(), "dry-run must not create the target");
     }
 }

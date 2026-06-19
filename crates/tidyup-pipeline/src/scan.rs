@@ -143,6 +143,16 @@ pub async fn run_scan(
 ) -> Result<ScanOutcome> {
     progress.phase_started(Phase::Indexing, None).await;
     let tree = scanner::scan(source_root);
+    // Content clustering: group loose siblings into photo bursts / music albums
+    // / document series. Runs after the structural scanner; these move as
+    // file-sets (each member individually, atomically) — see
+    // `BundleKind::moves_as_file_set`.
+    let (content_bundles, loose_files) = crate::clustering::cluster_loose(
+        &tree.loose_files,
+        extractors,
+        &crate::clustering::ClusterConfig::default(),
+    )
+    .await;
     progress.phase_finished(Phase::Indexing).await;
 
     let mut outcome = ScanOutcome {
@@ -151,8 +161,9 @@ pub async fn run_scan(
         unclassified: Vec::new(),
     };
 
-    // Bundles first — they don't pass through Tier 2.
-    for bundle in &tree.bundles {
+    // Bundles first — they don't pass through Tier 2. Marker (directory)
+    // bundles from the scanner plus content clusters from the clustering pass.
+    for bundle in tree.bundles.iter().chain(content_bundles.iter()) {
         match build_bundle_proposal(bundle, output_root) {
             Ok(bp) => outcome.bundles.push(bp),
             Err(e) => {
@@ -167,12 +178,12 @@ pub async fn run_scan(
     }
 
     #[allow(clippy::cast_possible_truncation)]
-    let total = tree.loose_files.len() as u64;
+    let total = loose_files.len() as u64;
     progress
         .phase_started(Phase::Classifying, Some(total))
         .await;
 
-    for (idx, path) in tree.loose_files.iter().enumerate() {
+    for (idx, path) in loose_files.iter().enumerate() {
         match classify_file(
             path,
             candidates,
@@ -830,20 +841,32 @@ const fn bundle_taxonomy(kind: &BundleKind) -> &'static str {
 }
 
 fn build_bundle_proposal(bundle: &DetectedBundle, output_root: &Path) -> Result<BundleProposal> {
-    let leaf = bundle
-        .root
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("bundle")
-        .to_string();
     let taxonomy = bundle_taxonomy(&bundle.kind);
     let target_parent = output_root.join(taxonomy.trim_end_matches('/'));
-    let bundle_target_root = target_parent.join(&leaf);
+
+    // Directory bundles keep their subtree under a folder named after the root
+    // (members relocate relative to the root). File-set clusters (photo bursts,
+    // music albums, document series) have no meaningful subtree — they collapse
+    // flat into a subfolder named by the cluster (`target_subdir`).
+    let flat = bundle.target_subdir.is_some();
+    let subfolder = bundle.target_subdir.clone().unwrap_or_else(|| {
+        bundle
+            .root
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("bundle")
+            .to_string()
+    });
+    let bundle_target_root = target_parent.join(&subfolder);
 
     let mut members = Vec::with_capacity(bundle.members.len());
     for m in &bundle.members {
-        let rel = m.strip_prefix(&bundle.root).unwrap_or(m);
-        let proposed_path = bundle_target_root.join(rel);
+        let proposed_path = if flat {
+            bundle_target_root.join(m.file_name().unwrap_or_else(|| m.as_os_str()))
+        } else {
+            let rel = m.strip_prefix(&bundle.root).unwrap_or(m);
+            bundle_target_root.join(rel)
+        };
         let name = m
             .file_name()
             .and_then(|s| s.to_str())
