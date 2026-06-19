@@ -55,6 +55,21 @@ enum Task {
         #[arg(long)]
         multimodal: bool,
     },
+    /// Verify already-installed model bundles against their pinned specs and
+    /// report per-bundle pass/fail. Run after `download-models`, or to check an
+    /// install's integrity. The default bundle is always checked; optional
+    /// bundles only when requested.
+    VerifyModels {
+        /// Also verify the `SigLIP` image encoder bundle.
+        #[arg(long)]
+        siglip: bool,
+        /// Also verify the `CLAP` audio encoder bundle.
+        #[arg(long)]
+        clap: bool,
+        /// Convenience: enables both `--siglip` and `--clap`.
+        #[arg(long)]
+        multimodal: bool,
+    },
     /// Assert the default `tidyup-cli` dep graph contains no network or LLM
     /// deps. Runs `cargo tree -p tidyup-cli -e normal` and fails if any
     /// banned crate appears. Embedded in `ci`.
@@ -111,6 +126,11 @@ impl Task {
                 let want_clap = clap || multimodal;
                 models::download(force, want_siglip, want_clap)
             }
+            Self::VerifyModels {
+                siglip,
+                clap,
+                multimodal,
+            } => models::verify(siglip || multimodal, clap || multimodal),
             Self::CheckPrivacy => privacy::check(),
             Self::Eval { json, no_model } => eval::run(json, no_model),
         }

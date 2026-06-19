@@ -137,6 +137,15 @@ The CLI and UI binaries detect the bundles at startup and enable the
 modality-specific Tier 2 path automatically when present. Absent bundles are
 not an error — image/audio files fall back to Tier 1 heuristics.
 
+**Integrity.** `download-models` verifies each file after fetching against the
+same `BundleSpec`/`ArtifactSpec` the binary checks at load time (one source of
+truth in `tidyup-embeddings-ort::install`, so downloader and runtime can't
+drift). A pinned BLAKE3 checksum is enforced — a corrupt download is deleted and
+the run fails — and unpinned artifacts print their digest + size so a maintainer
+can pin them (ideally against an immutable `resolve/<commit-sha>/` revision).
+`cargo xtask verify-models [--siglip --clap | --multimodal]` re-checks an
+existing install on demand.
+
 ---
 
 ## Roadmap
@@ -172,6 +181,7 @@ tidyup is being built in phases. Each phase lands an independently compilable sl
 - First-run model check: scan/migrate surface `cargo xtask download-models` (or a manual placement hint) when the embedding bundle is missing, without linking an HTTP client
 - `tidyup-ui`: Dioxus 0.7 desktop binary (`cargo run -p tidyup-ui --bin tidyup-desktop`) with Dashboard / Review / Runs / Settings pages, signal-backed `ProgressReporter` and oneshot-channel `ReviewHandler`. Same `ServiceContext` construction, extractors, and embedding model as the CLI — the only difference is the frontend port impls. Styled per `DESIGN.md` ("The Verdant Archive")
 - **Phase 7 multimodal Tier 2 (optional, off-by-default)**: SigLIP-base for cross-modal image classification and CLAP-htsat-unfused for audio. Both are pure-Rust ONNX (no FFI beyond `ort`/`symphonia`/`image`) and load only when their model bundles exist on disk. Default install ships text-only — image and audio files fall back to Tier 1 heuristics when the multimodal bundles aren't installed. Fetch them with `cargo xtask download-models --multimodal`. Wired identically into both CLI and UI `ServiceContext`. **Both scan and migration use it**: scan ranks against per-modality taxonomies; migration ranks against per-folder centroids the profiler builds from a bounded sample of each target folder — text `content_centroid` always, plus image/audio centroids when those bundles are installed — each in its own latent space, never cross-compared
+- **Model-integrity verification**: `cargo xtask download-models` and the runtime loader share one `BundleSpec` source of truth (`tidyup-embeddings-ort::install`); downloads are checksum-verified (pinned BLAKE3 enforced and a corrupt file deleted; unpinned digests reported so they can be pinned), and `cargo xtask verify-models` checks an install against those specs on demand
 - **Classification eval harness** (`cargo xtask eval`): a labeled golden corpus under `xtask/corpus/` plus a metrics runner reporting overall accuracy, per-label precision/recall/F1, tier coverage, Tier-1 regressions, and confusions (`--json` for machine output). Tier-1 heuristics are scored with no model, so the harness is meaningful in CI; Tier-2 embedding scoring runs automatically when the `bge-small-en-v1.5` bundle is installed, otherwise content-dependent entries are reported as deferred. This is the measurement foundation for confidence calibration — it deliberately stays out of `cargo xtask ci` (which must run model-free)
 
 **What does not yet work:**

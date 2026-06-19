@@ -30,13 +30,31 @@ pub struct ArtifactSpec {
     pub blake3_hex: &'static str,
 }
 
+/// A named bundle of model artifacts that install + verify operate on as a unit.
+///
+/// The single source of truth for which files a bundle needs, where they live,
+/// and what they should hash to — shared by the runtime verifier and the
+/// `cargo xtask download-models` / `verify-models` tooling so the two cannot
+/// drift.
+#[derive(Debug, Clone, Copy)]
+pub struct BundleSpec {
+    /// Human-readable bundle name, for logs and instructions.
+    pub name: &'static str,
+    /// Subdirectory under the model cache that holds the bundle's files.
+    pub dir: &'static str,
+    /// The artifacts that make up the bundle.
+    pub artifacts: &'static [ArtifactSpec],
+}
+
 /// The default embedding model bundle: `bge-small-en-v1.5` ONNX + its
 /// tokenizer.
 ///
-/// URLs point at the canonical Hugging Face artifacts. Size and checksum are
-/// placeholders until the tooling that populates them lands; `verify_artifact`
-/// skips hash comparison when `blake3_hex` is empty so placeholder values
-/// don't break user builds while the model pipeline is wired up.
+/// URLs point at the canonical Hugging Face artifacts. The `size_bytes` /
+/// `blake3_hex` fields are unpinned (`0` / empty) by default; [`verify_artifact`]
+/// skips those checks when unset, so unpinned specs never break installs. To
+/// pin: run `cargo xtask download-models`, which prints each file's BLAKE3 + size,
+/// then paste them here — ideally after switching the URL to an immutable
+/// `resolve/<commit-sha>/` revision so the pin stays valid.
 pub const DEFAULT_MODEL_DIR: &str = "bge-small-en-v1.5";
 
 /// ONNX encoder weights.
@@ -53,6 +71,17 @@ pub const DEFAULT_TOKENIZER_ARTIFACT: ArtifactSpec = ArtifactSpec {
     url: "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/tokenizer.json",
     size_bytes: 0,
     blake3_hex: "",
+};
+
+/// Every artifact in the default embedding bundle, in install order.
+pub const DEFAULT_ARTIFACTS: &[ArtifactSpec] =
+    &[DEFAULT_MODEL_ARTIFACT, DEFAULT_TOKENIZER_ARTIFACT];
+
+/// The default embedding bundle (`bge-small-en-v1.5`).
+pub const DEFAULT_BUNDLE: BundleSpec = BundleSpec {
+    name: "bge-small-en-v1.5",
+    dir: DEFAULT_MODEL_DIR,
+    artifacts: DEFAULT_ARTIFACTS,
 };
 
 /// The model subdirectory inside the platform cache.
@@ -97,24 +126,51 @@ pub fn verify_artifact(path: &Path, spec: &ArtifactSpec) -> Result<()> {
     Ok(())
 }
 
+/// Compute the BLAKE3 hex digest and byte size of a file on disk.
+///
+/// Used by installer tooling to report the values a maintainer should pin into
+/// the [`ArtifactSpec`]s (via `cargo xtask download-models`), and by
+/// `verify-models` for diagnostics. Unlike [`verify_artifact`] — which is lazy
+/// and only hashes when a digest is pinned — this always reads the whole file,
+/// so reserve it for tooling, not the hot binary-load path.
+///
+/// # Errors
+/// I/O failure reading the file.
+pub fn artifact_digest(path: &Path) -> Result<(String, u64)> {
+    let size = std::fs::metadata(path)
+        .with_context(|| format!("stat {}", path.display()))?
+        .len();
+    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let hash = blake3::hash(&bytes).to_hex().to_string();
+    Ok((hash, size))
+}
+
+/// Verify every artifact in `bundle` against its on-disk file under the model
+/// cache. Returns the bundle directory on success.
+///
+/// # Errors
+/// Platform cache unavailable, or any artifact missing / wrong size /
+/// mismatched checksum (the first failure short-circuits via
+/// [`verify_artifact`]).
+pub fn verify_bundle(bundle: &BundleSpec) -> Result<PathBuf> {
+    let dir = crate::paths::model_cache_dir()
+        .ok_or_else(|| {
+            anyhow::anyhow!("platform cache directory unavailable; set TIDYUP_MODEL_CACHE")
+        })?
+        .join(bundle.dir);
+    for spec in bundle.artifacts {
+        verify_artifact(&dir.join(spec.filename), spec)?;
+    }
+    Ok(dir)
+}
+
 /// Verify that every artifact for the default model bundle is present and
 /// intact. Returns the bundle directory on success.
 ///
 /// # Errors
-/// See [`verify_artifact`]; the first failure short-circuits.
+/// See [`verify_bundle`].
 pub fn verify_default_model() -> Result<PathBuf> {
-    let dir = default_model_directory().ok_or_else(|| {
-        anyhow::anyhow!("platform cache directory unavailable; set TIDYUP_MODEL_CACHE")
-    })?;
-    verify_artifact(
-        &dir.join(DEFAULT_MODEL_ARTIFACT.filename),
-        &DEFAULT_MODEL_ARTIFACT,
-    )?;
-    verify_artifact(
-        &dir.join(DEFAULT_TOKENIZER_ARTIFACT.filename),
-        &DEFAULT_TOKENIZER_ARTIFACT,
-    )?;
-    Ok(dir)
+    verify_bundle(&DEFAULT_BUNDLE)
 }
 
 /// Human-readable instructions for installing the default model bundle by
@@ -164,30 +220,27 @@ pub const SIGLIP_TOKENIZER_ARTIFACT: ArtifactSpec = ArtifactSpec {
     blake3_hex: "",
 };
 
+/// Every artifact in the `SigLIP` image bundle, in install order.
+pub const SIGLIP_ARTIFACTS: &[ArtifactSpec] = &[
+    SIGLIP_VISION_ARTIFACT,
+    SIGLIP_TEXT_ARTIFACT,
+    SIGLIP_TOKENIZER_ARTIFACT,
+];
+
+/// The optional `SigLIP` image bundle.
+pub const SIGLIP_BUNDLE: BundleSpec = BundleSpec {
+    name: "siglip-base-patch16-224",
+    dir: crate::paths::SIGLIP_DIR,
+    artifacts: SIGLIP_ARTIFACTS,
+};
+
 /// Verify the `SigLIP` bundle is present. Returns the bundle directory on
 /// success.
 ///
 /// # Errors
-/// Surfaces missing-artifact errors via [`verify_artifact`].
+/// Surfaces missing-artifact errors via [`verify_bundle`].
 pub fn verify_siglip_model() -> Result<PathBuf> {
-    let dir = crate::paths::model_cache_dir()
-        .ok_or_else(|| {
-            anyhow::anyhow!("platform cache directory unavailable; set TIDYUP_MODEL_CACHE")
-        })?
-        .join(crate::paths::SIGLIP_DIR);
-    verify_artifact(
-        &dir.join(SIGLIP_VISION_ARTIFACT.filename),
-        &SIGLIP_VISION_ARTIFACT,
-    )?;
-    verify_artifact(
-        &dir.join(SIGLIP_TEXT_ARTIFACT.filename),
-        &SIGLIP_TEXT_ARTIFACT,
-    )?;
-    verify_artifact(
-        &dir.join(SIGLIP_TOKENIZER_ARTIFACT.filename),
-        &SIGLIP_TOKENIZER_ARTIFACT,
-    )?;
-    Ok(dir)
+    verify_bundle(&SIGLIP_BUNDLE)
 }
 
 /// User-facing instructions for installing the `SigLIP` bundle by hand.
@@ -243,26 +296,26 @@ pub const CLAP_TOKENIZER_ARTIFACT: ArtifactSpec = ArtifactSpec {
     blake3_hex: "",
 };
 
+/// Every artifact in the `CLAP` audio bundle, in install order.
+pub const CLAP_ARTIFACTS: &[ArtifactSpec] = &[
+    CLAP_AUDIO_ARTIFACT,
+    CLAP_TEXT_ARTIFACT,
+    CLAP_TOKENIZER_ARTIFACT,
+];
+
+/// The optional `CLAP` audio bundle.
+pub const CLAP_BUNDLE: BundleSpec = BundleSpec {
+    name: "clap-htsat-unfused",
+    dir: crate::paths::CLAP_DIR,
+    artifacts: CLAP_ARTIFACTS,
+};
+
 /// Verify the `CLAP` bundle is present. Returns the bundle directory on success.
 ///
 /// # Errors
-/// Surfaces missing-artifact errors via [`verify_artifact`].
+/// Surfaces missing-artifact errors via [`verify_bundle`].
 pub fn verify_clap_model() -> Result<PathBuf> {
-    let dir = crate::paths::model_cache_dir()
-        .ok_or_else(|| {
-            anyhow::anyhow!("platform cache directory unavailable; set TIDYUP_MODEL_CACHE")
-        })?
-        .join(crate::paths::CLAP_DIR);
-    verify_artifact(
-        &dir.join(CLAP_AUDIO_ARTIFACT.filename),
-        &CLAP_AUDIO_ARTIFACT,
-    )?;
-    verify_artifact(&dir.join(CLAP_TEXT_ARTIFACT.filename), &CLAP_TEXT_ARTIFACT)?;
-    verify_artifact(
-        &dir.join(CLAP_TOKENIZER_ARTIFACT.filename),
-        &CLAP_TOKENIZER_ARTIFACT,
-    )?;
-    Ok(dir)
+    verify_bundle(&CLAP_BUNDLE)
 }
 
 /// User-facing instructions for installing the `CLAP` bundle by hand.
@@ -352,5 +405,45 @@ mod tests {
         assert!(msg.contains("model.onnx"));
         assert!(msg.contains("tokenizer.json"));
         assert!(msg.contains("bge-small-en-v1.5"));
+    }
+
+    #[test]
+    fn artifact_digest_reports_hash_and_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob.bin");
+        std::fs::write(&path, b"tidyup integrity").unwrap();
+        let (hash, size) = artifact_digest(&path).unwrap();
+        assert_eq!(size, 16);
+        assert_eq!(hash, blake3::hash(b"tidyup integrity").to_hex().to_string());
+    }
+
+    #[test]
+    fn default_bundle_is_consistent() {
+        assert_eq!(DEFAULT_BUNDLE.dir, DEFAULT_MODEL_DIR);
+        assert_eq!(DEFAULT_BUNDLE.artifacts.len(), 2);
+        let names: Vec<_> = DEFAULT_BUNDLE
+            .artifacts
+            .iter()
+            .map(|a| a.filename)
+            .collect();
+        assert!(names.contains(&"model.onnx"));
+        assert!(names.contains(&"tokenizer.json"));
+    }
+
+    #[test]
+    fn every_bundle_artifact_is_a_huggingface_url() {
+        assert_eq!(SIGLIP_BUNDLE.artifacts.len(), 3);
+        assert_eq!(CLAP_BUNDLE.artifacts.len(), 3);
+        for bundle in [DEFAULT_BUNDLE, SIGLIP_BUNDLE, CLAP_BUNDLE] {
+            assert!(!bundle.dir.is_empty());
+            for spec in bundle.artifacts {
+                assert!(
+                    spec.url.starts_with("https://huggingface.co/"),
+                    "non-HF url: {}",
+                    spec.url,
+                );
+                assert!(!spec.filename.is_empty());
+            }
+        }
     }
 }

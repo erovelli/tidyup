@@ -33,6 +33,11 @@ cargo xtask feature-matrix  # requires: cargo install cargo-hack
 cargo xtask eval
 cargo xtask eval --json
 
+# Fetch model bundles (download verifies each file: pinned BLAKE3 enforced,
+# unpinned digests printed to pin). Then check an install on demand.
+cargo xtask download-models [--siglip --clap | --multimodal]
+cargo xtask verify-models   [--siglip --clap | --multimodal]
+
 # Single crate / single test
 cargo check -p tidyup-domain
 cargo test  -p tidyup-pipeline

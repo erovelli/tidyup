@@ -10602,6 +10602,7 @@ dependencies = [
  "reqwest 0.13.2",
  "serde",
  "serde_json",
+ "tempfile",
  "tidyup-embeddings-ort",
  "tidyup-pipeline",
  "tokio",
