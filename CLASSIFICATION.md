@@ -54,6 +54,14 @@ the profiler (see "Migration-mode multimodal centroids" below). Video still
 routes through Tier 1 heuristics — keyframe extraction is gated on the
 `ffmpeg-next` FFI decision.
 
+The scan-mode text taxonomy is the built-in `default_taxonomy()` unless the user
+supplies their own with `scan --taxonomy <file.toml>` — an array of validated
+`[[entry]]` tables (`path` must end with `/`, `description`, optional
+`temporal`), loaded by `load_taxonomy_file` and embedded in place of the default.
+The disk embedding cache is keyed by description hash, so a custom taxonomy
+simply misses the default cache and embeds fresh; image/audio taxonomies are
+unaffected (they remain the per-modality defaults).
+
 | Modality | Default handling | Phase 7 (opt-in) | Post-Phase-7 |
 |---|---|---|---|
 | Text (pdf / docx / md / source / ipynb) | Tier 2 via `bge-small-en-v1.5` | — | — |

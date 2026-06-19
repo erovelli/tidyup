@@ -7,10 +7,12 @@ use tidyup_app::config;
 use tidyup_app::{
     migration::MigrationRequest, scan::ScanRequest, MigrationService, RollbackService, ScanService,
 };
+use tidyup_core::frontend::{Level, ProgressReporter};
 
 use crate::context::{
-    build, build_audio_scan_candidates, build_default_scan_candidates, build_image_scan_candidates,
-    describe_data_dir, InferenceActivation,
+    build, build_audio_scan_candidates, build_custom_scan_candidates,
+    build_default_scan_candidates, build_image_scan_candidates, describe_data_dir,
+    InferenceActivation,
 };
 use crate::reporter::CliReporter;
 use crate::review::{AutoApproveHandler, InteractiveHandler};
@@ -122,7 +124,20 @@ async fn run_scan(
     let reporter = CliReporter::new(json);
     let reviewer = reviewer_for(yes);
 
-    let candidates = build_default_scan_candidates(ctx.embeddings.as_ref()).await?;
+    // A `--taxonomy <file>` overrides the built-in taxonomy for the text tier.
+    // Image/audio candidates always use the default per-modality taxonomies.
+    let candidates = match taxonomy.as_deref() {
+        Some(path) => {
+            reporter
+                .message(
+                    Level::Info,
+                    &format!("using custom taxonomy from {}", path.display()),
+                )
+                .await;
+            build_custom_scan_candidates(path, ctx.embeddings.as_ref()).await?
+        }
+        None => build_default_scan_candidates(ctx.embeddings.as_ref()).await?,
+    };
     let image_candidates = build_image_scan_candidates(ctx.image_embeddings.as_deref()).await?;
     let audio_candidates = build_audio_scan_candidates(ctx.audio_embeddings.as_deref()).await?;
 

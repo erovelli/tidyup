@@ -8459,6 +8459,7 @@ dependencies = [
  "tidyup-domain",
  "tokenizers 0.21.4",
  "tokio",
+ "toml 1.1.2+spec-1.1.0",
  "tracing",
 ]
 

@@ -74,6 +74,10 @@ enum Command {
     /// Classify files in place against a taxonomy.
     Scan {
         root: std::path::PathBuf,
+        /// Path to a custom taxonomy TOML file (array of `[[entry]]` tables with
+        /// `path`, `description`, optional `temporal`). Overrides the built-in
+        /// text taxonomy; image/audio taxonomies stay default. Omit to use the
+        /// built-in taxonomy.
         #[arg(long)]
         taxonomy: Option<std::path::PathBuf>,
         #[arg(long)]

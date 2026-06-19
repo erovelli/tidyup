@@ -14,7 +14,7 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 /// A single leaf in the default taxonomy tree.
@@ -87,6 +87,85 @@ impl TaxonomyCache {
             .with_context(|| format!("write taxonomy cache to {}", path.display()))?;
         Ok(())
     }
+}
+
+/// An owned taxonomy entry loaded from a user-provided file.
+///
+/// Mirrors [`TaxonomyEntry`] but owns its strings, since it comes from disk
+/// rather than compile-time constants. Produced by [`load_taxonomy_file`] and
+/// consumed by scan mode's `--taxonomy <file>` flag.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct OwnedTaxonomyEntry {
+    /// Target folder path (e.g. `"Finance/Taxes/"`). Must end with `'/'`.
+    pub path: String,
+    /// Rich description used to compute the category embedding.
+    pub description: String,
+    /// Whether to append a year subdirectory when a year is found. Optional in
+    /// the file; defaults to `false`.
+    #[serde(default)]
+    pub temporal: bool,
+}
+
+/// TOML envelope: a custom taxonomy file is an array of `[[entry]]` tables.
+#[derive(Debug, Deserialize)]
+struct TaxonomyFile {
+    #[serde(rename = "entry")]
+    entries: Vec<OwnedTaxonomyEntry>,
+}
+
+/// Load and validate a custom taxonomy from a TOML file.
+///
+/// The format mirrors the eval corpus manifest: an array of `[[entry]]` tables,
+/// each with a `path` (must end with `'/'`), a `description`, and an optional
+/// `temporal` boolean. Example:
+///
+/// ```toml
+/// [[entry]]
+/// path = "Invoices/"
+/// description = "supplier invoice billing amount due payment terms"
+/// temporal = true
+/// ```
+///
+/// # Errors
+/// Fails if the file is unreadable, the TOML doesn't parse, the taxonomy is
+/// empty, or any entry has an empty / non-`/`-terminated path or empty
+/// description.
+pub fn load_taxonomy_file(path: &Path) -> Result<Vec<OwnedTaxonomyEntry>> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("read taxonomy file {}", path.display()))?;
+    parse_taxonomy(&text).with_context(|| format!("invalid taxonomy file {}", path.display()))
+}
+
+/// Parse + validate a taxonomy from TOML text. Split from [`load_taxonomy_file`]
+/// so the parse/validation logic is unit-testable without touching the disk.
+fn parse_taxonomy(text: &str) -> Result<Vec<OwnedTaxonomyEntry>> {
+    let parsed: TaxonomyFile = toml::from_str(text).context("parse taxonomy TOML")?;
+    validate_taxonomy(&parsed.entries)?;
+    Ok(parsed.entries)
+}
+
+/// Enforce the taxonomy invariants the scan pipeline relies on: at least one
+/// entry, every `path` non-empty and `'/'`-terminated, every `description`
+/// non-empty.
+fn validate_taxonomy(entries: &[OwnedTaxonomyEntry]) -> Result<()> {
+    if entries.is_empty() {
+        bail!("taxonomy must contain at least one [[entry]]");
+    }
+    for (i, entry) in entries.iter().enumerate() {
+        if entry.path.trim().is_empty() {
+            bail!("entry {i}: path is empty");
+        }
+        if !entry.path.ends_with('/') {
+            bail!(
+                "entry {i}: path {:?} must end with '/' (it names a target folder)",
+                entry.path
+            );
+        }
+        if entry.description.trim().is_empty() {
+            bail!("entry {i} ({}): description is empty", entry.path);
+        }
+    }
+    Ok(())
 }
 
 /// Default hierarchical taxonomy. Each entry is a leaf in the folder tree.
@@ -521,6 +600,74 @@ mod tests {
     #[test]
     fn taxonomy_has_entries() {
         assert!(default_taxonomy().len() >= 50);
+    }
+
+    #[test]
+    fn parse_taxonomy_accepts_a_valid_file() {
+        let text = r#"
+            [[entry]]
+            path = "Invoices/"
+            description = "supplier invoice billing amount due"
+            temporal = true
+
+            [[entry]]
+            path = "Photos/"
+            description = "personal photographs and snapshots"
+        "#;
+        let entries = parse_taxonomy(text).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].path, "Invoices/");
+        assert!(entries[0].temporal);
+        // `temporal` is optional and defaults to false.
+        assert!(!entries[1].temporal);
+    }
+
+    #[test]
+    fn parse_taxonomy_rejects_empty() {
+        // No entries at all.
+        assert!(parse_taxonomy("").is_err());
+        assert!(parse_taxonomy("# just a comment\n").is_err());
+    }
+
+    #[test]
+    fn parse_taxonomy_rejects_path_without_trailing_slash() {
+        let text = r#"
+            [[entry]]
+            path = "Invoices"
+            description = "missing the trailing slash"
+        "#;
+        let err = parse_taxonomy(text).unwrap_err().to_string();
+        assert!(err.contains("must end with '/'"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_taxonomy_rejects_empty_description() {
+        let text = r#"
+            [[entry]]
+            path = "Invoices/"
+            description = "   "
+        "#;
+        assert!(parse_taxonomy(text).is_err());
+    }
+
+    #[test]
+    fn load_taxonomy_file_reads_from_disk() {
+        use std::io::Write as _;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            f,
+            "[[entry]]\npath = \"Recipes/\"\ndescription = \"cooking recipe ingredients\"\n"
+        )
+        .unwrap();
+        let entries = load_taxonomy_file(f.path()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "Recipes/");
+    }
+
+    #[test]
+    fn load_taxonomy_file_missing_path_errors() {
+        let err = load_taxonomy_file(Path::new("/no/such/taxonomy.toml")).unwrap_err();
+        assert!(err.to_string().contains("read taxonomy file"));
     }
 
     #[test]
