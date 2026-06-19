@@ -1,11 +1,60 @@
 name: Release
-# Placeholder. Run `cargo dist init` to generate a real release workflow targeting
-# Homebrew, winget, and GitHub Releases. Intentionally stubbed so contributors see
-# the release story without commiting a mis-configured pipeline.
+
+# Tag-triggered binary releases for the default `tidyup` CLI.
+#
+# The binary is built with DEFAULT FEATURES ONLY — no `--features` — so every
+# published artifact has no HTTP client and no LLM inference linked, matching the
+# privacy guarantee enforced by `cargo xtask check-privacy`. The embedding model
+# is intentionally NOT bundled (it is fetched out-of-band; the binary has no
+# network code path and cannot download anything). The desktop UI
+# (`tidyup-desktop`) is not packaged here — its app-bundle + code-signing story
+# is tracked separately in the roadmap.
+#
+# Tag a release with `vMAJOR.MINOR.PATCH` (e.g. `v0.1.0`) to trigger.
+
 on:
-  workflow_dispatch:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+*"
+
+permissions:
+  contents: write
+
 jobs:
-  noop:
+  create-release:
     runs-on: ubuntu-latest
     steps:
-      - run: echo "Run 'cargo dist init' locally to generate this workflow."
+      - uses: actions/checkout@v6
+      - uses: taiki-e/create-gh-release-action@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  upload-assets:
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      # `bin: tidyup` builds only the CLI binary target with default features —
+      # `tidyup-ui` is not in its dependency graph, so no GTK/WebKit is needed on
+      # the Linux runner. The archive carries the binary + license + readme.
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: tidyup
+          target: ${{ matrix.target }}
+          archive: $bin-$tag-$target
+          include: LICENSE,README.md
+          leading-dir: true
+          checksum: sha256
+          token: ${{ secrets.GITHUB_TOKEN }}
