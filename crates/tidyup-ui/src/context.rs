@@ -6,10 +6,15 @@
 //!
 //! # Privacy gates
 //!
-//! Same two-gate model as the CLI: power-user inference backends enter the
-//! UI binary at compile-time via cargo features (none wired yet — the UI
-//! ships with the default embedding-only path) and require per-invocation
-//! activation at runtime. See `CLAUDE.md` → "Privacy model".
+//! Same triple-gated model as the CLI for Tier 3 LLM fallback: the
+//! `llm-fallback` cargo feature must be compiled in (gate 1), `[inference]
+//! llm_fallback = true` must be set in config (gate 2), and the per-invocation
+//! [`InferenceActivation`] — sourced from the Settings session toggle — must
+//! request it (gate 3). With the default activation the context's
+//! [`text`](tidyup_app::ServiceContext::text) field is `None` and Tier 3 is
+//! never invoked, identical to a default build with no feature compiled in. The
+//! UI deliberately does not surface the `remote` backend; that stays CLI-only.
+//! See `CLAUDE.md` → "Privacy model".
 
 use std::sync::Arc;
 
@@ -17,12 +22,27 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use tidyup_app::config::{resolve_data_dir, TidyupConfig};
 use tidyup_app::ServiceContext;
-use tidyup_core::inference::{AudioEmbeddingBackend, ImageEmbeddingBackend};
+use tidyup_core::inference::{AudioEmbeddingBackend, ImageEmbeddingBackend, TextBackend};
 use tidyup_embeddings_ort::{
     installation_instructions, verify_clap_model, verify_default_model, verify_siglip_model,
     ClapEmbeddings, OrtEmbeddings, SigLipEmbeddings,
 };
 use tidyup_storage_sqlite::SqliteStore;
+
+/// Per-invocation inference activation gate — the UI mirror of the CLI's
+/// struct of the same name.
+///
+/// Only a build with the `llm-fallback` feature can meaningfully set
+/// `llm_fallback = true`; with the default activation (all-false) the
+/// [`ServiceContext::text`] field is `None` and Tier 3 stays off. The UI sources
+/// this from the Settings session toggle, which is itself gated on the cargo
+/// feature + the config bool, so the three gates align before this is ever
+/// `true`.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct InferenceActivation {
+    /// Triple-gated activation for the local LLM fallback (mistralrs).
+    pub llm_fallback: bool,
+}
 
 /// Build a ready-to-use [`ServiceContext`] against the local data dir.
 ///
@@ -30,9 +50,14 @@ use tidyup_storage_sqlite::SqliteStore;
 /// instructions if the embedding model is missing. `strict_model = false`
 /// (rollback / runs-listing path) falls back to a null embedding backend so
 /// the UI can still browse run history without a model.
+///
+/// `activation` carries the per-invocation Tier 3 gate. When `llm_fallback` is
+/// `false` (the default) the [`ServiceContext::text`] field is `None`. The
+/// rollback / runs path passes the default activation since it never classifies.
 pub(crate) async fn build(
     config: &TidyupConfig,
     strict_model: bool,
+    activation: InferenceActivation,
 ) -> Result<Arc<ServiceContext>> {
     let data_dir = resolve_data_dir(&config.storage)?;
     std::fs::create_dir_all(&data_dir)
@@ -61,6 +86,11 @@ pub(crate) async fn build(
     let image_embeddings = try_load_siglip();
     let audio_embeddings = try_load_clap();
 
+    // Tier 3 text backend, loaded sequentially after the embedding model per the
+    // CLAUDE.md operational rule (concurrent model loads OOM on 8GB hosts). Stays
+    // `None` unless all three privacy gates align — see `build_text_backend`.
+    let text = build_text_backend(config, activation).await?;
+
     let extractors = default_extractors();
 
     Ok(Arc::new(ServiceContext {
@@ -68,16 +98,53 @@ pub(crate) async fn build(
         change_log: Arc::new(store.clone()),
         backup_store: Arc::new(store.clone()),
         run_log: Arc::new(store),
-        // The UI has no Tier 3 activation surface yet — keeping `text: None`
-        // upholds the privacy model (no per-invocation gate => no Tier 3).
-        // A settings-page toggle is the natural next step.
-        text: None,
+        text,
         embeddings,
         vision: None,
         image_embeddings,
         audio_embeddings,
         extractors,
     }))
+}
+
+/// Build the optional Tier 3 [`TextBackend`] from the per-invocation activation
+/// and config. Returns `Ok(None)` for the privacy-preserving case where the
+/// activation gate doesn't fire. Mirrors the CLI's `build_text_backend` (without
+/// the remote branch, which the UI does not surface).
+async fn build_text_backend(
+    config: &TidyupConfig,
+    activation: InferenceActivation,
+) -> Result<Option<Arc<dyn TextBackend>>> {
+    if activation.llm_fallback {
+        return build_llm_backend(config).await.map(Some);
+    }
+    Ok(None)
+}
+
+#[cfg(feature = "llm-fallback")]
+async fn build_llm_backend(config: &TidyupConfig) -> Result<Arc<dyn TextBackend>> {
+    if !config.inference.llm_fallback {
+        return Err(anyhow!(
+            "Tier 3 was requested but [inference] llm_fallback is false in config; \
+             the privacy model requires both to enable Tier 3 LLM fallback"
+        ));
+    }
+    let model_id = "Qwen/Qwen3-0.6B";
+    tracing::info!(model_id, "loading mistralrs text backend (Tier 3)");
+    let engine = tidyup_inference_mistralrs::MistralRsEngine::load(model_id)
+        .await
+        .context("loading mistralrs Tier 3 backend")?;
+    Ok(engine as Arc<dyn TextBackend>)
+}
+
+#[cfg(not(feature = "llm-fallback"))]
+#[allow(clippy::unused_async)] // signature mirrors the feature-on variant
+async fn build_llm_backend(_config: &TidyupConfig) -> Result<Arc<dyn TextBackend>> {
+    Err(anyhow!(
+        "Tier 3 LLM fallback was requested but this desktop build was compiled \
+         without the `llm-fallback` feature.\n\
+         Rebuild with: cargo build --release -p tidyup-ui --features llm-fallback"
+    ))
 }
 
 fn try_load_siglip() -> Option<Arc<dyn ImageEmbeddingBackend>> {

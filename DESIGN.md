@@ -70,6 +70,11 @@ In this system, elevation is a product of light and shadow, not lines.
 *   Small, pill-shaped (`full` roundedness) containers. Use the Tier colors defined in Section 2.
 *   Typography: `label-sm` in Semi-Bold to ensure the status is readable against the soft background.
 
+### Power-User Gates (Settings)
+*   **Purpose:** Surface opt-in capabilities (e.g. the Tier 3 LLM-fallback toggle) without ever *recommending* them. These live on the Settings page as their own card, never on the primary scan/migrate flow.
+*   **Honest disabled states:** When a gate is unavailable (feature not compiled, or config bool unset), render the control **disabled** with a plain-language status line explaining exactly which gate is missing and how to satisfy it — never hide the control silently, and never let it appear actionable when it isn't. The control only becomes enabled when *all* upstream gates are satisfied.
+*   **State, not persistence:** A per-session toggle reflects runtime activation only; it does not write config. Use the Primary button style when active, Secondary when inactive, so the current state reads at a glance.
+
 ---
 
 ## 6. Do’s and Don’ts
