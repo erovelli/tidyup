@@ -108,8 +108,8 @@ pub(crate) async fn build(
 }
 
 /// Build the optional Tier 3 [`TextBackend`] from the per-invocation activation
-/// + config. Returns `Ok(None)` for the privacy-preserving case where the
-/// activation gate doesn't fire. Mirrors the CLI's `build_text_backend` (minus
+/// and config. Returns `Ok(None)` for the privacy-preserving case where the
+/// activation gate doesn't fire. Mirrors the CLI's `build_text_backend` (without
 /// the remote branch, which the UI does not surface).
 async fn build_text_backend(
     config: &TidyupConfig,
