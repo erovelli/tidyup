@@ -23,7 +23,9 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use tidyup_domain::Calibration;
 use tidyup_embeddings_ort::{verify_default_model, EmbeddingClassifier, OrtEmbeddings};
+use tidyup_pipeline::calibration::{expected_calibration_error, fit_platt};
 use tidyup_pipeline::heuristics;
 
 /// The cascade tier that produced a prediction.
@@ -65,6 +67,9 @@ struct Outcome {
     /// heuristic regressions (a `tier1 = true` entry that did not land at
     /// Tier 1).
     expected_tier1: bool,
+    /// Raw confidence the producing tier assigned (`None` when unresolved).
+    /// Feeds `--calibrate`.
+    confidence: Option<f32>,
 }
 
 impl Outcome {
@@ -94,6 +99,21 @@ struct LabelMetric {
     f1: f64,
 }
 
+/// Fitted confidence calibration over the corpus (`--calibrate`).
+#[derive(Debug, Clone, Serialize)]
+struct CalibrationReport {
+    /// Resolved samples the calibrator was fit over.
+    samples: usize,
+    /// `"identity"` or `"platt"`.
+    fit: &'static str,
+    a: Option<f64>,
+    b: Option<f64>,
+    /// Expected Calibration Error of the raw scores (identity).
+    ece_raw: f32,
+    /// ECE after applying the fitted calibrator.
+    ece_calibrated: f32,
+}
+
 /// The full evaluation report. Serializable for `--json`.
 #[derive(Debug, Clone, Serialize)]
 struct Report {
@@ -116,6 +136,9 @@ struct Report {
     per_label: BTreeMap<String, LabelMetric>,
     /// `"Expected -> Predicted"` => count, for the mispredictions.
     confusions: BTreeMap<String, usize>,
+    /// Fitted calibration, present only with `--calibrate`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    calibration: Option<CalibrationReport>,
 }
 
 /// Entry point for `cargo xtask eval`.
@@ -127,13 +150,16 @@ struct Report {
 /// # Errors
 /// Propagates corpus-loading, model-loading, or classification failures.
 #[allow(unreachable_pub)]
-pub fn run(json: bool, no_model: bool) -> Result<()> {
+pub fn run(json: bool, no_model: bool, calibrate: bool) -> Result<()> {
     let dir = corpus_dir();
     let entries = load_manifest(&dir)?;
     let use_model = !no_model && verify_default_model().is_ok();
 
     let outcomes = classify_corpus(&dir, &entries, use_model)?;
-    let report = summarize(&outcomes);
+    let mut report = summarize(&outcomes);
+    if calibrate {
+        report.calibration = Some(compute_calibration(&outcomes));
+    }
 
     if json {
         let text = serde_json::to_string_pretty(&report).context("serialize report to JSON")?;
@@ -174,6 +200,7 @@ fn classify_corpus(dir: &Path, entries: &[CorpusEntry], use_model: bool) -> Resu
                 predicted: Some(hit.taxonomy_path.to_string()),
                 tier: Tier::Heuristic,
                 expected_tier1: entry.tier1,
+                confidence: Some(hit.confidence),
             });
         } else {
             outcomes.push(Outcome {
@@ -181,6 +208,7 @@ fn classify_corpus(dir: &Path, entries: &[CorpusEntry], use_model: bool) -> Resu
                 predicted: None,
                 tier: Tier::Unresolved,
                 expected_tier1: entry.tier1,
+                confidence: None,
             });
             pending.push(idx);
         }
@@ -227,6 +255,7 @@ fn run_embedding_pass(
                 predicted: Some(result.folder),
                 tier: Tier::Embedding,
                 expected_tier1: entries[idx].tier1,
+                confidence: Some(result.confidence),
             };
         }
         Ok::<(), anyhow::Error>(())
@@ -343,6 +372,31 @@ fn summarize(outcomes: &[Outcome]) -> Report {
         macro_f1: sum_f / denom,
         per_label,
         confusions,
+        calibration: None,
+    }
+}
+
+/// Fit a Platt calibrator over the resolved `(confidence, correct)` samples and
+/// measure ECE before/after. Filled only under `--calibrate`.
+fn compute_calibration(outcomes: &[Outcome]) -> CalibrationReport {
+    let samples: Vec<(f32, bool)> = outcomes
+        .iter()
+        .filter_map(|o| o.confidence.map(|c| (c, o.is_correct())))
+        .collect();
+    let ece_raw = expected_calibration_error(&samples, &Calibration::Identity, 10);
+    let fitted = fit_platt(&samples);
+    let ece_calibrated = expected_calibration_error(&samples, &fitted, 10);
+    let (fit, a, b) = match fitted {
+        Calibration::Identity => ("identity", None, None),
+        Calibration::Platt { a, b } => ("platt", Some(a), Some(b)),
+    };
+    CalibrationReport {
+        samples: samples.len(),
+        fit,
+        a,
+        b,
+        ece_raw,
+        ece_calibrated,
     }
 }
 
@@ -429,6 +483,26 @@ fn print_report(report: &Report, use_model: bool) {
             println!("    {count:>3}x  {pair}");
         }
     }
+
+    if let Some(cal) = &report.calibration {
+        println!(
+            "\n  calibration (Platt scaling over {} samples):",
+            cal.samples
+        );
+        match (cal.a, cal.b) {
+            (Some(a), Some(b)) => println!("    fit: sigmoid({a:.4} * score + {b:.4})"),
+            _ => println!("    fit: identity (degenerate — single class or too few samples)"),
+        }
+        println!(
+            "    ECE: {:.4} (raw) -> {:.4} (calibrated)",
+            cal.ece_raw, cal.ece_calibrated,
+        );
+        if !use_model {
+            println!(
+                "    note: model absent — fit over Tier-1 samples only; install the bundle for a real fit"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -442,6 +516,17 @@ mod tests {
             predicted: predicted.map(ToString::to_string),
             tier,
             expected_tier1: false,
+            confidence: None,
+        }
+    }
+
+    fn outcome_conf(expected: &str, predicted: Option<&str>, confidence: f32) -> Outcome {
+        Outcome {
+            expected: expected.to_string(),
+            predicted: predicted.map(ToString::to_string),
+            tier: Tier::Embedding,
+            expected_tier1: false,
+            confidence: Some(confidence),
         }
     }
 
@@ -523,15 +608,32 @@ mod tests {
             predicted: Some("Code/".to_string()),
             tier: Tier::Embedding,
             expected_tier1: true,
+            confidence: Some(0.4),
         };
         let healthy = Outcome {
             expected: "Music/".to_string(),
             predicted: Some("Music/".to_string()),
             tier: Tier::Heuristic,
             expected_tier1: true,
+            confidence: Some(0.95),
         };
         let report = summarize(&[regressed, healthy]);
         assert_eq!(report.tier1_regressions, 1);
+    }
+
+    #[test]
+    fn compute_calibration_reports_ece_and_fit() {
+        // Mixed outcomes -> a fittable two-class set.
+        let outcomes = vec![
+            outcome_conf("Code/", Some("Code/"), 0.9),
+            outcome_conf("Music/", Some("Music/"), 0.85),
+            outcome_conf("Recipes/", Some("Finance/Taxes/"), 0.4), // wrong
+            outcome_conf("School/Notes/", Some("Work/Career/"), 0.3), // wrong
+        ];
+        let cal = compute_calibration(&outcomes);
+        assert_eq!(cal.samples, 4);
+        assert!((0.0..=1.0).contains(&cal.ece_raw));
+        assert!((0.0..=1.0).contains(&cal.ece_calibrated));
     }
 
     // ---- corpus integrity (model-free, runs in CI) -------------------------

@@ -10603,6 +10603,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tidyup-domain",
  "tidyup-embeddings-ort",
  "tidyup-pipeline",
  "tokio",

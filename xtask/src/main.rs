@@ -89,6 +89,10 @@ enum Task {
         /// Skip the Tier-2 embedding pass even if the model bundle is present.
         #[arg(long)]
         no_model: bool,
+        /// Fit a Platt confidence calibrator over the corpus and report ECE
+        /// before/after. (Tooling — the shipped default stays uncalibrated.)
+        #[arg(long)]
+        calibrate: bool,
     },
 }
 
@@ -132,7 +136,11 @@ impl Task {
                 multimodal,
             } => models::verify(siglip || multimodal, clap || multimodal),
             Self::CheckPrivacy => privacy::check(),
-            Self::Eval { json, no_model } => eval::run(json, no_model),
+            Self::Eval {
+                json,
+                no_model,
+                calibrate,
+            } => eval::run(json, no_model, calibrate),
         }
     }
 }

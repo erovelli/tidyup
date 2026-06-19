@@ -196,7 +196,10 @@ pub async fn run_scan(
         .await
         {
             Ok(Some(classified)) => {
-                let proposal = build_proposal(path, output_root, &classified);
+                let mut proposal = build_proposal(path, output_root, &classified);
+                // Report calibrated confidence (no-op under the default Identity
+                // calibration; applies Platt scaling when a fitted set is set).
+                proposal.confidence = config.calibration.calibrate(proposal.confidence);
                 outcome.proposals.push(proposal);
             }
             Ok(None) => {

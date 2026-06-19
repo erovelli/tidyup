@@ -337,6 +337,9 @@ pub struct ClassifierConfig {
     pub weights: ScoreWeights,
     /// Rename proposal thresholds.
     pub rename: RenameConfig,
+    /// Confidence calibration applied to reported classification confidence.
+    /// Default [`Calibration::Identity`] (raw scores) — see [`Calibration`].
+    pub calibration: Calibration,
 }
 
 #[derive(Debug, Clone)]
@@ -368,6 +371,7 @@ impl Default for ClassifierConfig {
             enable_llm_renaming: true,
             weights: ScoreWeights::default(),
             rename: RenameConfig::default(),
+            calibration: Calibration::default(),
         }
     }
 }
@@ -388,6 +392,44 @@ impl Default for RenameConfig {
         Self {
             min_classification_confidence: 0.85,
             min_mismatch_score: 0.60,
+        }
+    }
+}
+
+/// Maps a raw classifier score to a calibrated confidence in `[0, 1]`.
+///
+/// `Identity` is the v0.1 default — confidence is reported as the raw
+/// weighted-cosine, uncalibrated (a true no-op). `Platt { a, b }` applies
+/// logistic (Platt) scaling `sigmoid(a·raw + b)`, fit offline against a labeled
+/// corpus (`cargo xtask eval --calibrate`). Calibration is opt-in: the shipped
+/// default stays `Identity` until a corpus-fit parameter set exists, so the
+/// "raw weighted-cosine, not calibrated" v0.1 promise holds by default.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum Calibration {
+    /// No calibration — report the raw score unchanged.
+    Identity,
+    /// Logistic (Platt) scaling: `sigmoid(a · raw + b)`.
+    Platt { a: f64, b: f64 },
+}
+
+impl Default for Calibration {
+    fn default() -> Self {
+        Self::Identity
+    }
+}
+
+impl Calibration {
+    /// Map a raw score to a calibrated confidence. `Identity` returns the input
+    /// unchanged; `Platt` applies logistic scaling (output always in `[0, 1]`).
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn calibrate(&self, raw: f32) -> f32 {
+        match *self {
+            Self::Identity => raw,
+            Self::Platt { a, b } => {
+                let z = a.mul_add(f64::from(raw), b);
+                (1.0 / (1.0 + (-z).exp())) as f32
+            }
         }
     }
 }

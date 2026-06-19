@@ -138,11 +138,11 @@ Tier 1 path rather than fabricating a cross-space match.
 not generate a rename — image/audio renames remain extractive (EXIF / ID3
 metadata → keyword fill → adapt → keep).
 
-## Confidence in v0.1: raw cosine with documented thresholds
+## Confidence: raw cosine by default, calibration available
 
-v0.1 reports `confidence` as the **raw weighted-cosine score**, not a calibrated probability. Thresholds (`embedding_threshold`, `min_classification_confidence`, `min_mismatch_score`) are tunable defaults chosen empirically from development use, documented in the config as raw-score values, and exposed in proposal reasoning so users can calibrate intuition by observation.
+By default tidyup reports `confidence` as the **raw weighted-cosine score**, not a calibrated probability. Thresholds (`embedding_threshold`, `min_classification_confidence`, `min_mismatch_score`) are tunable defaults chosen empirically from development use, documented in the config as raw-score values, and exposed in proposal reasoning so users can calibrate intuition by observation.
 
-Calibration to well-behaved probabilities — Platt scaling or isotonic regression against a held-out labelled corpus — is a **v0.2 story**. It requires a corpus that doesn't yet exist. Claiming "calibrated 85%" before that corpus exists would be marketing, not engineering.
+The calibration **mechanism** now exists: `ClassifierConfig.calibration` (a `tidyup_domain::Calibration`, default `Identity`) applies optional Platt scaling `sigmoid(a·raw + b)` to reported confidence, and `cargo xtask eval --calibrate` fits `(a, b)` over the golden corpus and reports Expected Calibration Error before/after (`tidyup_pipeline::calibration`). But the **shipped default stays `Identity` (uncalibrated)**: a trustworthy fitted parameter set needs the embedding model plus a held-out labelled corpus larger than the current fixture set. Until that ships, claiming "calibrated 85%" would be marketing, not engineering — the tooling to earn it is in place; the corpus isn't yet.
 
 Proposal reasoning strings surface raw sub-scores:
 
@@ -256,7 +256,7 @@ The cost (1–10 s of inference) is paid only on hard cases — Tier 2 hits that
 - **`tidyup-embeddings-ort` carries the default classifier.** Hosts `bge-small-en-v1.5` with room to add modality-specific encoders post-v0.1.
 - **`tidyup-pipeline` hosts Tier 1 + Tier 2.** Plus HDBSCAN soft-bundle clustering, the extractive rename cascade, and (when the feature is on) the Tier 3 call-through.
 - **Bundle detection stays in `pipeline::bundle`.** Marker detection unchanged; soft-bundle clustering uses text embeddings in v0.1.
-- **`ClassifierConfig` gains no calibration parameters in v0.1.** Raw-cosine thresholds only. Calibration config lands in v0.2.
+- **`ClassifierConfig.calibration` defaults to `Identity` (raw cosine).** The Platt-scaling mechanism + fitting tool (`cargo xtask eval --calibrate`) exist; the shipped default stays uncalibrated until a corpus-fit parameter set lands.
 
 ## Open questions
 
