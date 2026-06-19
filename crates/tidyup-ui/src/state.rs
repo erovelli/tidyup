@@ -83,6 +83,10 @@ pub(crate) struct SignalBundle {
     pub(crate) runs: SyncSignal<Vec<RunRecord>>,
     pub(crate) error: SyncSignal<Option<String>>,
     pub(crate) model_ready: SyncSignal<Option<bool>>,
+    /// Per-invocation Tier 3 (LLM fallback) activation — the third privacy gate,
+    /// toggled from Settings. `false` by default; only togglable when the
+    /// `llm-fallback` feature is compiled and `[inference] llm_fallback = true`.
+    pub(crate) llm_fallback_active: SyncSignal<bool>,
 }
 
 /// Non-signal state: the pending review's sender, held across an await inside
@@ -147,6 +151,7 @@ impl SharedState {
             runs: Signal::new_maybe_sync_in_scope(Vec::new(), ScopeId::ROOT),
             error: Signal::new_maybe_sync_in_scope(None, ScopeId::ROOT),
             model_ready: Signal::new_maybe_sync_in_scope(None, ScopeId::ROOT),
+            llm_fallback_active: Signal::new_maybe_sync_in_scope(false, ScopeId::ROOT),
         };
         Self {
             signals,

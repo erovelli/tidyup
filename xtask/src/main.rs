@@ -174,6 +174,20 @@ fn run_ci_lints() -> Result<()> {
         "-D",
         "warnings",
     ])?;
+    // The UI's Tier 3 path is `#[cfg(feature = "llm-fallback")]`; lint it with
+    // the feature on so the mistralrs-backed branch is covered (the default
+    // workspace clippy above only sees the feature-off stub).
+    sh(&[
+        "clippy",
+        "-p",
+        "tidyup-ui",
+        "--all-targets",
+        "--features",
+        "llm-fallback",
+        "--",
+        "-D",
+        "warnings",
+    ])?;
     sh(&[
         "clippy",
         "-p",

@@ -29,9 +29,11 @@ Your files stay where they belong — with you.
 > Migration mode now profiles target folders with a text content centroid (from
 > each folder's documents), plus image/audio centroids when the SigLIP/CLAP
 > bundles are installed, so files route on their own contents instead of
-> folder-name text. That said: confidence thresholds aren't calibrated against a
-> real corpus, and the desktop UI has no per-invocation Tier 3 toggle yet. Don't
-> point tidyup at files you care about.
+> folder-name text. The desktop UI now has a **Settings → Tier 3 toggle** that
+> surfaces the same three-gate activation as the CLI (build the UI with
+> `--features llm-fallback`, set `[inference] llm_fallback = true`, then flip the
+> per-session switch). That said: confidence thresholds aren't calibrated against
+> a real corpus by default. Don't point tidyup at files you care about.
 >
 > Everything below describes the target design. Check the
 > [roadmap](#roadmap) for what actually works today.
@@ -161,7 +163,7 @@ tidyup is being built in phases. Each phase lands an independently compilable sl
 | 5     | CLI wiring, apply + rollback, first-run model check, end-to-end flows                       | [x] Complete   |
 | 6     | Dioxus desktop UI (dashboard, review, runs, settings) on the same service seam              | [x] Complete   |
 | 7     | Multimodal encoders (SigLIP image / CLAP audio Tier 2) wired into scan-mode for both CLI and UI | [x] Complete   |
-| 8+    | Video keyframe encoder, UI Tier 3 toggle, code signing, packaging | [ ] Backlog    |
+| 8+    | Video keyframe encoder, code signing, packaging | [ ] Backlog    |
 
 **What currently works:**
 
@@ -188,7 +190,7 @@ tidyup is being built in phases. Each phase lands an independently compilable sl
 - ~~Migration-mode multimodal.~~ **Now shipped:** the migration profiler builds per-folder centroids in three latent spaces — text `content_centroid` (from each folder's documents, always), plus image/audio centroids when the SigLIP/CLAP bundles are installed — and routes each source file against the centroid in its own space, falling back to folder-name embeddings when a folder lacks the matching centroid.
 - Video keyframe encoder. Video files still classify via Tier 1 only — pure-Rust frame-extraction is gated on the `ffmpeg-next` FFI vs metadata-only decision.
 - Calibrated confidence **by default**. The calibration mechanism now exists — Platt scaling via `Calibration` (default `Identity`), fit with `cargo xtask eval --calibrate`, measured by Expected Calibration Error — but the shipped default is still raw weighted-cosine. Enabling a fitted default needs the embedding model plus a held-out corpus larger than the current fixture set.
-- UI Tier 3 toggle. The CLI exposes `--llm-fallback` / `--remote`; the desktop UI has no per-invocation activation surface yet, so it stays on the default Tier 1 + Tier 2 path. A settings-page toggle is the natural next step.
+- ~~UI Tier 3 toggle.~~ **Now shipped (LLM fallback):** the desktop UI's Settings page surfaces a per-session Tier 3 toggle that mirrors the CLI's three-gate model — it's only enabled when the UI is built `--features llm-fallback` *and* `[inference] llm_fallback = true`, and its state feeds the same `ServiceContext.text` activation. (The UI deliberately does not surface the `remote` backend; that stays CLI-only, so the default desktop binary has no HTTP client.) `cargo xtask check-privacy` now also asserts the default UI graph is LLM-silent.
 - Signed binaries, Homebrew/winget packaging.
 
 The invariants the finished tool will uphold — human-in-the-loop review, reversible moves, bundle atomicity, no-network-by-default, extractive-only renames — are now enforced at the code path, not just the design.

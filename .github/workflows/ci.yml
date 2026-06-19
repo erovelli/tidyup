@@ -64,6 +64,9 @@ jobs:
             libxdo-dev
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy -p tidyup-cli --all-targets --features llm-fallback,remote -- -D warnings
+      # The UI's Tier 3 path is feature-gated; lint it with the feature on so the
+      # mistralrs-backed branch is covered (workspace clippy above is feature-off).
+      - run: cargo clippy -p tidyup-ui --all-targets --features llm-fallback -- -D warnings
       - run: cargo clippy -p tidyup-extract --all-targets --all-features -- -D warnings
 
   # Layered test matrix, mirroring `cargo xtask ci`.

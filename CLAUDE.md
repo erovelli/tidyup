@@ -106,7 +106,7 @@ Storage follows the same shape (`FileIndex`/`ChangeLog`/`BackupStore`/`RunLog` a
 
 Default `cargo build -p tidyup-cli` produces a **network-silent, LLM-silent** binary. No HTTP client (no `reqwest`, `hyper`, `rustls`) AND no LLM inference (no `mistralrs`, `candle`, `hf-hub`, heavy tokenizer tree) — not linked, not present, not reachable.
 
-Verification: `cargo tree -p tidyup-cli -e normal | grep -E 'reqwest|hyper|rustls|mistralrs|candle|hf-hub'` returns empty. This is a CI-checked invariant for the default binary — break it and CI fails.
+Verification: `cargo tree -p tidyup-cli -e normal | grep -E 'reqwest|hyper|rustls|mistralrs|candle|hf-hub'` returns empty. This is a CI-checked invariant for the default binary — break it and CI fails. `cargo xtask check-privacy` additionally asserts the default **`tidyup-ui`** graph is LLM-silent (no `mistralrs`/`candle-core`/`hf-hub`); the desktop UI surfaces Tier 3 LLM fallback behind the same triple gate (cargo feature `llm-fallback` → `[inference] llm_fallback = true` → a per-session Settings toggle) but deliberately does **not** wire the `remote` backend, so the default desktop build stays HTTP-client-free. Network-silence is enforced only for the CLI (a webview app is not an airplane-mode promise).
 
 **Two symmetric power-user opt-in features**, each gated identically. The shape is the same; the bans are different.
 

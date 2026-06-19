@@ -39,7 +39,7 @@ use uuid::Uuid;
 
 use crate::context::{
     build, build_audio_scan_candidates, build_default_scan_candidates, build_image_scan_candidates,
-    quick_model_check,
+    quick_model_check, InferenceActivation,
 };
 use crate::reporter::DioxusReporter;
 use crate::review::DioxusReviewHandler;
@@ -1408,6 +1408,9 @@ fn RunRow(run: RunRecord, busy: Busy) -> Element {
 
 #[component]
 pub(crate) fn Settings() -> Element {
+    // Hook: must be called unconditionally (before the fallible config load) so
+    // the hook order is stable across renders regardless of load success.
+    let state = use_context::<SharedState>();
     let cfg_result = config::load();
     let config_path = config::platform_config_path()
         .map_or_else(|_| "<unresolved>".into(), |p| p.display().to_string());
@@ -1418,6 +1421,33 @@ pub(crate) fn Settings() -> Element {
                 .map_or_else(|_| "<unresolved>".into(), |p| p.display().to_string());
             let toml_text =
                 toml::to_string_pretty(&cfg).unwrap_or_else(|e| format!("<error: {e}>"));
+
+            // Tier 3 (LLM fallback) — the three privacy gates, surfaced.
+            let llm_active = state.signals.llm_fallback_active;
+            let feature_compiled = cfg!(feature = "llm-fallback");
+            let config_enabled = cfg.inference.llm_fallback;
+            let can_activate = feature_compiled && config_enabled;
+            let is_active = *llm_active.read();
+            let toggle_class = if is_active {
+                "button button-primary"
+            } else {
+                "button button-secondary"
+            };
+            let toggle_label = if is_active {
+                "Disable for this session"
+            } else {
+                "Enable for this session"
+            };
+            let tier3_status = if !feature_compiled {
+                "This desktop build was compiled without the `llm-fallback` feature, so Tier 3 is unavailable. Rebuild with `--features llm-fallback` to enable it.".to_string()
+            } else if !config_enabled {
+                "Set `[inference] llm_fallback = true` in the config file to allow Tier 3. It stays off until you do.".to_string()
+            } else if is_active {
+                "Tier 3 LLM fallback is active for this session. Ambiguous files may be classified on-device by the local LLM.".to_string()
+            } else {
+                "Tier 3 is available. Enable it for this session to let the local LLM resolve low-confidence classifications.".to_string()
+            };
+
             rsx! {
                 div {
                     h1 { class: "page-title", "Settings" }
@@ -1435,6 +1465,29 @@ pub(crate) fn Settings() -> Element {
                             div { class: "kv-value", "{config_path}" }
                             div { class: "kv-key", "data dir" }
                             div { class: "kv-value", "{data_dir}" }
+                        }
+                    }
+
+                    div {
+                        class: "card",
+                        h2 { class: "card-title", "Tier 3 — LLM fallback" }
+                        p {
+                            class: "small muted",
+                            style: "margin: 0 0 12px;",
+                            "{tier3_status}"
+                        }
+                        button {
+                            r#type: "button",
+                            class: "{toggle_class}",
+                            disabled: !can_activate,
+                            onclick: move |_| {
+                                if can_activate {
+                                    let mut active = llm_active;
+                                    let now = *active.read();
+                                    active.set(!now);
+                                }
+                            },
+                            "{toggle_label}"
                         }
                     }
 
@@ -1735,10 +1788,22 @@ fn ReportSummary(
 // Async actions. Each spawns a task that drives a service to completion.
 // ---------------------------------------------------------------------------
 
+/// Read the current Tier 3 (LLM fallback) activation from the session toggle.
+/// The Settings surface only lets the toggle reach `true` when the cargo feature
+/// and the config gate are both satisfied, so this read is the third privacy
+/// gate. Read in component scope (not inside the spawned task) to keep the
+/// root-anchored signal access on its owning scope.
+fn current_activation(signals: SignalBundle) -> InferenceActivation {
+    InferenceActivation {
+        llm_fallback: signals.llm_fallback_active.cloned(),
+    }
+}
+
 fn launch_scan(state: &SharedState, source: PathBuf) {
     let signals = state.signals;
     let slot = state.review_slot.clone();
     let bundle_slot = state.bundle_review_slot.clone();
+    let activation = current_activation(signals);
 
     reset_run_state(signals);
     set_busy(signals, Busy::Scanning);
@@ -1750,7 +1815,7 @@ fn launch_scan(state: &SharedState, source: PathBuf) {
     spawn_forever(async move {
         let result = async {
             let cfg = config::load()?;
-            let ctx = build(&cfg, true).await?;
+            let ctx = build(&cfg, true, activation).await?;
             let candidates = build_default_scan_candidates(ctx.embeddings.as_ref()).await?;
             let image_candidates =
                 build_image_scan_candidates(ctx.image_embeddings.as_deref()).await?;
@@ -1801,6 +1866,7 @@ fn launch_migrate(state: &SharedState, source: PathBuf, target: PathBuf) {
     let signals = state.signals;
     let slot = state.review_slot.clone();
     let bundle_slot = state.bundle_review_slot.clone();
+    let activation = current_activation(signals);
 
     reset_run_state(signals);
     set_busy(signals, Busy::Migrating);
@@ -1808,7 +1874,7 @@ fn launch_migrate(state: &SharedState, source: PathBuf, target: PathBuf) {
     spawn_forever(async move {
         let result = async {
             let cfg = config::load()?;
-            let ctx = build(&cfg, true).await?;
+            let ctx = build(&cfg, true, activation).await?;
             let reporter = DioxusReporter::new(signals);
             let reviewer = DioxusReviewHandler::new(signals, slot, bundle_slot);
 
@@ -1856,7 +1922,8 @@ fn launch_rollback(state: &SharedState, run_id: Uuid) {
     spawn_forever(async move {
         let result = async {
             let cfg = config::load()?;
-            let ctx = build(&cfg, false).await?;
+            // Rollback never classifies — no Tier 3 needed.
+            let ctx = build(&cfg, false, InferenceActivation::default()).await?;
             let reporter = DioxusReporter::new(signals);
             let service = RollbackService::new(Arc::clone(&ctx));
             let report = service.rollback_run(run_id, &reporter).await?;
@@ -1965,7 +2032,7 @@ fn refresh_runs(state: &SharedState) {
 async fn refresh_runs_inner(signals: SignalBundle) {
     let loaded = async {
         let cfg = config::load()?;
-        let ctx = build(&cfg, false).await?;
+        let ctx = build(&cfg, false, InferenceActivation::default()).await?;
         let service = RollbackService::new(Arc::clone(&ctx));
         service.list_runs().await
     }
