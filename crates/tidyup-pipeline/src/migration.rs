@@ -158,7 +158,9 @@ pub async fn run_migration(
         .await
         {
             Ok(Some(verdict)) => {
-                let proposal = build_proposal(path, &verdict);
+                let mut proposal = build_proposal(path, &verdict);
+                // Calibrated confidence (no-op under the default Identity).
+                proposal.confidence = config.calibration.calibrate(proposal.confidence);
                 outcome.proposals.push(proposal);
                 outcome.classifications.push(verdict.result);
             }

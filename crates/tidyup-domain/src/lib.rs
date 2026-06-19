@@ -20,10 +20,10 @@ pub use bundle::{BundleError, BundleKind, BundleProposal};
 pub use change::{ChangeProposal, ChangeStatus, ChangeType, ParseError};
 pub use file::{ContentHash, FileId, IndexedFile};
 pub use migration::{
-    Candidate, ClassificationResult, ClassifierConfig, DatePattern, ExecutedMove, FolderMetadata,
-    FolderNode, FolderProfile, MigrationPlan, MigrationRun, MoveStatus, OrganizationType,
-    PlanStats, ProfileCache, ProposedMove, RenameConfig, RunStatus, ScanDiff, ScoreBreakdown,
-    ScoreWeights, TargetScan, Tier,
+    Calibration, Candidate, ClassificationResult, ClassifierConfig, DatePattern, ExecutedMove,
+    FolderMetadata, FolderNode, FolderProfile, MigrationPlan, MigrationRun, MoveStatus,
+    OrganizationType, PlanStats, ProfileCache, ProposedMove, RenameConfig, RunStatus, ScanDiff,
+    ScoreBreakdown, ScoreWeights, TargetScan, Tier,
 };
 pub use run::{RunMode, RunRecord, RunState};
 

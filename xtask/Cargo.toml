@@ -29,6 +29,7 @@ serde      = { workspace = true }
 serde_json = { workspace = true }
 toml       = { workspace = true }
 tokio      = { workspace = true }
+tidyup-domain         = { workspace = true }
 tidyup-pipeline       = { workspace = true }
 tidyup-embeddings-ort = { workspace = true }
 

@@ -255,7 +255,7 @@ beyond the text Tier 2 rules:
 - **Don't auto-apply rename proposals.** Even under `--yes`, renames always surface in review.
 - **Don't propose renames for bundle members.** Their internal structure is load-bearing.
 - **Don't descend into detected bundles for per-file classification.** Bundle subtrees are opaque to the classifier.
-- **Don't claim calibrated confidence in v0.1.** Confidence is raw weighted-cosine; calibration is a v0.2 story dependent on a held-out corpus that doesn't yet exist.
+- **Don't claim calibrated confidence by default.** The default `Calibration::Identity` reports raw weighted-cosine. The Platt-scaling mechanism (`tidyup_domain::Calibration`, applied in the scan/migration pipelines) and the fitting tool (`cargo xtask eval --calibrate` over the golden corpus, `tidyup_pipeline::calibration`) now exist — but shipping a *fitted* non-Identity default needs a held-out corpus that doesn't yet exist. Don't change the default or claim calibrated probabilities until it does.
 - **Don't add a `tidyup-config` crate** (folded into `app` deliberately).
 - **Don't gate backend *selection* by cargo feature** (runtime registry). Backend *inclusion* is feature-gated only for network-capable and LLM backends.
 - **Don't add cross-impl-crate deps** (e.g., `storage-sqlite` depending on `inference-mistralrs`). Port traits in `core` are the only shared vocabulary.
