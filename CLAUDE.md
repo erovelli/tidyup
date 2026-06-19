@@ -33,6 +33,13 @@ cargo xtask feature-matrix  # requires: cargo install cargo-hack
 cargo xtask eval
 cargo xtask eval --json
 
+# The falsifiable "route by contents, not filename" test: held-out
+# migration-routing accuracy over an already-organized corpus (folder = label),
+# with content-vs-filename/most-frequent/extension baselines + bootstrap CIs.
+# `--fail-under` gates on content beating the filename baseline. Needs the model;
+# runs in the `model-eval` lane (nightly), never in model-free `ci`.
+cargo xtask eval-routing <corpus-dir> [--json] [--fail-under 0.05]
+
 # Fetch model bundles (download verifies each file: pinned BLAKE3 enforced,
 # unpinned digests printed to pin). Then check an install on demand.
 cargo xtask download-models [--siglip --clap | --multimodal]

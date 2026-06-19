@@ -6,6 +6,7 @@
 mod eval;
 mod models;
 mod privacy;
+mod routing_eval;
 
 use std::process::{Command, ExitCode};
 
@@ -94,6 +95,30 @@ enum Task {
         #[arg(long)]
         calibrate: bool,
     },
+    /// Measure held-out migration-routing accuracy on an already-organized
+    /// directory (folder = label), with content-vs-filename/most-frequent/
+    /// extension baselines and bootstrap CIs.
+    ///
+    /// This is the falsifiable test of "route by contents, not filename": it
+    /// uses real folder placements as ground truth and reports whether content
+    /// routing beats the filename baseline. Needs the embedding model installed;
+    /// not part of model-free `ci`. See `routing_eval` docs for the protocol.
+    EvalRouting {
+        /// Corpus root: each immediate subdirectory is a label.
+        corpus: std::path::PathBuf,
+        /// Emit the report as JSON instead of a human-readable summary.
+        #[arg(long)]
+        json: bool,
+        /// Fraction of each folder's files used to build its centroid.
+        #[arg(long, default_value_t = 0.7)]
+        train_frac: f64,
+        /// Seed for the deterministic split + bootstrap.
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        /// Gate: fail if (content − filename) top-1 is below this margin.
+        #[arg(long)]
+        fail_under: Option<f64>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -141,6 +166,13 @@ impl Task {
                 no_model,
                 calibrate,
             } => eval::run(json, no_model, calibrate),
+            Self::EvalRouting {
+                corpus,
+                json,
+                train_frac,
+                seed,
+                fail_under,
+            } => routing_eval::run(&corpus, train_frac, seed, fail_under, json),
         }
     }
 }
