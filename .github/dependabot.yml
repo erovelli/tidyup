@@ -4,6 +4,12 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    # Supply-chain hardening: never open a PR for a release until it has been
+    # public for at least a week, giving the ecosystem time to spot a
+    # compromised/yanked version before we pull it in. Applies to version
+    # updates only — security updates are exempt and still arrive immediately.
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 10
     groups:
       rust-dependencies:
@@ -20,6 +26,10 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    # Same week-long cooldown for Action bumps (pinned tags/SHAs are a common
+    # supply-chain vector). Security updates remain exempt.
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 5
     groups:
       github-actions:
