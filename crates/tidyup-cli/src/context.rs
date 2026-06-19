@@ -303,16 +303,48 @@ impl tidyup_core::inference::EmbeddingBackend for NullEmbeddings {
 pub(crate) async fn build_default_scan_candidates(
     embeddings: &dyn tidyup_core::inference::EmbeddingBackend,
 ) -> Result<Vec<tidyup_pipeline::scan::ScanCandidate>> {
-    let entries = tidyup_embeddings_ort::default_taxonomy();
-    let texts: Vec<&str> = entries.iter().map(|e| e.description).collect();
+    let triples: Vec<(String, String, bool)> = tidyup_embeddings_ort::default_taxonomy()
+        .into_iter()
+        .map(|e| (e.path.to_string(), e.description.to_string(), e.temporal))
+        .collect();
+    embed_scan_candidates(triples, embeddings).await
+}
+
+/// Build scan candidates from a user-provided taxonomy file (scan `--taxonomy
+/// <file>`). The file is parsed + validated by
+/// [`tidyup_embeddings_ort::load_taxonomy_file`] before its descriptions are
+/// embedded.
+///
+/// # Errors
+/// Propagates taxonomy load/validation and embedding-backend errors.
+pub(crate) async fn build_custom_scan_candidates(
+    taxonomy_path: &std::path::Path,
+    embeddings: &dyn tidyup_core::inference::EmbeddingBackend,
+) -> Result<Vec<tidyup_pipeline::scan::ScanCandidate>> {
+    let triples: Vec<(String, String, bool)> =
+        tidyup_embeddings_ort::load_taxonomy_file(taxonomy_path)?
+            .into_iter()
+            .map(|e| (e.path, e.description, e.temporal))
+            .collect();
+    embed_scan_candidates(triples, embeddings).await
+}
+
+/// Embed each `(folder_path, description, temporal)` triple's description and
+/// assemble [`tidyup_pipeline::scan::ScanCandidate`]s. Shared by the default and
+/// custom-taxonomy paths.
+async fn embed_scan_candidates(
+    triples: Vec<(String, String, bool)>,
+    embeddings: &dyn tidyup_core::inference::EmbeddingBackend,
+) -> Result<Vec<tidyup_pipeline::scan::ScanCandidate>> {
+    let texts: Vec<&str> = triples.iter().map(|(_, desc, _)| desc.as_str()).collect();
     let vecs = embeddings.embed_texts(&texts).await?;
-    let mut out = Vec::with_capacity(entries.len());
-    for (entry, emb) in entries.into_iter().zip(vecs) {
+    let mut out = Vec::with_capacity(triples.len());
+    for ((folder_path, description, temporal), embedding) in triples.into_iter().zip(vecs) {
         out.push(tidyup_pipeline::scan::ScanCandidate {
-            folder_path: entry.path.to_string(),
-            description: entry.description.to_string(),
-            temporal: entry.temporal,
-            embedding: emb,
+            folder_path,
+            description,
+            temporal,
+            embedding,
         });
     }
     Ok(out)

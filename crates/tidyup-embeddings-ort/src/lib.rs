@@ -51,5 +51,5 @@ pub use install::{
     verify_clap_model, verify_default_model, verify_siglip_model, ArtifactSpec,
 };
 pub use siglip::SigLipEmbeddings;
-pub use taxonomy::{default_taxonomy, TaxonomyEntry};
+pub use taxonomy::{default_taxonomy, load_taxonomy_file, OwnedTaxonomyEntry, TaxonomyEntry};
 pub use util::{cosine_similarity, extract_year, l2_normalize};
