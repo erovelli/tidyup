@@ -26,11 +26,16 @@
 //! thresholds; this module only produces candidates. A rejected gate leaves
 //! the file with its original name but an approved move.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use serde_json::Value;
 
 use crate::yake::Keyword;
+
+/// Maximum number of distinct words composing a synthesized keyword stem. Keeps
+/// names readable now that keywords can be multi-word phrases.
+const MAX_STEM_WORDS: usize = 4;
 
 /// Maximum length of a generated filename stem (without extension). Keeps
 /// proposals readable and avoids OS path-length issues on Windows.
@@ -163,27 +168,30 @@ fn stem_from_metadata(metadata: &Value) -> Option<String> {
 
 /// Compose a stem from the top YAKE keywords, optionally prefixed with a year.
 ///
-/// Takes up to the first four keywords in rank order (YAKE returns best-first).
-/// Returns `None` when no usable keyword survives sanitization.
+/// Keywords may be multi-word phrases (n-gram YAKE), so this flattens them, in
+/// rank order, into a sequence of up to [`MAX_STEM_WORDS`] words and
+/// de-duplicates at the **word** level — overlapping phrases like `"tax return"`
+/// then `"tax form"` collapse to `tax_return_form` rather than repeating `tax`.
+/// Returns `None` when no usable word survives sanitization.
 fn stem_from_keywords(keywords: &[Keyword], year: Option<i32>) -> Option<String> {
-    let mut picked: Vec<String> = Vec::new();
+    let mut words: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
     for kw in keywords {
         let token = sanitize_token(&kw.term);
-        if token.is_empty() {
-            continue;
+        for word in token.split('_').filter(|w| !w.is_empty()) {
+            if seen.insert(word.to_string()) {
+                words.push(word.to_string());
+            }
         }
-        if picked.iter().any(|p| p == &token) {
-            continue;
-        }
-        picked.push(token);
-        if picked.len() >= 4 {
+        if words.len() >= MAX_STEM_WORDS {
             break;
         }
     }
-    if picked.is_empty() {
+    words.truncate(MAX_STEM_WORDS);
+    if words.is_empty() {
         return None;
     }
-    let body = picked.join("_");
+    let body = words.join("_");
     Some(year.map_or_else(|| body.clone(), |y| format!("{y}_{body}")))
 }
 
@@ -222,12 +230,25 @@ pub fn sanitize_filename(raw: &str) -> String {
     }
 }
 
+/// Sanitize a single keyword token, which may be a multi-word phrase. Lowercases,
+/// maps any run of non-alphanumeric characters (notably the spaces inside a
+/// phrase) to a single `_`, and trims leading/trailing separators — so the
+/// caller can split the result back into words. Unlike [`sanitize_filename`] it
+/// does not truncate; keyword tokens are short by construction.
 fn sanitize_token(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
+    let mut last_was_sep = true;
     for ch in raw.to_lowercase().chars() {
         if ch.is_ascii_alphanumeric() {
             out.push(ch);
+            last_was_sep = false;
+        } else if !last_was_sep {
+            out.push('_');
+            last_was_sep = true;
         }
+    }
+    while out.ends_with('_') {
+        out.pop();
     }
     out
 }
@@ -441,6 +462,33 @@ mod tests {
     fn rename_source_label() {
         assert_eq!(RenameSource::Metadata.label(), "metadata");
         assert_eq!(RenameSource::Keywords.label(), "keywords");
+    }
+
+    #[test]
+    fn keyword_tier_flattens_phrases_word_deduplicated() {
+        // n-gram YAKE can return phrases; overlapping words must not repeat.
+        let kws = vec![kw("tax return", 0.05), kw("tax form", 0.06)];
+        let p = propose_rename(&PathBuf::from("/d/scan.pdf"), &json!({}), &kws, None);
+        match p {
+            RenameProposal::Rename { name, source } => {
+                assert_eq!(source, RenameSource::Keywords);
+                assert_eq!(name, "tax_return_form.pdf");
+            }
+            RenameProposal::Keep => panic!("expected keyword rename"),
+        }
+    }
+
+    #[test]
+    fn keyword_tier_caps_total_words() {
+        let kws = vec![kw("alpha beta gamma", 0.1), kw("delta epsilon", 0.2)];
+        let p = propose_rename(&PathBuf::from("/d/x.pdf"), &json!({}), &kws, None);
+        match p {
+            RenameProposal::Rename { name, .. } => {
+                // MAX_STEM_WORDS = 4 → alpha_beta_gamma_delta, epsilon dropped.
+                assert_eq!(name, "alpha_beta_gamma_delta.pdf");
+            }
+            RenameProposal::Keep => panic!("expected rename"),
+        }
     }
 
     #[test]

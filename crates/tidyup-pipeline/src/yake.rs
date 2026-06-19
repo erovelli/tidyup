@@ -24,11 +24,17 @@
 //!
 //! # Scope
 //!
-//! Single-word candidates only. N-gram extraction is a post-v0.1 improvement
-//! (the rename cascade currently wants topic-token fills, not phrases).
+//! Candidates are n-grams up to [`DEFAULT_MAX_NGRAM`] words, built from runs of
+//! consecutive content tokens (a phrase never spans a stopword, numeric, or
+//! punctuation boundary). Each candidate is scored by the YAKE keyphrase rule
+//! `∏ S(t) / (TF(kw) · (1 + ∑ S(t)))` over its constituent per-term scores —
+//! for a unigram this reduces to `S(t) / (TF · (1 + S(t)))`. **Lower is better.**
 //! English-only stopwords — multilingual support lands with `bge-m3`.
 
 use std::collections::{HashMap, HashSet};
+
+/// Longest keyphrase (in words) the extractor will consider.
+pub const DEFAULT_MAX_NGRAM: usize = 3;
 
 /// A keyword candidate and its YAKE score. Lower score = stronger keyword.
 #[derive(Debug, Clone, PartialEq)]
@@ -94,7 +100,8 @@ pub fn extract_keywords(text: &str, k: usize) -> Vec<Keyword> {
     #[allow(clippy::cast_precision_loss)]
     let total_sentences = sentences.len() as f32;
 
-    let mut scored: Vec<Keyword> = stats
+    // Per-term YAKE score S(t); lower is stronger.
+    let term_scores: HashMap<String, f32> = stats
         .into_iter()
         .map(|(term, s)| {
             #[allow(clippy::cast_precision_loss)]
@@ -112,17 +119,75 @@ pub fn extract_keywords(text: &str, k: usize) -> Vec<Keyword> {
 
             let denom = t_case + (t_freq / t_rel) + (t_difsent / t_rel);
             let score = (t_rel * t_position) / denom.max(f32::EPSILON);
-            Keyword { term, score }
+            (term, score)
         })
         .collect();
 
+    // Assemble n-gram candidates and score each by the YAKE keyphrase rule.
+    let mut scored: Vec<Keyword> = ngram_candidates(&sentences, DEFAULT_MAX_NGRAM)
+        .into_iter()
+        .map(|(phrase, (terms, tf))| {
+            let prod: f32 = terms
+                .iter()
+                .map(|t| term_scores.get(t).copied().unwrap_or(1.0))
+                .product();
+            let sum: f32 = terms
+                .iter()
+                .map(|t| term_scores.get(t).copied().unwrap_or(1.0))
+                .sum();
+            #[allow(clippy::cast_precision_loss)]
+            let tf_f = tf as f32;
+            let score = prod / (tf_f * (1.0 + sum)).max(f32::EPSILON);
+            Keyword {
+                term: phrase,
+                score,
+            }
+        })
+        .collect();
+
+    // Ascending by score; tie-break on the phrase text for deterministic output
+    // (HashMap iteration order is otherwise unspecified).
     scored.sort_by(|a, b| {
         a.score
             .partial_cmp(&b.score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.term.cmp(&b.term))
     });
     scored.truncate(k);
     scored
+}
+
+/// Build n-gram candidates (length `1..=max_n`) from runs of consecutive
+/// candidate tokens within each sentence — a phrase never spans a stopword,
+/// numeric, or punctuation boundary. Returns a map from the lowercased phrase to
+/// its constituent terms and its document frequency.
+fn ngram_candidates(sentences: &[&str], max_n: usize) -> HashMap<String, (Vec<String>, u32)> {
+    let mut grams: HashMap<String, (Vec<String>, u32)> = HashMap::new();
+    for sent in sentences {
+        // Split the sentence into runs of consecutive candidate tokens.
+        let mut runs: Vec<Vec<String>> = Vec::new();
+        let mut current: Vec<String> = Vec::new();
+        for tok in tokenize(sent) {
+            if is_candidate(tok) {
+                current.push(tok.to_lowercase());
+            } else if !current.is_empty() {
+                runs.push(std::mem::take(&mut current));
+            }
+        }
+        if !current.is_empty() {
+            runs.push(current);
+        }
+        for run in &runs {
+            for n in 1..=max_n.min(run.len()) {
+                for window in run.windows(n) {
+                    let phrase = window.join(" ");
+                    let entry = grams.entry(phrase).or_insert_with(|| (window.to_vec(), 0));
+                    entry.1 += 1;
+                }
+            }
+        }
+    }
+    grams
 }
 
 #[derive(Default)]
@@ -238,10 +303,48 @@ mod tests {
         let text = "Quarterly tax return filing. The tax form is 1040. \
                     Include tax receipts for all deductions. Tax advisor signed.";
         let out = extract_keywords(text, 5);
+        // With n-grams the domain term may surface as "tax" or as a phrase like
+        // "tax return"/"tax form" — either is the right signal for a rename.
         assert!(
-            out.iter().any(|k| k.term == "tax"),
-            "expected 'tax' in top 5; got {out:?}",
+            out.iter().any(|k| k.term.contains("tax")),
+            "expected a tax-related term in top 5; got {out:?}",
         );
+    }
+
+    #[test]
+    fn extracts_multiword_phrases() {
+        let text = "Quarterly tax return filing. The tax return is mailed. \
+                    Prepare the tax return early.";
+        let out = extract_keywords(text, 6);
+        assert!(
+            out.iter().any(|k| k.term.contains(' ')),
+            "expected at least one multi-word phrase; got {out:?}",
+        );
+        // "tax return" recurs three times and should surface as a phrase.
+        assert!(
+            out.iter().any(|k| k.term == "tax return"),
+            "expected 'tax return' phrase; got {out:?}",
+        );
+    }
+
+    #[test]
+    fn ngrams_do_not_span_stopwords() {
+        // "cat" and "dog" are split by the stopword "and" → no "cat dog" phrase.
+        let out = extract_keywords("The cat and the dog ran.", 10);
+        assert!(
+            out.iter().all(|k| k.term != "cat dog"),
+            "phrases must not span a stopword; got {out:?}",
+        );
+    }
+
+    #[test]
+    fn respects_max_ngram_length() {
+        let text = "alpha beta gamma delta epsilon zeta eta theta.";
+        let out = extract_keywords(text, 50);
+        for k in &out {
+            let words = k.term.split(' ').count();
+            assert!(words <= DEFAULT_MAX_NGRAM, "phrase too long: {}", k.term);
+        }
     }
 
     #[test]

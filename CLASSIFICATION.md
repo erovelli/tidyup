@@ -197,7 +197,7 @@ Once a bundle is identified, its subtree is **opaque** to per-file classificatio
 Rename proposals come from an extractive cascade. Each step is strictly higher-signal than the one below; the first that fires produces the proposal.
 
 1. **Embedded metadata.** PDF `/Title`, DOCX `core.xml` title, ID3 `TIT2`, EXIF `ImageDescription`, Office core properties. If present and non-trivially different from the current filename, this is the rename.
-2. **Keyword-template fill.** Extract top-k terms from content (inlined YAKE — see below). The target folder's siblings are analysed for a naming pattern via regex inference. Top keywords fill the `<topic>` slot; dates come from EXIF or file mtime.
+2. **Keyword-template fill.** Extract top-k keyphrases from content — n-grams up to 3 words (inlined YAKE — see below). The target folder's siblings are analysed for a naming pattern via regex inference. Top keyphrases fill the `<topic>` slot, flattened into a word-deduplicated stem (`"tax return"` + `"tax form"` → `tax_return_form`); dates come from EXIF or file mtime.
 3. **Nearest-neighbor adaptation.** Nearest content-neighbor in the target folder by cosine distance. Adopt its naming template. Substitute content-specific tokens from the current file.
 4. **No signal → no rename.** Keep the filename; just move.
 
@@ -205,7 +205,7 @@ The rename policy (`CLAUDE.md`) says renames never auto-apply, bundle members ne
 
 Filename-content mismatch: `1.0 - cos(embed(filename_as_text), content_embedding)`. `taxes_2023.pdf` with tax-return content scores low (name matches content); `DSC_0481.jpg` of a wedding scores high.
 
-**Keyword extraction crate.** YAKE is the algorithm. Available crates (`keyword-extraction-rs` at ~20k DL/mo) sit below the 100k-DL/mo dependency threshold in `CLAUDE.md`. v0.1 inlines ~150 LoC of YAKE rather than depending on the below-threshold crate. Re-evaluate if a mainstream pure-Rust option matures.
+**Keyword extraction crate.** YAKE is the algorithm, now n-gram-aware: candidates are phrases up to 3 words built from runs of consecutive content tokens (never spanning a stopword/numeric/punctuation boundary) and scored by the YAKE keyphrase rule `∏ S(t) / (TF · (1 + ∑ S(t)))`. Available crates (`keyword-extraction-rs` at ~20k DL/mo) sit below the 100k-DL/mo dependency threshold in `CLAUDE.md`. v0.1 inlines ~200 LoC of YAKE rather than depending on the below-threshold crate. Re-evaluate if a mainstream pure-Rust option matures.
 
 ## Why embeddings over a local LLM on the default path
 
