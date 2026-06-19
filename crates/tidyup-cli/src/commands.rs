@@ -63,6 +63,8 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<()> {
                 anyhow::bail!("rollback requires a run ID (or pass --list)")
             }
         }
+        Command::Prune { days } => run_prune(json, &cfg, days).await,
+        Command::Status => run_status(json, &cfg).await,
         Command::Config => run_config(&cfg),
     }
 }
@@ -227,6 +229,91 @@ async fn run_list_runs(json: bool, cfg: &config::TidyupConfig) -> Result<()> {
             r.source_root.display(),
             target,
         );
+    }
+    Ok(())
+}
+
+async fn run_prune(json: bool, cfg: &config::TidyupConfig, days: Option<u32>) -> Result<()> {
+    // Pruning never invokes the classifier — the null embedding fallback is fine.
+    let ctx = build(cfg, false, InferenceActivation::default()).await?;
+    let service = RollbackService::new(ctx);
+    let days = days.unwrap_or(cfg.storage.backup_retention_days);
+    let pruned = service.prune_backups(days).await?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"event": "prune", "pruned": pruned, "older_than_days": days}),
+        );
+    } else {
+        println!("Pruned {pruned} shelved backup(s) older than {days} day(s).");
+    }
+    Ok(())
+}
+
+async fn run_status(json: bool, cfg: &config::TidyupConfig) -> Result<()> {
+    let data = describe_data_dir(cfg).unwrap_or_else(|| "<unresolved>".into());
+    let model_ready = tidyup_embeddings_ort::verify_default_model().is_ok();
+    // Status never classifies; absence of the model is reported, not fatal.
+    let ctx = build(cfg, false, InferenceActivation::default()).await?;
+    let service = RollbackService::new(ctx);
+    let runs = service.list_runs().await?;
+    let recent: Vec<_> = runs.iter().take(10).collect();
+
+    if json {
+        let rows: Vec<_> = recent
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "run_id": r.id,
+                    "mode": r.mode.as_str(),
+                    "state": r.state.as_str(),
+                    "started_at": r.started_at,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "event": "status",
+                "data_dir": data,
+                "model_ready": model_ready,
+                "backup_retention_days": cfg.storage.backup_retention_days,
+                "total_runs": runs.len(),
+                "recent_runs": rows,
+            }),
+        );
+        return Ok(());
+    }
+
+    println!("tidyup status");
+    println!("  data dir:          {data}");
+    println!(
+        "  embedding model:   {}",
+        if model_ready {
+            "installed"
+        } else {
+            "missing (run `cargo xtask download-models`)"
+        },
+    );
+    println!(
+        "  backup retention:  {} day(s)",
+        cfg.storage.backup_retention_days,
+    );
+    println!("  recorded runs:     {}", runs.len());
+    if recent.is_empty() {
+        println!("  recent runs:       none");
+    } else {
+        println!("  recent runs:");
+        for r in recent {
+            println!(
+                "    {}  {:<8}  {:<12}  {}",
+                r.id,
+                r.mode.as_str(),
+                r.state.as_str(),
+                r.started_at,
+            );
+        }
     }
     Ok(())
 }

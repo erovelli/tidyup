@@ -105,6 +105,18 @@ enum Command {
         #[arg(long)]
         list: bool,
     },
+    /// Prune shelved backups older than the retention window.
+    ///
+    /// Expires (and removes from the shelf) backups past their TTL. Defaults to
+    /// `[storage] backup_retention_days` (30 unless configured). Once pruned, a
+    /// run can no longer be rolled back.
+    Prune {
+        /// Override the retention window, in days.
+        #[arg(long)]
+        days: Option<u32>,
+    },
+    /// Show a status summary: data dir, model, retention, and recent runs.
+    Status,
     /// Show current config (file path + parsed values).
     Config,
 }

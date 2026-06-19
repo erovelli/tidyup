@@ -282,4 +282,15 @@ impl RollbackService {
     pub async fn list_runs(&self) -> Result<Vec<RunRecord>> {
         self.ctx.run_log.list_runs().await
     }
+
+    /// Expire shelved backups older than `days`, marking them `Expired` and
+    /// best-effort removing their content from the shelf. Returns the count
+    /// pruned. A thin wrapper over the [`BackupStore`](tidyup_core::storage::BackupStore)
+    /// port so the CLI doesn't reach into the context directly.
+    ///
+    /// # Errors
+    /// Propagates storage failures.
+    pub async fn prune_backups(&self, days: u32) -> Result<usize> {
+        self.ctx.backup_store.prune_older_than_days(days).await
+    }
 }
