@@ -184,7 +184,8 @@ tidyup is being built in phases. Each phase lands an independently compilable sl
 
 **What currently works:**
 
-- `cargo build --release -p tidyup-cli` produces a fully functional default binary: `tidyup migrate`, `tidyup scan`, `tidyup rollback`, `tidyup config`
+- `cargo build --release -p tidyup-cli` produces a fully functional default binary: `tidyup migrate`, `tidyup scan`, `tidyup watch`, `tidyup rollback`, `tidyup config`
+- `tidyup watch <dir>` is an **advisory** filesystem watch: it re-scans (dry-run) on each debounced change and reports what it *would* propose, loading the model once and reusing it across rescans. It never moves anything — run `tidyup scan` to apply (editor/temp churn is filtered so a single save doesn't storm rescans)
 - `cargo xtask ci` is green: privacy check + `fmt` + `clippy --all-features -D warnings` + workspace tests
 - `cargo xtask check-privacy` asserts the default dep graph contains no `reqwest`/`hyper`/`rustls`/`mistralrs`/`candle-core`/`hf-hub`
 - SQLite storage: `FileIndex`, `ChangeLog`, `BackupStore`, `RunLog` with bundle-atomic shelving

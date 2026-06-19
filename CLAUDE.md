@@ -169,6 +169,7 @@ Both produce `ChangeProposal`s and `BundleProposal`s that flow through the same 
 - Default backup TTL is 30 days (configurable).
 - `FileIndex::upsert` preserves `FileId` UUIDs across re-scans (upsert-on-path).
 - No file is moved without an approved `ChangeProposal` or `BundleProposal`. `--yes` auto-approves *moves* above a confidence threshold; rename decisions never auto-apply.
+- **`tidyup watch` is advisory only.** It re-scans in dry-run on each debounced change and reports proposals; it never moves files. This both upholds the approval promise and avoids an apply→filesystem-event→rescan feedback loop. A future auto-apply-on-change mode would need explicit feedback-loop handling and its own opt-in — don't make `watch` mutate the filesystem by default.
 - **Bundles move atomically or not at all.** Same-volume: single atomic `rename()`. Cross-volume: copy-verify-delete with full rollback on any failure.
 
 ## Testing conventions

@@ -49,6 +49,7 @@ tidyup-inference-remote    = { workspace = true, optional = true }
 clap         = { workspace = true }
 indicatif    = { workspace = true }
 console      = { workspace = true }
+notify       = { workspace = true }
 anyhow       = { workspace = true }
 async-trait  = { workspace = true }
 tokio        = { workspace = true }

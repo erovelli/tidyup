@@ -75,6 +75,10 @@ serde        = { version = "1.0.228", features = ["derive"] }
 serde_json   = "1.0.149"
 toml         = "1.1"
 tracing      = "0.1.44"
+# Cross-platform filesystem watching for `tidyup watch` (CC0-1.0 OR Artistic-2.0
+# — CC0 satisfies the license allowlist). Thin OS bindings (inotify/kqueue/
+# ReadDirectoryChanges), no network.
+notify       = "6.1"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid         = { version = "1.23", features = ["v4", "serde"] }
 chrono       = { version = "0.4.44", features = ["serde"] }
