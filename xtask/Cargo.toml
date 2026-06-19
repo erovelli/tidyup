@@ -32,5 +32,8 @@ tokio      = { workspace = true }
 tidyup-pipeline       = { workspace = true }
 tidyup-embeddings-ort = { workspace = true }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [lints]
 workspace = true
