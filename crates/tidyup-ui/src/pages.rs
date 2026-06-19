@@ -172,6 +172,15 @@ pub(crate) fn Review() -> Element {
     let hovered = use_signal(|| Option::<Uuid>::None);
     let selected = use_signal(|| Option::<Uuid>::None);
 
+    // Atomic bundle-review pass. The service reviews loose proposals first
+    // (clearing `proposals` when done), then bundles — so `bundles` is non-empty
+    // only during the bundle phase. Route to a dedicated approve/reject surface.
+    if !bundles.is_empty() {
+        return rsx! {
+            BundleReview { state: state.clone() }
+        };
+    }
+
     if !pending && proposals.is_empty() && bundles.is_empty() {
         let last = signals.last_report.read().clone();
         return rsx! {
@@ -221,20 +230,6 @@ pub(crate) fn Review() -> Element {
             DiffView { model, hovered, selected, signals }
 
             DiffLegend {}
-
-            if !bundles.is_empty() {
-                div {
-                    class: "card",
-                    style: "margin-top: 24px;",
-                    h2 { class: "card-title", "{bundles.len()} bundle(s) held" }
-                    p { class: "card-subtitle muted", "Bundles move as atomic units. Full review UX lands in Phase 7+." }
-                    div {
-                        for b in bundles.iter().cloned() {
-                            BundleCard { key: "{b.id}", bundle: b }
-                        }
-                    }
-                }
-            }
 
             div {
                 class: "section-heading",
@@ -1186,31 +1181,113 @@ fn ProposalCard(proposal: ChangeProposal, signals: SignalBundle) -> Element {
     }
 }
 
+/// Atomic bundle-review surface. Shown when the service is awaiting per-bundle
+/// approve/reject decisions (the second review pass, after loose proposals).
 #[component]
-fn BundleCard(bundle: BundleProposal) -> Element {
+fn BundleReview(state: SharedState) -> Element {
+    let signals = state.signals;
+    let bundles = signals.bundles.read().clone();
+    let approvals = signals.bundle_approvals.read().clone();
+    let total = bundles.len();
+    let approved_n = approvals.values().filter(|v| **v).count();
+
+    let on_apply = {
+        let state = state.clone();
+        move |_| submit_bundle_review(&state)
+    };
+    let on_reject_all = {
+        let state = state.clone();
+        move |_| reject_all_bundles_and_submit(&state)
+    };
+
+    rsx! {
+        div {
+            h1 { class: "page-title", "Review — Bundles" }
+            PhaseBanner { signals }
+            div {
+                class: "card",
+                h2 { class: "card-title", "{total} bundle(s) to review" }
+                p {
+                    class: "card-subtitle muted",
+                    "Bundles move as atomic units — the whole group relocates or nothing does. Approve or reject each; anything left undecided is held (not moved)."
+                }
+                div {
+                    class: "button-row",
+                    style: "margin-top: 12px;",
+                    button {
+                        class: "button button-primary",
+                        onclick: on_apply,
+                        "Apply ({approved_n}/{total} approved)"
+                    }
+                    button {
+                        class: "button button-secondary",
+                        onclick: on_reject_all,
+                        "Reject all"
+                    }
+                }
+            }
+            div {
+                class: "card-stack",
+                style: "margin-top: 16px;",
+                for b in bundles.iter().cloned() {
+                    BundleReviewCard { key: "{b.id}", bundle: b, signals }
+                }
+            }
+        }
+    }
+}
+
+/// One reviewable bundle: atomic approve/reject, no per-member decision.
+#[component]
+fn BundleReviewCard(bundle: BundleProposal, signals: SignalBundle) -> Element {
+    let approvals = signals.bundle_approvals;
+    let decision = approvals.read().get(&bundle.id).copied();
+
     let root = bundle.root.display().to_string();
     let target = bundle.target_parent.display().to_string();
     let kind = bundle.kind.as_str();
     let chip = confidence_chip(bundle.confidence);
     let member_count = bundle.members.len();
 
+    let card_class = match decision {
+        Some(true) => "proposal proposal-approved",
+        Some(false) => "proposal proposal-rejected",
+        None => "proposal",
+    };
+
+    let bundle_id = bundle.id;
+    let on_approve = move |_| {
+        let mut a = approvals;
+        a.with_mut(|map| {
+            map.insert(bundle_id, true);
+        });
+    };
+    let on_reject = move |_| {
+        let mut a = approvals;
+        a.with_mut(|map| {
+            map.insert(bundle_id, false);
+        });
+    };
+
+    let approve_class = if decision == Some(true) {
+        "mini-button mini-button-approve active"
+    } else {
+        "mini-button mini-button-approve"
+    };
+    let reject_class = if decision == Some(false) {
+        "mini-button mini-button-reject active"
+    } else {
+        "mini-button mini-button-reject"
+    };
+
     rsx! {
         div {
-            class: "proposal",
+            class: "{card_class}",
             div {
                 class: "proposal-meta",
-                div {
-                    class: "proposal-target",
-                    "{root}"
-                }
-                div {
-                    class: "proposal-path",
-                    "{member_count} member(s) → {target}"
-                }
-                div {
-                    class: "proposal-reason",
-                    "{bundle.reasoning}"
-                }
+                div { class: "proposal-target", "{root}" }
+                div { class: "proposal-path", "{member_count} member(s) → {target}/" }
+                div { class: "proposal-reason", "{bundle.reasoning}" }
                 div {
                     class: "button-row small",
                     style: "margin-top: 6px;",
@@ -1220,10 +1297,8 @@ fn BundleCard(bundle: BundleProposal) -> Element {
             }
             div {
                 class: "proposal-actions",
-                span {
-                    class: "muted small",
-                    "held for review"
-                }
+                button { class: "{approve_class}", onclick: on_approve, "Approve" }
+                button { class: "{reject_class}", onclick: on_reject, "Reject" }
             }
         }
     }
@@ -1663,6 +1738,7 @@ fn ReportSummary(
 fn launch_scan(state: &SharedState, source: PathBuf) {
     let signals = state.signals;
     let slot = state.review_slot.clone();
+    let bundle_slot = state.bundle_review_slot.clone();
 
     reset_run_state(signals);
     set_busy(signals, Busy::Scanning);
@@ -1681,7 +1757,7 @@ fn launch_scan(state: &SharedState, source: PathBuf) {
             let audio_candidates =
                 build_audio_scan_candidates(ctx.audio_embeddings.as_deref()).await?;
             let reporter = DioxusReporter::new(signals);
-            let reviewer = DioxusReviewHandler::new(signals, slot);
+            let reviewer = DioxusReviewHandler::new(signals, slot, bundle_slot);
 
             let service = ScanService::new(Arc::clone(&ctx));
             let report = service
@@ -1724,6 +1800,7 @@ fn launch_scan(state: &SharedState, source: PathBuf) {
 fn launch_migrate(state: &SharedState, source: PathBuf, target: PathBuf) {
     let signals = state.signals;
     let slot = state.review_slot.clone();
+    let bundle_slot = state.bundle_review_slot.clone();
 
     reset_run_state(signals);
     set_busy(signals, Busy::Migrating);
@@ -1733,7 +1810,7 @@ fn launch_migrate(state: &SharedState, source: PathBuf, target: PathBuf) {
             let cfg = config::load()?;
             let ctx = build(&cfg, true).await?;
             let reporter = DioxusReporter::new(signals);
-            let reviewer = DioxusReviewHandler::new(signals, slot);
+            let reviewer = DioxusReviewHandler::new(signals, slot, bundle_slot);
 
             let service = MigrationService::new(Arc::clone(&ctx));
             let report = service
@@ -1836,6 +1913,46 @@ fn reject_all_and_submit(state: &SharedState) {
         }
     });
     submit_review(state);
+}
+
+/// Send the approved bundle ids to the parked `review_bundles` oneshot. Only
+/// bundles explicitly toggled to approve are sent — undecided and rejected
+/// bundles are held, the safe default (mirrors `submit_review`).
+fn submit_bundle_review(state: &SharedState) {
+    let signals = state.signals;
+    let slot = state.bundle_review_slot.clone();
+    spawn_forever(async move {
+        let tx_opt = {
+            let mut guard = slot.lock().await;
+            guard.take()
+        };
+        let Some(tx) = tx_opt else {
+            tracing::warn!("submit_bundle_review: no pending oneshot sender");
+            return;
+        };
+        let approved: Vec<Uuid> = signals
+            .bundle_approvals
+            .read()
+            .iter()
+            .filter_map(|(id, approved)| (*approved).then_some(*id))
+            .collect();
+        if tx.send(approved).is_err() {
+            tracing::warn!("submit_bundle_review: service receiver dropped before send");
+        }
+    });
+}
+
+fn reject_all_bundles_and_submit(state: &SharedState) {
+    let signals = state.signals;
+    let bundles = signals.bundles.read().clone();
+    let mut approvals = signals.bundle_approvals;
+    approvals.with_mut(|map| {
+        map.clear();
+        for b in &bundles {
+            map.insert(b.id, false);
+        }
+    });
+    submit_bundle_review(state);
 }
 
 fn refresh_runs(state: &SharedState) {

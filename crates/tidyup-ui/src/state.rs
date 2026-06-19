@@ -73,6 +73,10 @@ pub(crate) struct SignalBundle {
     pub(crate) proposals: SyncSignal<Vec<ChangeProposal>>,
     pub(crate) bundles: SyncSignal<Vec<BundleProposal>>,
     pub(crate) decisions: SyncSignal<HashMap<Uuid, ReviewDecision>>,
+    /// Per-bundle approve (`true`) / reject (`false`) decisions during the
+    /// atomic bundle-review pass. Absent = undecided (defaults to reject at
+    /// submit, mirroring the loose-proposal flow).
+    pub(crate) bundle_approvals: SyncSignal<HashMap<Uuid, bool>>,
     pub(crate) review_pending: SyncSignal<bool>,
     pub(crate) busy: SyncSignal<Busy>,
     pub(crate) last_report: SyncSignal<Option<LastReport>>,
@@ -87,6 +91,11 @@ pub(crate) struct SignalBundle {
 /// starts), so a `tokio::Mutex` is the right primitive.
 pub(crate) type ReviewSlot = Arc<Mutex<Option<oneshot::Sender<Vec<ReviewDecision>>>>>;
 
+/// Non-signal state: the pending bundle review's sender, carrying the ids of the
+/// bundles the user approved. Separate from [`ReviewSlot`] because the service
+/// reviews loose proposals and bundles in two distinct `ReviewHandler` calls.
+pub(crate) type BundleReviewSlot = Arc<Mutex<Option<oneshot::Sender<Vec<Uuid>>>>>;
+
 /// Top-level shared state provided at the app root and consumed by every page.
 ///
 /// `PartialEq` is implemented via pointer identity on `review_slot` so that
@@ -97,11 +106,14 @@ pub(crate) type ReviewSlot = Arc<Mutex<Option<oneshot::Sender<Vec<ReviewDecision
 pub(crate) struct SharedState {
     pub(crate) signals: SignalBundle,
     pub(crate) review_slot: ReviewSlot,
+    pub(crate) bundle_review_slot: BundleReviewSlot,
 }
 
 impl PartialEq for SharedState {
     fn eq(&self, other: &Self) -> bool {
-        self.signals == other.signals && Arc::ptr_eq(&self.review_slot, &other.review_slot)
+        self.signals == other.signals
+            && Arc::ptr_eq(&self.review_slot, &other.review_slot)
+            && Arc::ptr_eq(&self.bundle_review_slot, &other.bundle_review_slot)
     }
 }
 
@@ -128,6 +140,7 @@ impl SharedState {
             proposals: Signal::new_maybe_sync_in_scope(Vec::new(), ScopeId::ROOT),
             bundles: Signal::new_maybe_sync_in_scope(Vec::new(), ScopeId::ROOT),
             decisions: Signal::new_maybe_sync_in_scope(HashMap::new(), ScopeId::ROOT),
+            bundle_approvals: Signal::new_maybe_sync_in_scope(HashMap::new(), ScopeId::ROOT),
             review_pending: Signal::new_maybe_sync_in_scope(false, ScopeId::ROOT),
             busy: Signal::new_maybe_sync_in_scope(Busy::Idle, ScopeId::ROOT),
             last_report: Signal::new_maybe_sync_in_scope(None, ScopeId::ROOT),
@@ -138,6 +151,7 @@ impl SharedState {
         Self {
             signals,
             review_slot: Arc::new(Mutex::new(None)),
+            bundle_review_slot: Arc::new(Mutex::new(None)),
         }
     }
 }
