@@ -24,7 +24,7 @@ jobs:
   create-release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.0.3
       - uses: taiki-e/create-gh-release-action@v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -45,7 +45,7 @@ jobs:
             os: windows-latest
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.0.3
       # `bin: tidyup` builds only the CLI binary target with default features —
       # `tidyup-ui` is not in its dependency graph, so no GTK/WebKit is needed on
       # the Linux runner. The archive carries the binary + license + readme.
