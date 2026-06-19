@@ -29,7 +29,12 @@
 //! punctuation boundary). Each candidate is scored by the YAKE keyphrase rule
 //! `∏ S(t) / (TF(kw) · (1 + ∑ S(t)))` over its constituent per-term scores —
 //! for a unigram this reduces to `S(t) / (TF · (1 + S(t)))`. **Lower is better.**
-//! English-only stopwords — multilingual support lands with `bge-m3`.
+//!
+//! Stopwords are **language-aware**: [`detect_language`] picks the document's
+//! language by stopword overlap (English by default) so renames for non-English
+//! content stay clean. This is independent of classification, which still uses
+//! the English `bge-small` model — full multilingual *classification* awaits a
+//! multilingual embedding model (`bge-m3`).
 
 use std::collections::{HashMap, HashSet};
 
@@ -58,12 +63,15 @@ pub fn extract_keywords(text: &str, k: usize) -> Vec<Keyword> {
         return Vec::new();
     }
 
+    // Pick the stopword set from the detected language (English by default).
+    let stopwords = stopwords_for(detect_language(text));
+
     // Per-term statistics keyed by lowercased form.
     let mut stats: HashMap<String, TermStats> = HashMap::new();
     for (sent_idx, sent) in sentences.iter().enumerate() {
         let tokens: Vec<&str> = tokenize(sent).collect();
         for (pos, tok) in tokens.iter().enumerate() {
-            if !is_candidate(tok) {
+            if !is_candidate(tok, stopwords) {
                 continue;
             }
             let key = tok.to_lowercase();
@@ -124,7 +132,7 @@ pub fn extract_keywords(text: &str, k: usize) -> Vec<Keyword> {
         .collect();
 
     // Assemble n-gram candidates and score each by the YAKE keyphrase rule.
-    let mut scored: Vec<Keyword> = ngram_candidates(&sentences, DEFAULT_MAX_NGRAM)
+    let mut scored: Vec<Keyword> = ngram_candidates(&sentences, DEFAULT_MAX_NGRAM, stopwords)
         .into_iter()
         .map(|(phrase, (terms, tf))| {
             let prod: f32 = terms
@@ -161,14 +169,18 @@ pub fn extract_keywords(text: &str, k: usize) -> Vec<Keyword> {
 /// candidate tokens within each sentence — a phrase never spans a stopword,
 /// numeric, or punctuation boundary. Returns a map from the lowercased phrase to
 /// its constituent terms and its document frequency.
-fn ngram_candidates(sentences: &[&str], max_n: usize) -> HashMap<String, (Vec<String>, u32)> {
+fn ngram_candidates(
+    sentences: &[&str],
+    max_n: usize,
+    stopwords: &[&str],
+) -> HashMap<String, (Vec<String>, u32)> {
     let mut grams: HashMap<String, (Vec<String>, u32)> = HashMap::new();
     for sent in sentences {
         // Split the sentence into runs of consecutive candidate tokens.
         let mut runs: Vec<Vec<String>> = Vec::new();
         let mut current: Vec<String> = Vec::new();
         for tok in tokenize(sent) {
-            if is_candidate(tok) {
+            if is_candidate(tok, stopwords) {
                 current.push(tok.to_lowercase());
             } else if !current.is_empty() {
                 runs.push(std::mem::take(&mut current));
@@ -213,7 +225,7 @@ fn tokenize(sentence: &str) -> impl Iterator<Item = &str> {
         .filter(|s| !s.is_empty())
 }
 
-fn is_candidate(tok: &str) -> bool {
+fn is_candidate(tok: &str, stopwords: &[&str]) -> bool {
     if tok.len() < 2 {
         return false;
     }
@@ -223,7 +235,7 @@ fn is_candidate(tok: &str) -> bool {
     {
         return false;
     }
-    !is_stopword(&tok.to_lowercase())
+    !is_stopword(&tok.to_lowercase(), stopwords)
 }
 
 fn is_upper_initial(tok: &str) -> bool {
@@ -238,10 +250,82 @@ fn is_all_upper(tok: &str) -> bool {
             .all(|c| c.is_uppercase() || c == '-' || c == '_')
 }
 
-// Minimal English stopword list. Tuned for filename/prose balance, not
-// exhaustive NLP coverage — the YAKE score already penalizes most common
-// words via `T_FreqT`.
-const STOPWORDS: &[&str] = &[
+/// Languages with stopword coverage.
+///
+/// This only governs which stopword set the keyword extractor uses, so renames
+/// for non-English content stay clean. Full multilingual *classification* still
+/// needs a multilingual embedding model (`bge-m3`) and is tracked separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Language {
+    English,
+    Spanish,
+    French,
+    German,
+}
+
+/// Candidate languages, English first (the default).
+const LANGUAGES: &[Language] = &[
+    Language::English,
+    Language::Spanish,
+    Language::French,
+    Language::German,
+];
+
+/// Minimum non-English stopword hits before detection will switch away from the
+/// English default — guards against flipping on incidental overlap.
+const MIN_FOREIGN_HITS: usize = 3;
+
+/// Detect the document language by stopword overlap.
+///
+/// English is the default and only loses to a language whose stopwords
+/// *strictly* dominate (and clear [`MIN_FOREIGN_HITS`]), so English documents —
+/// the common case — always stay on the existing path. Cheap enough to run
+/// inline (a few `contains` scans).
+#[must_use]
+pub fn detect_language(text: &str) -> Language {
+    let mut counts = [0usize; LANGUAGES.len()];
+    for sentence in split_sentences(text) {
+        for tok in tokenize(sentence) {
+            let lower = tok.to_lowercase();
+            for (i, lang) in LANGUAGES.iter().enumerate() {
+                if stopwords_for(*lang).contains(&lower.as_str()) {
+                    counts[i] += 1;
+                }
+            }
+        }
+    }
+    let english = counts[0];
+    let (best_idx, best) = counts
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, c)| **c)
+        .map_or((0, 0), |(i, c)| (i, *c));
+    if best_idx != 0 && best > english && best >= MIN_FOREIGN_HITS {
+        LANGUAGES[best_idx]
+    } else {
+        Language::English
+    }
+}
+
+const fn stopwords_for(lang: Language) -> &'static [&'static str] {
+    match lang {
+        Language::English => STOPWORDS_EN,
+        Language::Spanish => STOPWORDS_ES,
+        Language::French => STOPWORDS_FR,
+        Language::German => STOPWORDS_DE,
+    }
+}
+
+fn is_stopword(tok: &str, stopwords: &[&str]) -> bool {
+    // Lists are small (~50-100 entries); linear search beats maintaining a
+    // lazily-built `HashSet` across calls.
+    stopwords.contains(&tok)
+}
+
+// Minimal stopword lists per language. Tuned for filename/prose balance, not
+// exhaustive NLP coverage — the YAKE score already penalizes common words via
+// `T_FreqT`. These also drive language detection above.
+const STOPWORDS_EN: &[&str] = &[
     "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from", "has", "have", "he",
     "her", "his", "i", "in", "is", "it", "its", "of", "on", "or", "she", "that", "the", "their",
     "them", "there", "they", "this", "to", "was", "we", "were", "will", "with", "you", "your",
@@ -253,11 +337,29 @@ const STOPWORDS: &[&str] = &[
     "off", "once", "only", "own", "same", "very", "where", "while", "am",
 ];
 
-fn is_stopword(tok: &str) -> bool {
-    // List is small enough (~100 entries) that linear search beats the
-    // overhead of maintaining a lazily-built `HashSet` across calls.
-    STOPWORDS.contains(&tok)
-}
+const STOPWORDS_ES: &[&str] = &[
+    "el", "la", "los", "las", "un", "una", "unos", "unas", "de", "del", "al", "a", "ante", "con",
+    "en", "por", "para", "sin", "sobre", "entre", "hasta", "desde", "y", "e", "o", "u", "que",
+    "como", "más", "pero", "porque", "cuando", "donde", "su", "sus", "se", "lo", "le", "les", "mi",
+    "tu", "es", "son", "ser", "está", "están", "este", "esta", "esto", "ese", "esa", "eso", "no",
+    "sí", "ya", "muy", "también", "hay", "fue", "han", "ha",
+];
+
+const STOPWORDS_FR: &[&str] = &[
+    "le", "la", "les", "un", "une", "des", "de", "du", "et", "ou", "que", "qui", "quoi", "dont",
+    "où", "dans", "en", "au", "aux", "pour", "par", "sur", "sous", "sans", "avec", "ce", "cet",
+    "cette", "ces", "son", "sa", "ses", "mon", "ma", "mes", "je", "tu", "il", "elle", "nous",
+    "vous", "ils", "elles", "est", "sont", "été", "être", "ne", "pas", "plus", "mais", "comme",
+    "ainsi", "donc", "aussi",
+];
+
+const STOPWORDS_DE: &[&str] = &[
+    "der", "die", "das", "den", "dem", "des", "ein", "eine", "einen", "einem", "einer", "und",
+    "oder", "aber", "dass", "weil", "wenn", "als", "wie", "von", "zu", "mit", "nach", "bei", "aus",
+    "auf", "im", "in", "an", "am", "für", "ist", "sind", "war", "waren", "sein", "hat", "haben",
+    "wird", "werden", "nicht", "kein", "keine", "auch", "noch", "nur", "schon", "sehr", "man",
+    "sich", "es", "ich", "wir", "ihr",
+];
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::float_cmp)]
@@ -358,8 +460,54 @@ mod tests {
 
     #[test]
     fn is_stopword_lookup() {
-        assert!(is_stopword("the"));
-        assert!(is_stopword("and"));
-        assert!(!is_stopword("foo"));
+        assert!(is_stopword("the", STOPWORDS_EN));
+        assert!(is_stopword("and", STOPWORDS_EN));
+        assert!(!is_stopword("foo", STOPWORDS_EN));
+    }
+
+    #[test]
+    fn detect_language_defaults_to_english() {
+        assert_eq!(detect_language(""), Language::English);
+        assert_eq!(
+            detect_language("The quarterly report is on the shared drive."),
+            Language::English,
+        );
+        // Too little foreign signal to switch away from English.
+        assert_eq!(detect_language("le rapport"), Language::English);
+    }
+
+    #[test]
+    fn detect_language_recognizes_romance_and_germanic() {
+        assert_eq!(
+            detect_language("le rapport trimestriel est sur le disque et dans le dossier"),
+            Language::French,
+        );
+        assert_eq!(
+            detect_language("el informe trimestral está en el disco y en la carpeta de la empresa"),
+            Language::Spanish,
+        );
+        assert_eq!(
+            detect_language(
+                "der vierteljährliche Bericht ist auf der Festplatte und in dem Ordner"
+            ),
+            Language::German,
+        );
+    }
+
+    #[test]
+    fn french_stopwords_are_filtered_in_french_text() {
+        let text = "Le contrat de location de l'appartement. \
+                    Le contrat précise le loyer mensuel et la caution.";
+        let out = extract_keywords(text, 8);
+        let terms: Vec<&str> = out.iter().map(|k| k.term.as_str()).collect();
+        // French stopwords must not surface as standalone keywords…
+        assert!(!terms.contains(&"le"), "French stopword leaked: {terms:?}");
+        assert!(!terms.contains(&"la"), "French stopword leaked: {terms:?}");
+        assert!(!terms.contains(&"de"), "French stopword leaked: {terms:?}");
+        // …while domain terms still do.
+        assert!(
+            out.iter().any(|k| k.term.contains("contrat")),
+            "expected 'contrat'; got {terms:?}",
+        );
     }
 }
