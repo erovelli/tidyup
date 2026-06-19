@@ -1,0 +1,22 @@
+Jane Doe — Senior Software Engineer
+San Francisco, CA · jane.doe@example.com · linkedin.com/in/janedoe
+
+Professional Summary
+Backend engineer with 8 years of experience building distributed systems in
+Rust and Go. Seeking a senior engineering role at an early-stage startup.
+
+Experience
+Staff Engineer, Acme Corp (2020–present)
+- Led migration of the billing platform to an event-sourced architecture.
+- Mentored four engineers; owned on-call rotation and incident review.
+
+Software Engineer, Globex (2016–2020)
+- Built the data ingestion pipeline handling 2B events per day.
+
+Skills
+Rust, Go, PostgreSQL, distributed systems, gRPC, Kubernetes.
+
+Education
+B.S. Computer Science, State University.
+
+References available upon request. Cover letter and portfolio attached.

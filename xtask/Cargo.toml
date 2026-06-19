@@ -21,5 +21,16 @@ blake3  = { workspace = true }
 dirs    = { workspace = true }
 indicatif = { workspace = true }
 
+# `eval` harness: runs the real cascade (heuristics + optional embeddings) over
+# the golden corpus. xtask is a dev-only, never-published binary, so pulling in
+# the pipeline + embedding crates here keeps the eval tool out of the shipping
+# graph entirely.
+serde      = { workspace = true }
+serde_json = { workspace = true }
+toml       = { workspace = true }
+tokio      = { workspace = true }
+tidyup-pipeline       = { workspace = true }
+tidyup-embeddings-ort = { workspace = true }
+
 [lints]
 workspace = true

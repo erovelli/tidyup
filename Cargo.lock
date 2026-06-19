@@ -10600,6 +10600,12 @@ dependencies = [
  "dirs",
  "indicatif 0.18.4",
  "reqwest 0.13.2",
+ "serde",
+ "serde_json",
+ "tidyup-embeddings-ort",
+ "tidyup-pipeline",
+ "tokio",
+ "toml 1.1.2+spec-1.1.0",
 ]
 
 [[package]]

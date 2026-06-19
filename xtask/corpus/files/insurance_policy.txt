@@ -1,0 +1,18 @@
+Auto Insurance Policy — Declarations Page
+
+Policy number: AP-558204-3
+Insured: Jane Doe
+Policy period: 12 months
+
+Coverage summary:
+- Bodily injury liability: 100,000 per person / 300,000 per accident
+- Property damage liability: 50,000
+- Collision: 500 deductible
+- Comprehensive: 250 deductible
+- Uninsured motorist: included
+
+Annual premium: 1,284.00, payable in monthly installments.
+
+This declarations page summarizes your coverage, deductibles, and premium. Keep
+it with your insurance records. Refer to the full policy for terms, conditions,
+and exclusions.

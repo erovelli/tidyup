@@ -1,0 +1,15 @@
+Flight Confirmation — Booking Reference: QH7P2K
+
+Passenger: Jane Doe
+Airline: Pacific Air
+E-ticket number: 014-2233445566
+
+Outbound
+Flight PA 482, departs SFO (San Francisco) 08:15, arrives JFK (New York) 16:40.
+Seat 14C. Boarding group 3. Gate and terminal shown on your boarding pass.
+
+Return
+Flight PA 119, departs JFK 18:05, arrives SFO 21:30. Seat 09A.
+
+Please arrive at the departure gate no later than 30 minutes before boarding.
+Check in online to receive your boarding pass.

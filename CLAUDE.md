@@ -27,6 +27,12 @@ cargo xtask lint            # clippy --all-features -D warnings
 cargo xtask deny            # requires: cargo install cargo-deny
 cargo xtask feature-matrix  # requires: cargo install cargo-hack
 
+# Classification accuracy over the labeled golden corpus (xtask/corpus/).
+# Model-free Tier-1 always runs; Tier-2 needs the bge-small bundle installed.
+# Calibration tool — NOT part of `ci`, which must stay model-free.
+cargo xtask eval
+cargo xtask eval --json
+
 # Single crate / single test
 cargo check -p tidyup-domain
 cargo test  -p tidyup-pipeline

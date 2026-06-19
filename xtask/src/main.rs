@@ -3,6 +3,7 @@
 //! Replaces ad-hoc shell scripts. Keeps the build story portable across Linux,
 //! macOS, and Windows with no bash dependency.
 
+mod eval;
 mod models;
 mod privacy;
 
@@ -58,6 +59,22 @@ enum Task {
     /// deps. Runs `cargo tree -p tidyup-cli -e normal` and fails if any
     /// banned crate appears. Embedded in `ci`.
     CheckPrivacy,
+    /// Evaluate classification accuracy over the labeled golden corpus under
+    /// `xtask/corpus/`.
+    ///
+    /// Tier-1 heuristics run with no model; Tier-2 embedding scoring runs only
+    /// when the `bge-small-en-v1.5` bundle is installed (otherwise
+    /// content-dependent entries are deferred). Reports accuracy, per-label
+    /// precision / recall / F1, tier coverage, and confusions. Not part of
+    /// `ci` — it is a calibration tool.
+    Eval {
+        /// Emit the report as JSON instead of a human-readable summary.
+        #[arg(long)]
+        json: bool,
+        /// Skip the Tier-2 embedding pass even if the model bundle is present.
+        #[arg(long)]
+        no_model: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -95,6 +112,7 @@ impl Task {
                 models::download(force, want_siglip, want_clap)
             }
             Self::CheckPrivacy => privacy::check(),
+            Self::Eval { json, no_model } => eval::run(json, no_model),
         }
     }
 }
