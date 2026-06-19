@@ -152,6 +152,12 @@ By default tidyup reports `confidence` as the **raw weighted-cosine score**, not
 
 The calibration **mechanism** now exists: `ClassifierConfig.calibration` (a `tidyup_domain::Calibration`, default `Identity`) applies optional Platt scaling `sigmoid(a·raw + b)` to reported confidence, and `cargo xtask eval --calibrate` fits `(a, b)` over the golden corpus and reports Expected Calibration Error before/after (`tidyup_pipeline::calibration`). But the **shipped default stays `Identity` (uncalibrated)**: a trustworthy fitted parameter set needs the embedding model plus a held-out labelled corpus larger than the current fixture set. Until that ships, claiming "calibrated 85%" would be marketing, not engineering — the tooling to earn it is in place; the corpus isn't yet.
 
+### Validating the premise (held-out routing eval)
+
+Calibration is downstream of a more basic question: *does content-embedding routing actually beat the cheap baselines it claims to replace?* `cargo xtask eval-routing <corpus>` (`xtask/src/routing_eval.rs`) is the falsifiable experiment. It treats an **already-organized directory as ground truth** (folder = label — 20 Newsgroups, BBC-News-by-category, etc. drop straight in), holds out files per label, builds each folder's content centroid from the train split, and routes the held-out files with the **real** embedding backend and the migration centroid-cosine rule. It reports top-1/top-3 with bootstrap 95% CIs against three baselines — **filename-embedding** (the one tidyup must beat to justify reading contents at all), most-frequent (chance floor), and extension — plus the content−filename delta; `--fail-under <margin>` turns that delta into a gate.
+
+Honest bounds: public corpora are cleanly separable, so they are an **upper bound** ("if it can't sort 20NG it can't sort a real Downloads folder" — necessary, not sufficient); the real test is a consented personal corpus, and reported accuracy is capped by inter-annotator agreement on the labels. The split, metrics, and baselines are unit-tested deterministically against a stub backend, so the *instrument* is proven without a model; the **`model-eval` nightly lane** runs it (and `eval`) against the real model + corpus — the only CI lane that touches the embedding path.
+
 Proposal reasoning strings surface raw sub-scores:
 
 ```

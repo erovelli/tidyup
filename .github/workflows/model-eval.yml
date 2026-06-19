@@ -1,0 +1,108 @@
+name: Model eval (nightly)
+
+# The one lane that exercises the REAL embedding path end-to-end — the product's
+# spine, which the default model-free CI never touches. It:
+#   1. provisions libonnxruntime + the bge-small bundle,
+#   2. runs `cargo xtask eval` (taxonomy classification accuracy),
+#   3. fetches a real already-foldered corpus (20 Newsgroups) and runs
+#      `cargo xtask eval-routing` — the falsifiable "content beats filename" test,
+#      gated so a regression (or a broken premise) fails the lane.
+#
+# Deliberately NOT a PR gate: it needs network (HuggingFace + the corpus) and a
+# CPU-minutes embedding pass, so it runs on a schedule + on demand. Keeping it
+# out of `pull_request` preserves the fast, network-silent default CI.
+#
+# NOTE: this is the first CI lane to load the model; the onnxruntime
+# provisioning below may need a version bump on its first real run (ort
+# 2.0.0-rc.12 / api-23 ↔ ONNX Runtime 1.20.x).
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 07:00 UTC daily.
+    - cron: "0 7 * * *"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Cap docs/category so the embedding pass stays within CI minutes while the
+  # bootstrap CIs remain meaningful. Bump for a tighter estimate.
+  DOCS_PER_LABEL: "120"
+
+jobs:
+  model-eval:
+    name: model-eval (linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6.0.3
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Provision libonnxruntime
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet "onnxruntime==1.20.1"
+          ORT_SO="$(python3 - <<'PY'
+          import glob, os, onnxruntime
+          d = os.path.dirname(onnxruntime.__file__)
+          libs = sorted(glob.glob(os.path.join(d, "capi", "libonnxruntime.so*")))
+          assert libs, "libonnxruntime.so not found in onnxruntime wheel"
+          print(libs[0])
+          PY
+          )"
+          echo "ORT_DYLIB_PATH=$ORT_SO" >> "$GITHUB_ENV"
+          echo "Using libonnxruntime at: $ORT_SO"
+
+      - name: Download embedding bundle (bge-small)
+        run: cargo run -p xtask -- download-models
+
+      - name: Verify bundle integrity
+        run: cargo run -p xtask -- verify-models
+
+      - name: Taxonomy-classification accuracy (eval)
+        run: cargo run -p xtask -- eval --json | tee eval.json
+
+      - name: Build a real held-out corpus (20 Newsgroups)
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet scikit-learn
+          python3 - <<'PY'
+          import os
+          from sklearn.datasets import fetch_20newsgroups
+          cap = int(os.environ.get("DOCS_PER_LABEL", "120"))
+          data = fetch_20newsgroups(subset="all", remove=("headers", "footers", "quotes"))
+          counts = {}
+          written = 0
+          for text, target in zip(data.data, data.target):
+              label = data.target_names[target]
+              n = counts.get(label, 0)
+              if n >= cap or len(text.strip()) < 40:
+                  continue
+              d = os.path.join("corpus20ng", label)
+              os.makedirs(d, exist_ok=True)
+              with open(os.path.join(d, f"doc{n}.txt"), "w", encoding="utf-8") as f:
+                  f.write(text)
+              counts[label] = n + 1
+              written += 1
+          print(f"wrote {written} docs across {len(counts)} labels (cap {cap}/label)")
+          PY
+
+      - name: Held-out routing accuracy + baselines (eval-routing)
+        # Gate: content routing must beat the filename baseline on top-1 (the
+        # falsifiable premise). 0.0 = "strictly better"; tighten as the real
+        # number stabilizes.
+        run: cargo run -p xtask -- eval-routing corpus20ng --json --fail-under 0.0 | tee routing.json
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-reports
+          path: |
+            eval.json
+            routing.json
+          if-no-files-found: ignore
