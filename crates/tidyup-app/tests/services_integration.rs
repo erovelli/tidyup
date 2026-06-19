@@ -400,6 +400,55 @@ async fn scan_service_applies_moves_and_rollback_restores_them() {
 }
 
 #[tokio::test]
+async fn rollback_service_prunes_shelved_backups() {
+    use tidyup_app::RollbackService;
+
+    let workdir = TempDir::new().unwrap();
+    let shelf = workdir.path().join("shelf");
+    std::fs::create_dir_all(&shelf).unwrap();
+    let src_root = workdir.path().join("src");
+    std::fs::create_dir_all(&src_root).unwrap();
+    std::fs::write(src_root.join("helpers.rs"), b"fn main() {}").unwrap();
+
+    let (ctx, _store) = make_ctx_with_shelf(Some(shelf));
+    let candidates = sample_scan_candidates().await;
+    let service = ScanService::new(Arc::clone(&ctx));
+    let rollback = RollbackService::new(Arc::clone(&ctx));
+
+    // Empty shelf → nothing to prune.
+    assert_eq!(rollback.prune_backups(0).await.unwrap(), 0);
+
+    // A real apply shelves the original before moving it.
+    let report = service
+        .run(
+            tidyup_app::scan::ScanRequest {
+                root: src_root.clone(),
+                taxonomy_path: None,
+                dry_run: false,
+                auto_approve_bundles: false,
+                bundle_min_confidence: 0.85,
+            },
+            &candidates,
+            &[],
+            &[],
+            &NullProgress,
+            &AutoApprove::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.applied, 1);
+
+    // Prune everything shelved before now → the just-shelved original expires.
+    assert_eq!(
+        rollback.prune_backups(0).await.unwrap(),
+        1,
+        "the shelved original should be pruned",
+    );
+    // Idempotent: a second prune finds nothing.
+    assert_eq!(rollback.prune_backups(0).await.unwrap(), 0);
+}
+
+#[tokio::test]
 async fn rollback_service_lists_runs_most_recent_first() {
     use tidyup_app::RollbackService;
 
