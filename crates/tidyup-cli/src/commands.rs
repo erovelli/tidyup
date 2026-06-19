@@ -49,6 +49,11 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<()> {
             taxonomy,
             dry_run,
         } => run_scan(yes, json, activation, &cfg, root, taxonomy, dry_run).await,
+        Command::Watch {
+            root,
+            taxonomy,
+            debounce_ms,
+        } => crate::watch::run_watch(json, activation, &cfg, root, taxonomy, debounce_ms).await,
         Command::Rollback { run_id, list } => {
             if list {
                 run_list_runs(json, &cfg).await

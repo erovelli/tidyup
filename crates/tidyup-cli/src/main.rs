@@ -22,6 +22,7 @@ mod commands;
 mod context;
 mod reporter;
 mod review;
+mod watch;
 
 use clap::{Parser, Subcommand};
 
@@ -82,6 +83,19 @@ enum Command {
         taxonomy: Option<std::path::PathBuf>,
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Watch SOURCE and report proposals (dry-run) on every change.
+    ///
+    /// Advisory only: it never moves files — run `scan` to apply. The model loads
+    /// once and is reused across rescans. Press Ctrl-C to stop.
+    Watch {
+        root: std::path::PathBuf,
+        /// Custom taxonomy TOML file (same format as `scan --taxonomy`).
+        #[arg(long)]
+        taxonomy: Option<std::path::PathBuf>,
+        /// Debounce window (ms) for coalescing rapid changes into one rescan.
+        #[arg(long, default_value_t = 500)]
+        debounce_ms: u64,
     },
     /// Roll back a previous run by ID, or list recorded runs with `--list`.
     Rollback {
