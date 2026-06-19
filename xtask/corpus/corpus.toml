@@ -1,0 +1,126 @@
+# Golden evaluation corpus for tidyup's classification cascade.
+#
+# Each entry pins a fixture file to the taxonomy folder it *should* land in.
+#
+#   file     — path relative to `xtask/corpus/`.
+#   expected — taxonomy leaf the cascade should route the file to (trailing '/').
+#              Temporal categories may append a year subdirectory at runtime
+#              (e.g. "Finance/Taxes/2023/"); the harness treats that as correct.
+#   tier1    — true  => Tier-1 heuristics alone should resolve it (extension or
+#                       marker filename). These are deterministic and run in CI
+#                       with no model.
+#              false => content-dependent; only the Tier-2 embedding classifier
+#                       can route it, so it is scored only when the
+#                       bge-small-en-v1.5 bundle is installed.
+#
+# Keep `expected` for tier1 entries in sync with `tidyup_pipeline::heuristics`
+# — the `tier1_entries_match_heuristics` test enforces it.
+
+# ── Tier 1: heuristic-resolvable (extension / marker filename) ──────────────
+
+[[entry]]
+file = "files/main.rs"
+expected = "Code/"
+tier1 = true
+
+[[entry]]
+file = "files/server.py"
+expected = "Code/"
+tier1 = true
+
+[[entry]]
+file = "files/settings.toml"
+expected = "Code/Config/"
+tier1 = true
+
+[[entry]]
+file = "files/Dockerfile"
+expected = "Code/Config/"
+tier1 = true
+
+[[entry]]
+file = "files/Makefile"
+expected = "Code/Config/"
+tier1 = true
+
+[[entry]]
+file = "files/data.csv"
+expected = "Spreadsheets/"
+tier1 = true
+
+[[entry]]
+file = "files/budget.xlsx"
+expected = "Spreadsheets/"
+tier1 = true
+
+[[entry]]
+file = "files/archive.zip"
+expected = "Archives/"
+tier1 = true
+
+[[entry]]
+file = "files/Inter.ttf"
+expected = "Fonts/"
+tier1 = true
+
+[[entry]]
+file = "files/holiday.jpg"
+expected = "Photos/"
+tier1 = true
+
+[[entry]]
+file = "files/Screenshot_2024-01-02.png"
+expected = "Screenshots/"
+tier1 = true
+
+[[entry]]
+file = "files/song.mp3"
+expected = "Music/"
+tier1 = true
+
+[[entry]]
+file = "files/clip.mp4"
+expected = "Videos/"
+tier1 = true
+
+[[entry]]
+file = "files/README.md"
+expected = "Documents/Manuals/"
+tier1 = true
+
+# ── Tier 2: content-dependent (embedding classifier) ────────────────────────
+
+[[entry]]
+file = "files/tax_return_2023.txt"
+expected = "Finance/Taxes/"
+tier1 = false
+
+[[entry]]
+file = "files/insurance_policy.txt"
+expected = "Finance/Insurance/"
+tier1 = false
+
+[[entry]]
+file = "files/chocolate_cake_recipe.txt"
+expected = "Recipes/"
+tier1 = false
+
+[[entry]]
+file = "files/resume_jane_doe.txt"
+expected = "Work/Career/"
+tier1 = false
+
+[[entry]]
+file = "files/standup_notes.md"
+expected = "Work/Meetings/"
+tier1 = false
+
+[[entry]]
+file = "files/lecture_notes_biology.md"
+expected = "School/Notes/"
+tier1 = false
+
+[[entry]]
+file = "files/flight_confirmation.txt"
+expected = "Travel/Flights/"
+tier1 = false

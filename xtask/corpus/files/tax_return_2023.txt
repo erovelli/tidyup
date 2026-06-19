@@ -1,0 +1,14 @@
+Form 1040 — U.S. Individual Income Tax Return, tax year 2023.
+
+Taxpayer: Jane Q. Sample. Filing status: single.
+Wages, salaries, and tips from Form W-2, box 1: 82,400.00
+Federal income tax withheld (W-2 box 2): 11,260.00
+Taxable interest (1099-INT): 312.00
+Adjusted gross income: 82,712.00
+Standard deduction: 13,850.00
+Total tax: 9,940.00
+Refund owed by the IRS: 1,320.00
+
+Attached schedules: Schedule 1 (additional income), Schedule B (interest and
+ordinary dividends). Estimated quarterly tax payments reconciled. Keep this
+return and supporting documents for your federal tax records.
