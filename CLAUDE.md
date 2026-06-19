@@ -128,18 +128,18 @@ First-run UX, onboarding, and default documentation never recommend either. The 
 
 Files are not always independent. A coding project, photo burst, or music album loses meaning when fragmented. These are **bundles** and move as atomic units.
 
-**Detection happens during the initial walk**, before per-file classification. Markers (`.git/`, `Cargo.toml`, `package.json`, `pyproject.toml`, `*.xcodeproj`, consistent EXIF timestamps, consistent ID3 album tags) mark a subtree as an opaque bundle. **The pipeline never descends into a detected bundle for individual classification.**
+**Two bundle shapes.** *Directory bundles* are found during the initial walk (`scanner`), before per-file classification: structural markers (`.git/`, `Cargo.toml`, `package.json`, `pyproject.toml`, `*.xcodeproj`, Gradle, ≥2 sibling `.ipynb`) mark a whole subtree as an opaque bundle the pipeline never descends into. *File-set bundles* are content clusters of loose sibling files, found by a second pass (`clustering`) over the scanner's loose files: **photo bursts** (EXIF capture times within a window), **music albums** (shared ID3 album tag), **document series** (filename families like `invoice-01`, `-02`). They have no shared directory to rename — `BundleKind::moves_as_file_set()` is the discriminator the executor and rollback branch on.
 
-**Atomic apply:**
+**Atomic apply** (in `tidyup-app::executor`, routed by `BundleKind::moves_as_file_set()`):
 
-- Same-volume bundle moves use a single `std::fs::rename()` on the bundle root. POSIX `rename(2)` and NTFS `MoveFile` are atomic on the same volume. One syscall, no intermediate state.
-- Cross-volume bundle moves use copy-verify-delete: stage the entire subtree on the target volume, verify by content hash, delete original, commit the final rename. Any failure at any step rolls back the entire bundle — staged data is discarded, originals untouched.
+- *Directory bundles* — same-volume: a single `std::fs::rename()` on the bundle root (POSIX `rename(2)` / NTFS `MoveFile`, atomic on one volume, no intermediate state). Cross-volume: copy-verify-delete the whole subtree (verify by content hash), then delete the original; any failure discards staged data, originals untouched.
+- *File-set bundles* — pre-flight (every source present, no target occupied), then shelve + move each member individually, keyed by the member's **own** proposal id. **Any member failure reverses all completed moves** (LIFO), so the cluster relocates whole or not at all. Rollback restores each member from its shelf record by the same id.
 
 **Domain shape.** Bundles are a first-class aggregate: `BundleProposal { root, kind, members: Vec<ChangeProposal>, target_parent, confidence, status }`. Individual member proposals are never approved, applied, or rolled back independently. Member proposals cannot carry rename suggestions. The SQL schema: a `bundles` table plus a `bundle_id` foreign key on `change_proposals`.
 
 **Bundle review is per-bundle, never per-member.** `ReviewHandler::review_bundles` returns the ids of approved *bundles* (not `ReviewDecision`s and no `Override` — members carry their own paths). The default impl approves nothing, so a frontend without a bundle surface holds every bundle. `--yes` skips the handler and applies the confidence threshold directly. Don't add a per-member bundle decision path.
 
-**Do not** introduce partial-bundle apply paths, per-member rollback, or any code that allows some members to move while others don't. This invariant has no exceptions.
+**Do not** introduce partial-bundle apply paths or any code that lets some members move while others don't. (File-set bundles necessarily move members one at a time, but the executor reverses every completed move on any failure and rollback restores every member — still strictly all-or-nothing.) This invariant has no exceptions.
 
 ## Rename policy
 

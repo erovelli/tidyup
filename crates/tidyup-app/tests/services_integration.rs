@@ -538,6 +538,81 @@ async fn interactive_bundle_review_applies_and_rollback_restores_it() {
 }
 
 #[tokio::test]
+async fn file_set_bundle_applies_atomically_and_rollback_restores_it() {
+    use tidyup_app::RollbackService;
+
+    // Three sibling files forming a filename family become a DocumentSeries —
+    // a *file-set* bundle (no shared directory; members move individually,
+    // atomically). Exercises apply_file_set_bundle + rollback_file_set_bundle
+    // through the real SqliteStore (shelve + restore keyed by member id).
+    let workdir = TempDir::new().unwrap();
+    let shelf = workdir.path().join("shelf");
+    std::fs::create_dir_all(&shelf).unwrap();
+    let src_root = workdir.path().join("src");
+    std::fs::create_dir_all(&src_root).unwrap();
+    for n in ["invoice-01.pdf", "invoice-02.pdf", "invoice-03.pdf"] {
+        std::fs::write(src_root.join(n), format!("contents of {n}").as_bytes()).unwrap();
+    }
+
+    let (ctx, store) = make_ctx_with_shelf(Some(shelf));
+    let candidates = sample_scan_candidates().await;
+    let service = ScanService::new(Arc::clone(&ctx));
+    let reviewer = ApproveEverything::new();
+
+    let report = service
+        .run(
+            tidyup_app::scan::ScanRequest {
+                root: src_root.clone(),
+                taxonomy_path: None,
+                dry_run: false,
+                auto_approve_bundles: false,
+                bundle_min_confidence: 0.85,
+            },
+            &candidates,
+            &[],
+            &[],
+            &NullProgress,
+            &reviewer,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        report.bundles, 1,
+        "the invoice family is one file-set bundle"
+    );
+    assert_eq!(report.proposed, 0, "all three files were clustered");
+    assert_eq!(report.bundles_applied, 1);
+    assert_eq!(report.bundles_failed, 0);
+    // Originals moved; the destination is under the source root's taxonomy.
+    for n in ["invoice-01.pdf", "invoice-02.pdf", "invoice-03.pdf"] {
+        assert!(!src_root.join(n).exists(), "{n} original must be moved");
+    }
+    let moved = src_root.join("Documents/Series/invoice/invoice-01.pdf");
+    assert!(
+        moved.exists(),
+        "members land flat under the cluster subfolder"
+    );
+
+    // Atomic restore — every member comes back to its original path.
+    let rollback = RollbackService::new(Arc::clone(&ctx));
+    let rb = rollback
+        .rollback_run(report.run_id, &NullProgress)
+        .await
+        .unwrap();
+    assert_eq!(rb.bundles_restored, 1);
+    assert_eq!(rb.failures, 0);
+    for n in ["invoice-01.pdf", "invoice-02.pdf", "invoice-03.pdf"] {
+        assert!(src_root.join(n).exists(), "{n} must be restored");
+    }
+    assert_eq!(
+        std::fs::read(src_root.join("invoice-02.pdf")).unwrap(),
+        b"contents of invoice-02.pdf",
+    );
+    assert!(store.pending().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn bundle_held_when_interactive_review_rejects_it() {
     let workdir = TempDir::new().unwrap();
     let shelf = workdir.path().join("shelf");
