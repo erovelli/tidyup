@@ -131,7 +131,7 @@ dioxus       = { version = "0.7.5", features = ["desktop", "router"] }
 rfd          = "0.17"
 
 # Storage
-rusqlite     = { version = "0.39", features = ["bundled", "chrono"] }
+rusqlite     = { version = "0.40", features = ["bundled", "chrono"] }
 tempfile     = "3.20"
 
 # HTTP
