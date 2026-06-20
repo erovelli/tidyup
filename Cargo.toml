@@ -90,7 +90,7 @@ mime_guess   = "2.0"
 
 # Content extraction (feature-gated per format in tidyup-extract)
 pdf-extract  = "0.10"
-calamine     = "0.34"
+calamine     = "0.35"
 image        = "0.25"
 kamadak-exif = "0.6"
 lofty        = "0.24"
