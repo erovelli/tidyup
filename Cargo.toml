@@ -98,7 +98,7 @@ lofty        = "0.24"
 # decode audio samples for the audio tower. Wide format support (WAV, FLAC,
 # MP3, AAC, OGG). Maintained by the pdeltah/symphonia team, MPL-2.0,
 # well over the dep-policy DL threshold.
-symphonia    = { version = "0.5", default-features = false, features = ["wav", "flac", "mp3", "aac", "isomp4", "vorbis", "ogg"] }
+symphonia    = { version = "0.6", default-features = false, features = ["wav", "flac", "mp3", "aac", "isomp4", "vorbis", "ogg"] }
 
 # Embeddings (tidyup-embeddings-ort).
 # `load-dynamic` keeps build-time TLS out of the dep graph — the runtime
