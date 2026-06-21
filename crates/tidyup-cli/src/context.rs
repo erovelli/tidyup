@@ -240,7 +240,7 @@ fn try_load_clap() -> Option<Arc<dyn AudioEmbeddingBackend>> {
 pub(crate) async fn verify_and_load_default_embeddings(
 ) -> Result<Arc<dyn tidyup_core::inference::EmbeddingBackend>> {
     if let Err(e) = verify_default_model() {
-        return Err(anyhow!("{e}\n\n{}", installation_instructions(),));
+        return Err(anyhow!("{e}\n\n{}", installation_instructions()));
     }
     // Load synchronously — ORT init is cheap; `spawn_blocking` would add noise.
     let embeddings = tokio::task::spawn_blocking(OrtEmbeddings::load_default)

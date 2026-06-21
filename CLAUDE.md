@@ -55,7 +55,7 @@ cargo run -p tidyup-cli -- --help
 cargo run -p tidyup-cli -- migrate <src> <tgt> --dry-run
 ```
 
-Toolchain is pinned to **1.90.0** via `rust-toolchain.toml` — needed for `Seek for Take` used by `lofty` 0.24.
+Toolchain is pinned to **1.95.0** via `rust-toolchain.toml` — needed for the std `cfg_select!` macro that `libsqlite3-sys` 0.38 (pulled in by `rusqlite` 0.40) uses in its build script. (Also satisfies `lofty` 0.24's `Seek for Take`, which only needed 1.90.)
 
 ## Architecture — strict layering
 

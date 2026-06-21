@@ -141,7 +141,7 @@ fn render_proposal(term: &Term, idx: usize, total: usize, p: &ChangeProposal) {
             .and_then(|s| s.to_str())
             .unwrap_or_default()
     {
-        let _ = term.write_line(&format!("  rename -> {}", style(&p.proposed_name).italic(),));
+        let _ = term.write_line(&format!("  rename -> {}", style(&p.proposed_name).italic()));
     }
     let _ = term.write_line(&format!("  why:  {}", p.reasoning));
     if p.needs_review {

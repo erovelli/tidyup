@@ -237,11 +237,7 @@ fn build_node(root: &Path, dir: &Path, parent_segments: &[String]) -> io::Result
     let sibling_names = sibling_names(dir);
     let has_children = !children.is_empty();
     #[allow(clippy::cast_possible_truncation)]
-    let avg_file_size = if size_count == 0 {
-        0
-    } else {
-        total_size / size_count
-    };
+    let avg_file_size = total_size.checked_div(size_count).unwrap_or(0);
 
     let metadata = FolderMetadata {
         file_count,
@@ -292,7 +288,7 @@ fn sibling_names(dir: &Path) -> Vec<String> {
     };
     entries
         .flatten()
-        .filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
+        .filter(|e| e.file_type().is_ok_and(|ft| ft.is_dir()))
         .filter_map(|e| {
             let name = e.file_name();
             if name == self_name {
@@ -557,7 +553,7 @@ pub async fn build_profile_cache_multimodal(
 
     let now = SystemTime::now();
     let mut profiles: HashMap<PathBuf, FolderProfile> = HashMap::with_capacity(paths.len());
-    for (path, name_embedding) in paths.into_iter().zip(name_vectors.into_iter()) {
+    for (path, name_embedding) in paths.into_iter().zip(name_vectors) {
         let Some(node) = scan.nodes.get(&path) else {
             continue;
         };
@@ -637,7 +633,7 @@ where
     let mut candidates: Vec<PathBuf> = match fs::read_dir(dir) {
         Ok(rd) => rd
             .flatten()
-            .filter(|e| e.file_type().map(|ft| ft.is_file()).unwrap_or(false))
+            .filter(|e| e.file_type().is_ok_and(|ft| ft.is_file()))
             .map(|e| e.path())
             .filter(|p| {
                 p.extension()
@@ -732,7 +728,7 @@ async fn content_centroid(
     let mut candidates: Vec<PathBuf> = match fs::read_dir(dir) {
         Ok(rd) => rd
             .flatten()
-            .filter(|e| e.file_type().map(|ft| ft.is_file()).unwrap_or(false))
+            .filter(|e| e.file_type().is_ok_and(|ft| ft.is_file()))
             .map(|e| e.path())
             .filter(|p| !is_non_text_ext(p))
             .collect(),

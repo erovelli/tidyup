@@ -400,7 +400,7 @@ fn common_ancestor(paths: &[PathBuf]) -> PathBuf {
 
 #[derive(Default)]
 struct TreeBuilder {
-    folders: BTreeMap<String, TreeBuilder>,
+    folders: BTreeMap<String, Self>,
     files: Vec<(String, usize)>, // (filename, proposal index)
 }
 

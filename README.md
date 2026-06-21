@@ -136,7 +136,7 @@ cargo build --release -p tidyup-cli --features llm-cuda    # NVIDIA
 cargo build --release -p tidyup-cli --features remote
 ```
 
-Rust pinned to 1.90 via `rust-toolchain.toml`. The default-binary embedding model (~35 MB) is fetched out-of-band by `cargo xtask download-models` — the release binary itself has no HTTP client and cannot download anything. Packagers are expected to bundle the model alongside the binary; developers run the xtask once. Model cache: `dirs::cache_dir()/tidyup/models/` (overridable via `TIDYUP_MODEL_CACHE`).
+Rust pinned to 1.95 via `rust-toolchain.toml`. The default-binary embedding model (~35 MB) is fetched out-of-band by `cargo xtask download-models` — the release binary itself has no HTTP client and cannot download anything. Packagers are expected to bundle the model alongside the binary; developers run the xtask once. Model cache: `dirs::cache_dir()/tidyup/models/` (overridable via `TIDYUP_MODEL_CACHE`).
 
 **Multimodal model bundles (optional, Phase 7).** Image and audio Tier 2
 classification needs the SigLIP and CLAP ONNX bundles — neither ships by

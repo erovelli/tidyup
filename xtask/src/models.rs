@@ -170,7 +170,7 @@ fn resolve_cache_dir() -> Result<PathBuf> {
     dirs::cache_dir()
         .map(|d| d.join("tidyup").join("models"))
         .ok_or_else(|| {
-            anyhow::anyhow!("platform cache dir unavailable; set TIDYUP_MODEL_CACHE to pick one",)
+            anyhow::anyhow!("platform cache dir unavailable; set TIDYUP_MODEL_CACHE to pick one")
         })
 }
 

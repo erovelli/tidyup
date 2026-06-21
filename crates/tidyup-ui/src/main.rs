@@ -24,6 +24,10 @@ use dioxus::prelude::*;
 use crate::pages::{Dashboard, Review, Runs, Settings};
 use crate::state::SharedState;
 
+// The dioxus `asset!` macro expands to code that trips clippy 1.95's
+// `volatile_composites` lint (`&[u8]` is not volatile-compatible); the
+// generated code is out of our hands, so allow it at this single call site.
+#[allow(clippy::volatile_composites)]
 const THEME_CSS: Asset = asset!("/assets/theme.css");
 
 fn main() {
