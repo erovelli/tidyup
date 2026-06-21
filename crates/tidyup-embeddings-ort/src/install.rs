@@ -100,7 +100,7 @@ pub fn default_model_directory() -> Option<PathBuf> {
 /// Missing file, wrong size, mismatched hash, or I/O failure.
 pub fn verify_artifact(path: &Path, spec: &ArtifactSpec) -> Result<()> {
     if !path.exists() {
-        return Err(anyhow::anyhow!("missing artifact: {}", path.display(),));
+        return Err(anyhow::anyhow!("missing artifact: {}", path.display()));
     }
     let metadata = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
     if spec.size_bytes != 0 && metadata.len() != spec.size_bytes {

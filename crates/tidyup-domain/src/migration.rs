@@ -404,18 +404,13 @@ impl Default for RenameConfig {
 /// corpus (`cargo xtask eval --calibrate`). Calibration is opt-in: the shipped
 /// default stays `Identity` until a corpus-fit parameter set exists, so the
 /// "raw weighted-cosine, not calibrated" v0.1 promise holds by default.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub enum Calibration {
     /// No calibration — report the raw score unchanged.
+    #[default]
     Identity,
     /// Logistic (Platt) scaling: `sigmoid(a · raw + b)`.
     Platt { a: f64, b: f64 },
-}
-
-impl Default for Calibration {
-    fn default() -> Self {
-        Self::Identity
-    }
 }
 
 impl Calibration {

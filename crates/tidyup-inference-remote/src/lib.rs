@@ -118,7 +118,7 @@ impl RemoteText {
             .user_agent(USER_AGENT)
             .build()
             .map_err(|e| anyhow::anyhow!("build reqwest client: {e}"))?;
-        let model_id = format!("{}/{}", endpoint.model_id_prefix(), endpoint.model(),);
+        let model_id = format!("{}/{}", endpoint.model_id_prefix(), endpoint.model());
         Ok(Self {
             endpoint,
             client,

@@ -80,7 +80,7 @@ jobs:
         rust: [stable]
         include:
           - os: ubuntu-latest
-            rust: "1.90.0"    # MSRV
+            rust: "1.95.0"    # MSRV
     steps:
       - uses: actions/checkout@v6.0.3
       - uses: dtolnay/rust-toolchain@master

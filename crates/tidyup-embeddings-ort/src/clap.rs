@@ -43,13 +43,14 @@ use async_trait::async_trait;
 use ndarray::Array2;
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Tensor;
-use symphonia::core::audio::{AudioBufferRef, Signal};
-use symphonia::core::codecs::DecoderOptions;
+use symphonia::core::audio::GenericAudioBufferRef;
+use symphonia::core::codecs::audio::AudioDecoderOptions;
+use symphonia::core::codecs::CodecParameters;
 use symphonia::core::errors::Error as SymphoniaError;
-use symphonia::core::formats::FormatOptions;
+use symphonia::core::formats::probe::Hint;
+use symphonia::core::formats::{FormatOptions, TrackType};
 use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
 use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
 use tokenizers::{
     EncodeInput, PaddingDirection, PaddingParams, PaddingStrategy, Tokenizer, TruncationDirection,
     TruncationParams, TruncationStrategy,
@@ -481,41 +482,49 @@ fn decode_to_mono_48k(audio_bytes: &[u8], mime: &str) -> Result<Vec<f32>> {
         hint.with_extension(ext);
     }
 
-    let probed = symphonia::default::get_probe()
-        .format(
+    // Symphonia 0.6: `probe` returns the format reader directly (no `.format`
+    // field) and takes the option structs by value.
+    let mut format = symphonia::default::get_probe()
+        .probe(
             &hint,
             stream,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
+            FormatOptions::default(),
+            MetadataOptions::default(),
         )
         .context("probing audio format")?;
 
-    let mut format = probed.format;
     let track = format
-        .default_track()
+        .default_track(TrackType::Audio)
         .ok_or_else(|| anyhow::anyhow!("no default audio track in input"))?;
     let track_id = track.id;
-    let codec_params = track.codec_params.clone();
+    // 0.6 wraps per-kind parameters in a `CodecParameters` enum; pull out the
+    // audio variant (and clone so the immutable track borrow ends before the
+    // mutable `next_packet` loop below).
+    let audio_params = match track.codec_params.as_ref() {
+        Some(CodecParameters::Audio(params)) => params.clone(),
+        _ => return Err(anyhow::anyhow!("audio track has no codec parameters")),
+    };
 
-    let source_rate = codec_params
+    let source_rate = audio_params
         .sample_rate
         .ok_or_else(|| anyhow::anyhow!("audio has no sample rate"))?;
 
     let mut decoder = symphonia::default::get_codecs()
-        .make(&codec_params, &DecoderOptions::default())
+        .make_audio_decoder(&audio_params, &AudioDecoderOptions::default())
         .context("building audio decoder")?;
 
     let mut mono: Vec<f32> = Vec::new();
     loop {
+        // Symphonia 0.6: `next_packet` returns `Ok(None)` at end-of-stream.
         let packet = match format.next_packet() {
-            Ok(p) => p,
+            Ok(Some(p)) => p,
+            Ok(None) | Err(SymphoniaError::ResetRequired) => break,
             Err(SymphoniaError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 break;
             }
-            Err(SymphoniaError::ResetRequired) => break,
             Err(e) => return Err(anyhow::anyhow!("decode packet: {e}")),
         };
-        if packet.track_id() != track_id {
+        if packet.track_id != track_id {
             continue;
         }
         let buf = match decoder.decode(&packet) {
@@ -542,64 +551,19 @@ fn decode_to_mono_48k(audio_bytes: &[u8], mime: &str) -> Result<Vec<f32>> {
     }
 }
 
-fn downmix_to_mono_into(buf: &AudioBufferRef<'_>, out: &mut Vec<f32>) {
-    match buf {
-        AudioBufferRef::F32(b) => {
-            let frames = b.frames();
-            let chans = b.spec().channels.count().max(1);
-            for f in 0..frames {
-                let mut sum = 0.0_f32;
-                for c in 0..chans {
-                    sum += b.chan(c)[f];
-                }
-                #[allow(clippy::cast_precision_loss)]
-                out.push(sum / chans as f32);
-            }
-        }
-        AudioBufferRef::S16(b) => {
-            let frames = b.frames();
-            let chans = b.spec().channels.count().max(1);
-            for f in 0..frames {
-                let mut sum = 0.0_f32;
-                for c in 0..chans {
-                    sum += f32::from(b.chan(c)[f]) / f32::from(i16::MAX);
-                }
-                #[allow(clippy::cast_precision_loss)]
-                out.push(sum / chans as f32);
-            }
-        }
-        AudioBufferRef::S32(b) => {
-            let frames = b.frames();
-            let chans = b.spec().channels.count().max(1);
-            #[allow(clippy::cast_precision_loss)]
-            let denom = i32::MAX as f32;
-            for f in 0..frames {
-                let mut sum = 0.0_f32;
-                for c in 0..chans {
-                    #[allow(clippy::cast_precision_loss)]
-                    let v = b.chan(c)[f] as f32;
-                    sum += v / denom;
-                }
-                #[allow(clippy::cast_precision_loss)]
-                out.push(sum / chans as f32);
-            }
-        }
-        AudioBufferRef::U8(b) => {
-            let frames = b.frames();
-            let chans = b.spec().channels.count().max(1);
-            for f in 0..frames {
-                let mut sum = 0.0_f32;
-                for c in 0..chans {
-                    let v = (f32::from(b.chan(c)[f]) - 128.0_f32) / 128.0_f32;
-                    sum += v;
-                }
-                #[allow(clippy::cast_precision_loss)]
-                out.push(sum / chans as f32);
-            }
-        }
-        // Other sample formats (S24, U16, U24, U32, F64) collapse to silence
-        // for now — the mainstream codecs we care about emit S16/S32/F32.
-        _ => {}
+fn downmix_to_mono_into(buf: &GenericAudioBufferRef<'_>, out: &mut Vec<f32>) {
+    // Symphonia 0.6 unifies sample formats behind `GenericAudioBufferRef`.
+    // `copy_to_vec_interleaved::<f32>` converts any source PCM format
+    // (S16/S32/U8/F32/…) to normalized `f32` in `[-1, 1]`, so the per-format
+    // match arms the 0.5 path needed are gone. We then average the interleaved
+    // channels frame-by-frame to collapse to mono.
+    let chans = buf.spec().channels().count().max(1);
+    let mut interleaved: Vec<f32> = Vec::new();
+    buf.copy_to_vec_interleaved(&mut interleaved);
+    for frame in interleaved.chunks(chans) {
+        let sum: f32 = frame.iter().sum();
+        #[allow(clippy::cast_precision_loss)]
+        out.push(sum / chans as f32);
     }
 }
 

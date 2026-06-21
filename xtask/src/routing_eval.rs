@@ -843,7 +843,7 @@ mod tests {
             doc("travel", "flight hotel itinerary booking", "e"),
             doc("travel", "hotel flight itinerary", "f"),
         ];
-        let test = vec![
+        let test = [
             doc("finance", "tax invoice", "x1"),
             doc("code", "impl struct", "x2"),
             doc("travel", "flight itinerary", "x3"),
