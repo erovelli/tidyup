@@ -6,7 +6,7 @@ Guidance for Claude Code (claude.ai/code) when working in this repository.
 
 `tidyup` is a CLI-first, open-source Rust tool that auto-sorts a source directory recursively into a preexisting target hierarchy. It classifies files by their **contents** (not just filename/extension) using deterministic embedding similarity running entirely on-device, preserves logical file groupings (coding projects, photo bursts, music albums) as atomic bundles, and proposes rename-and-move operations for review. **Nothing moves without explicit approval.**
 
-The workspace is under active construction — many modules are scaffolded with typed stubs ahead of full implementation. Check which crates are wired up before assuming behaviour.
+The workspace is past its scaffolding stage: every crate (`domain` through `cli`/`ui`) is substantively implemented and the default CLI runs end-to-end (`migrate`/`scan`/`watch`/`rollback`/`prune`/`status`). Remaining work is post-Phase-7 — video Tier 2, calibrated-confidence-by-default, embedding-verified soft bundles, and packaging; see the roadmap in `README.md`. Status is still **pre-alpha**: confidence thresholds are not calibrated against a real corpus by default.
 
 **Core product promises** (design constraints — never violate):
 

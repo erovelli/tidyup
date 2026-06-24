@@ -181,11 +181,11 @@ Bundles are identified in the walk phase, before per-file scoring.
 | `JupyterNotebookSet` | `.ipynb` neighbours |
 | `DocumentSeries` | filename regex family (`invoice_*.pdf`, `meeting_YYYY-MM-DD_*`) |
 
-**Soft bundles — v0.1 (text-only path):**
+**Soft bundles — v0.1 (metadata/filename path):**
 
 | Kind | Signal |
 |---|---|
-| `DocumentSeries` (augmented) | filename family + HDBSCAN cluster over text embeddings of candidate members |
+| `DocumentSeries` | numeric/date filename family grouped by a shared stem (`invoice-2024-01`, …); no embedding step in v0.1 |
 
 **Soft bundles — post-v0.1** (require image/audio encoders):
 
@@ -194,7 +194,7 @@ Bundles are identified in the walk phase, before per-file scoring.
 | `PhotoBurst` | EXIF timestamps within N seconds + same camera + HDBSCAN over image embeddings | SigLIP Tier 2 |
 | `MusicAlbum` | consistent ID3 `album` tag + HDBSCAN over audio embeddings | CLAP Tier 2 |
 
-HDBSCAN (density-based clustering) is a textbook non-LLM AI technique, deterministic under fixed `min_cluster_size`. Clusters too small are rejected; clusters whose embedding spread exceeds a threshold are rejected as accidental neighbours. For v0.1, `PhotoBurst` and `MusicAlbum` fall back to metadata-only detection (timestamp/tag proximity) without embedding verification — acceptable for the common cases, tightenable once the encoders land.
+HDBSCAN (density-based clustering) is the *planned* embedding-verification step — a textbook non-LLM AI technique, deterministic under a fixed `min_cluster_size`: clusters too small are rejected, and clusters whose embedding spread exceeds a threshold are rejected as accidental neighbours. **It is not wired yet.** Today all three soft-bundle kinds detect on metadata/filename signals only — `PhotoBurst` by EXIF capture-time window, `MusicAlbum` by shared ID3 `album` tag, `DocumentSeries` by filename family (all in `pipeline::clustering`) — without embedding verification, acceptable for the common cases. The SigLIP/CLAP encoders the image/audio embedding path needs have since landed (Phase 7), so the remaining work is the verification pass itself, not the encoders.
 
 Once a bundle is identified, its subtree is **opaque** to per-file classification. Only the bundle root receives a `ClassificationResult`, using the pooled embedding of its text members (v0.1). Bundle members never receive rename proposals (per the rename policy in `CLAUDE.md`).
 
@@ -268,8 +268,8 @@ The cost (1–10 s of inference) is paid only on hard cases — Tier 2 hits that
 
 - **`tidyup-inference-mistralrs` is feature-gated.** `--features llm-fallback`. Not in the default crate graph.
 - **`tidyup-embeddings-ort` carries the default classifier.** Hosts `bge-small-en-v1.5` with room to add modality-specific encoders post-v0.1.
-- **`tidyup-pipeline` hosts Tier 1 + Tier 2.** Plus HDBSCAN soft-bundle clustering, the extractive rename cascade, and (when the feature is on) the Tier 3 call-through.
-- **Bundle detection stays in `pipeline::bundle`.** Marker detection unchanged; soft-bundle clustering uses text embeddings in v0.1.
+- **`tidyup-pipeline` hosts Tier 1 + Tier 2.** Plus soft-bundle clustering (metadata/filename-only today in `pipeline::clustering`; HDBSCAN-over-embeddings is the planned upgrade), the extractive rename cascade, and (when the feature is on) the Tier 3 call-through.
+- **Marker bundle detection stays in `pipeline::bundle`; soft-bundle clustering lives in `pipeline::clustering`.** Marker detection unchanged; soft-bundle clustering is metadata/filename-only in v0.1 (no embedding step yet).
 - **`ClassifierConfig.calibration` defaults to `Identity` (raw cosine).** The Platt-scaling mechanism + fitting tool (`cargo xtask eval --calibrate`) exist; the shipped default stays uncalibrated until a corpus-fit parameter set lands.
 
 ## Open questions
