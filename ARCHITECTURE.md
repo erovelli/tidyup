@@ -6,7 +6,7 @@ Tidyup is organised as a Cargo workspace with hexagonal (ports-and-adapters) str
 
 ```
                       ┌──────────────────────────┐
-                      │   tidyup-domain          │  pure types, no deps
+                      │   tidyup-domain          │  pure types, no tidyup-crate deps
                       └────────────┬─────────────┘
                                    │
                       ┌────────────▼─────────────┐
@@ -36,6 +36,8 @@ Tidyup is organised as a Cargo workspace with hexagonal (ports-and-adapters) str
              └─────────────┘           └─────────────┘
 ```
 
+> The adapter tier also includes **`tidyup-extract`** — per-format content extractors (PDF, Excel, image, audio) that depend on `tidyup-core` and feed `tidyup-pipeline`. It sits beside `storage-sqlite` / `inference-*` / `embeddings-ort`; it's elided from the box-art above only for legibility.
+
 ## The plug-and-play seam
 
 Application services in `tidyup-app` accept `&dyn ProgressReporter` and `&dyn ReviewHandler` — the frontend ports from `tidyup-core::frontend`. Both the CLI (indicatif progress + interactive/auto approval) and the UI (Dioxus signals + diff-view page) implement these same traits.
@@ -46,9 +48,9 @@ Consequence: adding a new frontend (web, TUI, MCP server) means implementing two
 
 Inference backends fit through the same port traits — `TextBackend`, `VisionBackend`, `EmbeddingBackend`, and the cross-modal `ImageEmbeddingBackend` / `AudioEmbeddingBackend` from Phase 7. The pipeline consumes them as trait objects and never names a concrete backend.
 
-**Backend activation today (CLI).** The CLI exposes a one-of-N choice for the optional Tier 3 `TextBackend` via mutually-exclusive flags `--llm-fallback` and `--remote` (with env-var equivalents `TIDYUP_LLM_FALLBACK=1` / `TIDYUP_REMOTE=1`). The chosen flag, the matching cargo feature, and the matching config section together gate which `TextBackend` the context builder constructs. `ServiceContext.text` is `Option<Arc<dyn TextBackend>>`; `None` is the privacy-preserving default and means Tier 3 is off. The desktop UI binary has no per-invocation activation surface yet — it always builds a context with `text: None`.
+**Backend activation today (CLI).** The CLI exposes a one-of-N choice for the optional Tier 3 `TextBackend` via mutually-exclusive flags `--llm-fallback` and `--remote` (with env-var equivalents `TIDYUP_LLM_FALLBACK=1` / `TIDYUP_REMOTE=1`). The chosen flag, the matching cargo feature, and the matching config section together gate which `TextBackend` the context builder constructs. `ServiceContext.text` is `Option<Arc<dyn TextBackend>>`; `None` is the privacy-preserving default and means Tier 3 is off. The desktop UI has its own per-invocation activation surface: a **Settings session toggle** (`signals.llm_fallback_active`) feeds `tidyup-ui/src/context.rs::InferenceActivation` into the UI's context builder, gated identically to the CLI (cargo feature + `[inference] llm_fallback = true` + the toggle). The scan/migrate paths source it via `current_activation()`; only the rollback / runs paths — which never classify — build with the default `text: None`. The UI deliberately does **not** surface the `remote` backend, so the default desktop binary stays HTTP-client-free.
 
-**The future shape.** `tidyup-app::config::InferenceConfig.backends` is an ordered list of backend IDs (`"mistralrs"`, `"remote-openai"`, `"ollama"`) reserved for a runtime registry that picks among multiple compiled-in backends without a rebuild. The registry isn't wired yet — the field is read by `serde` for forward-compat but unused by the context builder, which currently just consults `llm_fallback` / `remote` directly. Adding a backend today still means: implement the port trait, gate the crate behind a cargo feature symmetric with the existing `llm-fallback` / `remote` features, and extend the activation enum in `tidyup-cli/src/context.rs::InferenceActivation`. Pipeline and app stay untouched.
+**The future shape.** `tidyup-app::config::InferenceConfig.backends` is an ordered list of backend IDs (`"embeddings-ort"` (default), `"mistralrs"`, `"remote-openai"`, `"remote-anthropic"`, `"remote-ollama"`) reserved for a runtime registry that picks among multiple compiled-in backends without a rebuild. The registry isn't wired yet — the field is read by `serde` for forward-compat but unused by the context builder, which currently just consults `llm_fallback` / `remote` directly. Adding a backend today still means: implement the port trait, gate the crate behind a cargo feature symmetric with the existing `llm-fallback` / `remote` features, and extend the activation enum in `tidyup-cli/src/context.rs::InferenceActivation`. Pipeline and app stay untouched.
 
 **Inclusion is separate from activation.** Whether a backend is *compiled into the binary at all* is governed by cargo features. Network-capable backends (`tidyup-inference-remote`) are gated behind `--features remote`; LLM backends (`tidyup-inference-mistralrs`) are gated behind `--features llm-fallback`. **Both are excluded from the default binary** — the default classifier is `bge-small-en-v1.5` via `tidyup-embeddings-ort`, which is always compiled in. See [Privacy model](#privacy-model).
 
@@ -85,13 +87,13 @@ Bundle detection happens during the initial walk, before per-file classification
 | Bundle kind | Marker |
 |---|---|
 | `GitRepository` | `.git/` directory |
-| `NodeProject` | `package.json` + `node_modules/` (latter never descended) |
-| `RustCrate` | `Cargo.toml` (climbs to `[workspace]` root if present) |
-| `PythonProject` | `pyproject.toml` / `setup.py` / `__init__.py` |
+| `NodeProject` | `package.json` |
+| `RustCrate` | `Cargo.toml` |
+| `PythonProject` | `pyproject.toml` / `setup.py` / `setup.cfg` |
 | `XcodeProject` | `*.xcodeproj` |
 | `AndroidStudioProject` | `settings.gradle` / `build.gradle` |
 | `JupyterNotebookSet` | `.ipynb` neighbours |
-| `PhotoBurst` | EXIF timestamps within N seconds, same camera |
+| `PhotoBurst` | EXIF capture timestamps within a window (N seconds) |
 | `MusicAlbum` | consistent ID3 `album` tag |
 | `DocumentSeries` | filename regex family (e.g., `invoice_*.pdf`) |
 | `Generic` | user-defined marker (future) |
@@ -103,7 +105,7 @@ Bundle moves are all-or-nothing. Partial bundle state is never allowed to persis
 Two apply paths:
 
 1. **Same-volume bundle moves** use a single `std::fs::rename()` on the bundle root. POSIX `rename(2)` on the same filesystem is atomic; NTFS `MoveFile` is atomic. One syscall, no intermediate state.
-2. **Cross-volume bundle moves** use copy-verify-delete: copy entire subtree to shelf-staged destination, verify by content hash, delete original, then commit the final rename. Any failure at any step rolls back everything — the shelf staging area is discarded, originals remain untouched.
+2. **Cross-volume bundle moves** use copy-verify-delete: copy the entire subtree directly to the destination, verify by BLAKE3 content hash, then delete the original. Any failure at any step discards the partially-copied data at the destination; the originals remain untouched.
 
 The domain models this as a `BundleProposal` aggregate: `{ root, kind, members: Vec<ChangeProposal>, target_parent, confidence, status }`. Individual member proposals are never approved, applied, or rolled back independently. Member proposals cannot carry rename suggestions — bundle identity depends on internal structure.
 

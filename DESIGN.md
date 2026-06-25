@@ -17,6 +17,8 @@ The palette is a sophisticated "Spring" spectrum, balanced to provide high legib
 *   **Sidebar/Navigation:** `surface-container-low` (#f2f4f4)
 *   **Active/Focus Areas:** `surface-container-highest` (#dfe3e4)
 
+*Carve-out:* the rule bans lines for **sectioning**. A solid outline used purely as an **interaction-state** affordance — e.g. the 2px `primary` outline on a selected review-tree row — is permitted, since it marks focus/selection rather than dividing layout.
+
 ### Surface Hierarchy & Nesting
 Treat the UI as physical layers of fine paper. 
 *   **Nesting:** A file card (`surface-container-lowest`) should sit atop a gallery view (`surface-container-low`). The subtle shift in hex value provides all the "edge" required.
@@ -35,6 +37,8 @@ We employ a dual-font strategy to balance editorial authority with functional cl
 
 *   **Display & Headlines (Manrope):** Chosen for its modern, geometric construction. Use `display-lg` and `headline-md` for folder names or "Empty State" messaging to create an authoritative, premium feel.
 *   **Body & Labels (Inter):** The workhorse. Inter provides exceptional legibility at small sizes (`body-sm` or `label-md`) required for file metadata and breadcrumbs.
+
+> **Implementation note (not yet wired):** the build does not bundle these webfonts — `theme.css` names `Manrope`/`Inter` but ships no `@font-face` rule or font assets, so the desktop UI currently falls back to the system sans-serif stack (`-apple-system`, `Segoe UI`, …). The Manrope/Inter pairing is the intended design; self-hosting the two families (to keep the desktop build network-silent) is the step that makes it render.
 
 **Visual Hierarchy Tip:** Use `on_surface_variant` (#5b6061) for secondary metadata (date modified, file size) to ensure the primary filename (`on_surface`) remains the focal point.
 
@@ -55,12 +59,14 @@ In this system, elevation is a product of light and shadow, not lines.
 
 ### Tree Views & Navigation
 *   **Structure:** No vertical guide lines. Use 24px of horizontal indentation per level.
-*   **Selection:** Active states use a soft capsule shape with `secondary_container` (#bee9ff) and 12px (`md`) rounded corners.
+*   **Selection (sidebar nav):** Active nav items use a soft capsule shape with `secondary_container` (#bee9ff) and 12px (`md`) rounded corners (`.nav-item.active`).
+*   **Selection & decisions (Review / Proposed-Structure tree):** Rows use 6px (`sm`) corners. The *selected* row is marked with a 2px `primary` outline (not a fill); an *approved* row fills with `primary_container` (#c8ebca) and a *rejected* row with `error_container`. This is the app's primary tree surface, so it — not the nav rule above — governs file/folder selection.
 
 ### Action Buttons
 *   **Primary:** Gradient fill (`primary` to `primary_dim`), `xl` (1.5rem) roundedness. High-end, pill-shaped.
 *   **Secondary:** Ghost style. No background, `on_surface` text. On hover, transition to `surface_container_high`.
 *   **Tertiary:** `surface_container_lowest` with a "Ghost Border."
+*   **Destructive / Danger:** Solid `error_container` (#fd795a) fill with `on_error_container` text, same pill geometry as the others. Reserved for irreversible-feeling actions (e.g. the **Rollback** button on the Runs page). Keep the soft peach tone consistent with the Confidence-Tier `error_container` usage — destructive, not panic-inducing.
 
 ### Cards & File Items
 *   **Rule:** Forbid the use of divider lines between list items. Use 8px of vertical spacing (`md`) to separate rows. 

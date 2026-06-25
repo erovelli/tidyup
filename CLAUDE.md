@@ -6,7 +6,7 @@ Guidance for Claude Code (claude.ai/code) when working in this repository.
 
 `tidyup` is a CLI-first, open-source Rust tool that auto-sorts a source directory recursively into a preexisting target hierarchy. It classifies files by their **contents** (not just filename/extension) using deterministic embedding similarity running entirely on-device, preserves logical file groupings (coding projects, photo bursts, music albums) as atomic bundles, and proposes rename-and-move operations for review. **Nothing moves without explicit approval.**
 
-The workspace is under active construction — many modules are scaffolded with typed stubs ahead of full implementation. Check which crates are wired up before assuming behaviour.
+The workspace is past its scaffolding stage: every crate (`domain` through `cli`/`ui`) is substantively implemented and the default CLI runs end-to-end (`migrate`/`scan`/`watch`/`rollback`/`prune`/`status`). Remaining work is post-Phase-7 — video Tier 2, calibrated-confidence-by-default, embedding-verified soft bundles, and packaging; see the roadmap in `README.md`. Status is still **pre-alpha**: confidence thresholds are not calibrated against a real corpus by default.
 
 **Core product promises** (design constraints — never violate):
 
@@ -22,6 +22,7 @@ The workspace is under active construction — many modules are scaffolded with 
 cargo xtask ci
 
 # Individual steps
+cargo xtask check-privacy   # assert default CLI/UI graphs are network+LLM-silent (runs first inside `ci`)
 cargo xtask fmt
 cargo xtask lint            # clippy --all-features -D warnings
 cargo xtask deny            # requires: cargo install cargo-deny
@@ -32,6 +33,7 @@ cargo xtask feature-matrix  # requires: cargo install cargo-hack
 # Calibration tool — NOT part of `ci`, which must stay model-free.
 cargo xtask eval
 cargo xtask eval --json
+cargo xtask eval --calibrate  # fit Platt calibration over the corpus (shipped default stays uncalibrated)
 
 # The falsifiable "route by contents, not filename" test: held-out
 # migration-routing accuracy over an already-organized corpus (folder = label),
@@ -103,7 +105,7 @@ Two patterns are architectural contracts, not suggestions:
 
 1. **Frontend seam.** `tidyup-app` services take `&dyn ProgressReporter` and `&dyn ReviewHandler`. Never embed a frontend impl in a service. Two live implementations already exercise this seam — `tidyup-cli` (indicatif + interactive prompts) and `tidyup-ui` (Dioxus signal-backed progress + oneshot-channel review). Adding another frontend (web, TUI, MCP) = implementing two traits; it must not require a service-layer refactor. Note that `SyncStorage`-backed signals are the UI-side requirement to satisfy `Send + Sync` on those trait objects.
 
-2. **Inference backend registry.** Backends register by capability at runtime, driven by `InferenceConfig.backends` (ordered list of IDs: `"mistralrs"`, `"remote-openai"`, `"ollama"`). Runtime *selection* is config-driven — not a cargo feature flag. Adding a backend: new `tidyup-inference-*` crate + implement `TextBackend`/`VisionBackend`/`EmbeddingBackend` + register. No pipeline/app changes.
+2. **Inference backend registry.** Backends register by capability at runtime, driven by `InferenceConfig.backends` (ordered list of IDs: `"embeddings-ort"` (default), `"mistralrs"`, `"remote-openai"`, `"remote-anthropic"`, `"remote-ollama"`). Runtime *selection* is config-driven — not a cargo feature flag. Adding a backend: new `tidyup-inference-*` crate + implement `TextBackend`/`VisionBackend`/`EmbeddingBackend` + register. No pipeline/app changes.
 
 Storage follows the same shape (`FileIndex`/`ChangeLog`/`BackupStore`/`RunLog` are traits, sqlite is the default impl) but we don't expect alternates pre-v0.1.
 
@@ -185,7 +187,7 @@ Both produce `ChangeProposal`s and `BundleProposal`s that flow through the same 
 - Unit tests: in-file `#[cfg(test)] mod tests` — fast, no models, no DB.
 - Integration tests: `crates/<crate>/tests/*.rs` — real impls, slower.
 - Fixture files live under `crates/<crate>/tests/fixtures/`.
-- `cargo test --all-features` in CI — keep feature combos green.
+- CI runs a layered test matrix — `cargo test --workspace` (default features), `cargo test -p tidyup-cli --features llm-fallback,remote`, and `cargo test -p tidyup-extract --all-features`. `--all-features` is deliberately *not* used workspace-wide (the CLI's `llm-metal`/`llm-cuda` accelerator pass-throughs need platform toolchains). Keep feature combos green.
 
 ## Operational rules
 
@@ -258,7 +260,7 @@ beyond the text Tier 2 rules:
 
 - **Don't violate the privacy model.** No HTTP clients, LLM deps, or phone-home code paths in the default binary. Network-capable code lives only in `tidyup-inference-remote` behind `--features remote`. LLM code lives only in `tidyup-inference-mistralrs` behind `--features llm-fallback`.
 - **Don't make LLM or remote inference a default.** Both `tidyup-inference-mistralrs` and `tidyup-inference-remote` are feature-gated off by default. Never change CLI defaults, config defaults, or build defaults to turn them on. First-run UX and default docs never recommend either.
-- **Don't add generative rename paths.** Rename proposals are extractive only (embedded metadata → keyword-template fill → nearest-neighbor adapt → no-rename). No LLM-fabricated names, even under `--features llm-fallback`.
+- **Don't add generative rename paths.** Rename proposals are extractive only (embedded metadata → keyword-template fill → no-rename). No LLM-fabricated names, even under `--features llm-fallback`.
 - **Don't introduce partial-bundle apply paths.** Bundles are atomic. No code that allows some members to move while others don't.
 - **Don't auto-apply rename proposals.** Even under `--yes`, renames always surface in review.
 - **Don't propose renames for bundle members.** Their internal structure is load-bearing.

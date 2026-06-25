@@ -2,6 +2,23 @@
 
 Design doc for how tidyup decides where a file belongs, whether it should be renamed, and whether it is part of a larger group. Complements `ARCHITECTURE.md` (crate graph, port traits, privacy model) by fleshing out what sits *behind* the `Classifier` port.
 
+## Contents
+
+- [The question this doc answers](#the-question-this-doc-answers)
+- [Decision: three-tier cascade](#decision-three-tier-cascade-embeddings-at-the-spine)
+- [The unified-pattern property](#the-unified-pattern-property)
+- [v0.1 scope: text by default, image/audio opt-in](#v01-scope-text-by-default-imageaudio-opt-in)
+- [Tier 2: how embedding classification works](#tier-2-how-embedding-classification-works)
+- [Confidence: raw cosine by default, calibration available](#confidence-raw-cosine-by-default-calibration-available)
+- [Bundle detection](#bundle-detection)
+- [Rename strategy: extractive cascade](#rename-strategy-extractive-cascade)
+- [Why embeddings over a local LLM on the default path](#why-embeddings-over-a-local-llm-on-the-default-path)
+- [What embeddings give up — honestly](#what-embeddings-give-up--honestly)
+- [Tier 3: the LLM-fallback escape hatch](#tier-3-the-llm-fallback-escape-hatch)
+- [Architectural implications](#architectural-implications)
+- [Open questions](#open-questions)
+- [References in repo](#references-in-repo)
+
 ## The question this doc answers
 
 A messy source directory contains text documents, images, audio, video, and mixed bundles. For each file, the pipeline must produce:
@@ -62,6 +79,26 @@ The disk embedding cache is keyed by description hash, so a custom taxonomy
 simply misses the default cache and embeds fresh; image/audio taxonomies are
 unaffected (they remain the per-modality defaults).
 
+A custom taxonomy file looks like this:
+
+```toml
+# custom-taxonomy.toml — used via: tidyup scan <root> --taxonomy custom-taxonomy.toml
+[[entry]]
+path = "Finance/Taxes/"          # required; must end with "/"
+description = "tax returns, W-2 and 1099 forms, IRS correspondence, deductions"
+temporal = true                   # optional; bucket by year/date when placing
+
+[[entry]]
+path = "Projects/Writing/"
+description = "essays, drafts, manuscripts, blog posts"
+
+[[entry]]
+path = "Reference/Manuals/"
+description = "product manuals, datasheets, user guides, specifications"
+```
+
+It overrides only the text taxonomy; the image and audio taxonomies stay at their per-modality defaults.
+
 | Modality | Default handling | Phase 7 (opt-in) | Post-Phase-7 |
 |---|---|---|---|
 | Text (pdf / docx / md / source / ipynb) | Tier 2 via `bge-small-en-v1.5` | — | — |
@@ -96,10 +133,9 @@ Text extracted via `tidyup-extract` → embedded with `bge-small-en-v1.5` (384-d
 score(v, folder) = w_cent · cos(v, folder.content_centroid)
                  + w_name · cos(v, folder.name_embedding)
                  + w_meta · metadata_match(file, folder)
-                 + w_hier · hierarchy_prior(file.path, folder.path)
 ```
 
-Default weights (from `ClassifierConfig::ScoreWeights` in `tidyup-domain`): `w_cent = 0.55`, `w_name = 0.25`, `w_meta = 0.10`, `w_hier = 0.10`. Tunable per-config.
+Default weights (from `ClassifierConfig::ScoreWeights` in `tidyup-domain`): `w_cent = 0.55`, `w_name = 0.25`, `w_meta = 0.10`. Tunable per-config. (`ScoreWeights` also carries a `w_hier = 0.10` weight for a path-hierarchy prior, but that term is **reserved and currently inert** — `hierarchy_adjustment` is fixed at `0.0` pending an implementation — so it contributes nothing today.)
 
 **Centroid-absent fallback.** The profiler populates `content_centroid` from a bounded sample of each folder's documents (see "Migration-mode multimodal centroids" below). A folder with no extractable text documents — an empty/cold target folder, or one holding only images/audio — keeps `content_centroid = None`. When the centroid is missing, the pipeline redistributes `w_cent` onto `w_name` (so the effective `w_name` is `0.80` and the centroid term is `0`), keeping the composite on the same `[0, 1]` scale rather than shrinking it. For a cold target, folder-name embedding similarity is what carries placements until the folder accumulates documents.
 
@@ -161,7 +197,7 @@ Honest bounds: public corpora are cleanly separable, so they are an **upper boun
 Proposal reasoning strings surface raw sub-scores:
 
 ```
-centroid match 0.92 to Research/Papers; gap to Archive/2023 = 0.08; name-embedding match 0.71; hierarchy prior +0.05. filename 'DSC_0481.jpg' vs content cos-sim 0.03 → rename suggestion from EXIF subject.
+centroid match 0.92 to Research/Papers; gap to Archive/2023 = 0.08; name-embedding match 0.71. filename 'DSC_0481.jpg' vs content cos-sim 0.03 → rename suggestion from EXIF subject.
 ```
 
 ## Bundle detection
@@ -173,30 +209,26 @@ Bundles are identified in the walk phase, before per-file scoring.
 | Kind | Marker |
 |---|---|
 | `GitRepository` | `.git/` |
-| `NodeProject` | `package.json` + `node_modules/` (never descended) |
-| `RustCrate` | `Cargo.toml` (climbs to `[workspace]` root) |
-| `PythonProject` | `pyproject.toml` / `setup.py` / `__init__.py` |
+| `NodeProject` | `package.json` |
+| `RustCrate` | `Cargo.toml` |
+| `PythonProject` | `pyproject.toml` / `setup.py` / `setup.cfg` |
 | `XcodeProject` | `*.xcodeproj` |
 | `AndroidStudioProject` | `settings.gradle` / `build.gradle` |
 | `JupyterNotebookSet` | `.ipynb` neighbours |
-| `DocumentSeries` | filename regex family (`invoice_*.pdf`, `meeting_YYYY-MM-DD_*`) |
 
-**Soft bundles — v0.1 (text-only path):**
+**Soft bundles (file-set bundles) — v0.1 (metadata/filename path):**
+
+Loose sibling files clustered by content metadata in `pipeline::clustering`. They have no shared directory, so they move as atomic file-sets (`BundleKind::moves_as_file_set()`), member by member.
 
 | Kind | Signal |
 |---|---|
-| `DocumentSeries` (augmented) | filename family + HDBSCAN cluster over text embeddings of candidate members |
+| `PhotoBurst` | EXIF capture timestamps within a window (`burst_window_secs`, default 60s; `min_burst` default 3) |
+| `MusicAlbum` | shared ID3 `album` tag (`min_album` default 3) |
+| `DocumentSeries` | numeric/date filename family grouped by a shared stem (`invoice-2024-01`, …; `min_series` default 3) |
 
-**Soft bundles — post-v0.1** (require image/audio encoders):
+HDBSCAN (density-based clustering) is the *planned* embedding-verification step — a textbook non-LLM AI technique, deterministic under a fixed `min_cluster_size`: clusters too small are rejected, and clusters whose embedding spread exceeds a threshold are rejected as accidental neighbours. **It is not wired yet.** Today all three soft-bundle kinds detect on metadata/filename signals only — `PhotoBurst` by EXIF capture-time window, `MusicAlbum` by shared ID3 `album` tag, `DocumentSeries` by filename family (all in `pipeline::clustering`) — without embedding verification, acceptable for the common cases. The SigLIP/CLAP encoders the image/audio embedding path needs have since landed (Phase 7), so the remaining work is the verification pass itself, not the encoders.
 
-| Kind | Signal | Requires |
-|---|---|---|
-| `PhotoBurst` | EXIF timestamps within N seconds + same camera + HDBSCAN over image embeddings | SigLIP Tier 2 |
-| `MusicAlbum` | consistent ID3 `album` tag + HDBSCAN over audio embeddings | CLAP Tier 2 |
-
-HDBSCAN (density-based clustering) is a textbook non-LLM AI technique, deterministic under fixed `min_cluster_size`. Clusters too small are rejected; clusters whose embedding spread exceeds a threshold are rejected as accidental neighbours. For v0.1, `PhotoBurst` and `MusicAlbum` fall back to metadata-only detection (timestamp/tag proximity) without embedding verification — acceptable for the common cases, tightenable once the encoders land.
-
-Once a bundle is identified, its subtree is **opaque** to per-file classification. Only the bundle root receives a `ClassificationResult`, using the pooled embedding of its text members (v0.1). Bundle members never receive rename proposals (per the rename policy in `CLAUDE.md`).
+Once a bundle is identified, its subtree is **opaque** to per-file classification, and the bundle is *placed* as a unit rather than scored per file. Scan mode routes it to a default taxonomy folder chosen by `BundleKind` at a fixed 0.90 confidence; migration mode places it by embedding the bundle-kind label plus the bundle's leaf directory name against the target folders' `name_embedding`s (also fixed 0.90), falling back to the kind default when the profile cache is empty. The result is a `BundleProposal` (not a per-file `ClassificationResult`); there is no pooled embedding of member contents. Bundle members never receive rename proposals (per the rename policy in `CLAUDE.md`).
 
 ## Rename strategy: extractive cascade
 
@@ -204,14 +236,13 @@ Rename proposals come from an extractive cascade. Each step is strictly higher-s
 
 1. **Embedded metadata.** PDF `/Title`, DOCX `core.xml` title, ID3 `TIT2`, EXIF `ImageDescription`, Office core properties. If present and non-trivially different from the current filename, this is the rename.
 2. **Keyword-template fill.** Extract top-k keyphrases from content — n-grams up to 3 words (inlined YAKE — see below). The target folder's siblings are analysed for a naming pattern via regex inference. Top keyphrases fill the `<topic>` slot, flattened into a word-deduplicated stem (`"tax return"` + `"tax form"` → `tax_return_form`); dates come from EXIF or file mtime.
-3. **Nearest-neighbor adaptation.** Nearest content-neighbor in the target folder by cosine distance. Adopt its naming template. Substitute content-specific tokens from the current file.
-4. **No signal → no rename.** Keep the filename; just move.
+3. **No signal → no rename.** Keep the filename; just move.
 
 The rename policy (`CLAUDE.md`) says renames never auto-apply, bundle members never rename, and two signals — classification confidence and filename-content mismatch — must clear configured thresholds. This cascade is **structurally incapable of fabricating a rename without extractive evidence**.
 
 Filename-content mismatch: `1.0 - cos(embed(filename_as_text), content_embedding)`. `taxes_2023.pdf` with tax-return content scores low (name matches content); `DSC_0481.jpg` of a wedding scores high.
 
-**Keyword extraction crate.** YAKE is the algorithm, now n-gram-aware: candidates are phrases up to 3 words built from runs of consecutive content tokens (never spanning a stopword/numeric/punctuation boundary) and scored by the YAKE keyphrase rule `∏ S(t) / (TF · (1 + ∑ S(t)))`. Stopwords are **language-aware**: a lightweight, dependency-free detector picks the document's language by stopword overlap (English, Spanish, French, German — English is the conservative default and only loses to a clearly-dominant language), so renames for non-English content don't fill with `le`/`la`/`der`/`el`. This is independent of classification, which still embeds with English `bge-small`. Available crates (`keyword-extraction-rs` at ~20k DL/mo) sit below the 100k-DL/mo dependency threshold in `CLAUDE.md`. v0.1 inlines ~250 LoC of YAKE rather than depending on the below-threshold crate. Re-evaluate if a mainstream pure-Rust option matures.
+**Keyword extraction crate.** YAKE is the algorithm, now n-gram-aware: candidates are phrases up to 3 words built from runs of consecutive content tokens (never spanning a stopword/numeric/punctuation boundary) and scored by the YAKE keyphrase rule `∏ S(t) / (TF · (1 + ∑ S(t)))`. Stopwords are **language-aware**: a lightweight, dependency-free detector picks the document's language by stopword overlap (English, Spanish, French, German — English is the conservative default and only loses to a clearly-dominant language), so renames for non-English content don't fill with `le`/`la`/`der`/`el`. This is independent of classification, which still embeds with English `bge-small`. Available crates (`keyword-extraction-rs` at ~20k DL/mo) sit below the 100k-DL/mo dependency threshold in `CLAUDE.md`. v0.1 inlines the YAKE logic (a few hundred lines, in `yake.rs`) rather than depending on the below-threshold crate. Re-evaluate if a mainstream pure-Rust option matures.
 
 ## Why embeddings over a local LLM on the default path
 
@@ -268,19 +299,18 @@ The cost (1–10 s of inference) is paid only on hard cases — Tier 2 hits that
 
 - **`tidyup-inference-mistralrs` is feature-gated.** `--features llm-fallback`. Not in the default crate graph.
 - **`tidyup-embeddings-ort` carries the default classifier.** Hosts `bge-small-en-v1.5` with room to add modality-specific encoders post-v0.1.
-- **`tidyup-pipeline` hosts Tier 1 + Tier 2.** Plus HDBSCAN soft-bundle clustering, the extractive rename cascade, and (when the feature is on) the Tier 3 call-through.
-- **Bundle detection stays in `pipeline::bundle`.** Marker detection unchanged; soft-bundle clustering uses text embeddings in v0.1.
+- **`tidyup-pipeline` hosts Tier 1 + Tier 2.** Plus soft-bundle clustering (metadata/filename-only today in `pipeline::clustering`; HDBSCAN-over-embeddings is the planned upgrade), the extractive rename cascade, and (when the feature is on) the Tier 3 call-through.
+- **Marker bundle detection stays in `pipeline::bundle`; soft-bundle clustering lives in `pipeline::clustering`.** Marker detection unchanged; soft-bundle clustering is metadata/filename-only in v0.1 (no embedding step yet).
 - **`ClassifierConfig.calibration` defaults to `Identity` (raw cosine).** The Platt-scaling mechanism + fitting tool (`cargo xtask eval --calibrate`) exist; the shipped default stays uncalibrated until a corpus-fit parameter set lands.
 
 ## Open questions
 
 - **Held-out corpus for calibration (v0.2).** Ship a synthetic fixture corpus? Calibrate on first run against a labelled sample? Defer until there's real-world feedback to mine (with user opt-in)?
 - **Multilingual support.** When to swap to `bge-m3` or `multilingual-e5`? Gate on binary-size impact vs observed demand.
-- ~~**Migration-mode multimodal.**~~ **Resolved** — see "Migration-mode centroids" above. `FolderProfile` now carries `content_centroid` (text), `image_centroid` (SigLIP), and `audio_centroid` (CLAP); the migration cascade routes each source file against the centroid in its own latent space, falling back to name embeddings when a folder lacks the matching centroid. Remaining: image-side rename gating (below).
-- **Image-side rename gating.** Phase 7 image classification produces a folder choice but no rename proposal. The rename cascade still runs against text Tier 2 (EXIF metadata → keyword fill → adapt → keep). A future enhancement: cross-modal mismatch gate using SigLIP text + image embeddings of filename and content.
+- **Image-side rename gating.** Phase 7 image classification produces a folder choice but no rename proposal. The rename cascade still runs against text Tier 2 (EXIF metadata → keyword fill → keep). A future enhancement: cross-modal mismatch gate using SigLIP text + image embeddings of filename and content.
 - **Video keyframe extraction.** Still pending the `ffmpeg-next` FFI vs metadata-only decision.
 - **Cold-start UX mitigation.** Does tidyup detect "target hierarchy has no files yet" and advise the user about `--features llm-fallback`, or silently surface all proposals to review with low confidence? A `--bootstrap` mode that seeds profiles from folder-name embeddings only?
-- **Inline-YAKE maintenance.** ~150 LoC of keyword extraction inline is cheap but adds a small maintenance item. Acceptable until a mainstream crate crosses the DL threshold.
+- **Inline-YAKE maintenance.** A few hundred lines of keyword extraction inline is cheap but adds a small maintenance item. Acceptable until a mainstream crate crosses the DL threshold.
 
 ## References in repo
 

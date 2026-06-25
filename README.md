@@ -40,6 +40,24 @@ Your files stay where they belong — with you.
 
 ---
 
+## Contents
+
+- [Why this exists](#why-this-exists)
+- [What it does](#what-it-does)
+- [Privacy guarantees](#privacy-guarantees)
+- [Installing](#installing)
+- [Building](#building)
+- [Quickstart](#quickstart)
+- [Configuration](#configuration)
+- [Environment variables](#environment-variables)
+- [Where tidyup stores things](#where-tidyup-stores-things)
+- [Troubleshooting](#troubleshooting)
+- [Roadmap](#roadmap)
+- [Contributing](#contributing)
+- [License](#license)
+
+---
+
 ## Why this exists
 
 Most "smart" file organizers are thin wrappers around someone else's API. You hand them your tax returns, your medical bills, your draft manuscripts, your half-written love letters — and trust that a privacy policy somewhere protects you.
@@ -85,12 +103,12 @@ Two modes:
 | --------------------- | ----------------------------------------------------------------------------------------------------- |
 | No network inference (default) | Default binary is built without `tidyup-inference-remote`. No HTTP client, no `reqwest`/`hyper`/`rustls` linked. Verified in CI by `cargo tree -p tidyup-cli -e normal` on the default feature set. |
 | No LLM inference (default) | Default binary is built without `tidyup-inference-mistralrs`. No `mistralrs`/`candle`/`hf-hub`/heavy tokenizer tree linked. Classification is deterministic embedding similarity only. `--features llm-fallback` additionally links `reqwest` transitively via `hf-hub` (needed for one-shot model download); there is no classifier-time phone-home. |
-| No telemetry          | No analytics crate in `Cargo.toml`. CI check blocks additions.                                        |
+| No telemetry          | No analytics/telemetry crate in any `Cargo.toml`; `cargo xtask check-privacy` keeps the default CLI/UI graphs free of network & LLM deps. |
 | No background uploads | App has no cloud sync feature, by design.                                                             |
 | Local-only storage    | SQLite DB + config + backups all under platform data dir.                                             |
 | Reversible by default | Every move is preceded by a copy to the backup shelf.                                                 |
 | Atomic bundle moves   | Coding projects, photo albums, and other groupings move as a single unit or not at all.                |
-| Extractive renames only | Rename proposals come from embedded metadata, keyword-template fill, or nearest-neighbor adaptation — never fabricated. Structurally incapable of generating a name without evidence. |
+| Extractive renames only | Rename proposals come from embedded metadata or keyword-template fill — never fabricated. Structurally incapable of generating a name without evidence. |
 
 **Remote inference and LLM fallback are symmetric power-user opt-ins**, not defaults. Each requires the same **three-gate** opt-in: (a) compile with the feature flag (`--features remote` or `--features llm-fallback`), (b) configure (`[inference.remote]` section or `[inference] llm_fallback = true`), and (c) pass the per-invocation flag (`--remote` / `TIDYUP_REMOTE=1` or `--llm-fallback` / `TIDYUP_LLM_FALLBACK=1`). The CLI rejects activation without the matching cargo feature. The two flags are mutually exclusive. First-run and onboarding never recommend either; the tool is designed to be excellent offline with embedding-based classification as the spine.
 
@@ -140,7 +158,7 @@ Rust pinned to 1.95 via `rust-toolchain.toml`. The default-binary embedding mode
 
 **Multimodal model bundles (optional, Phase 7).** Image and audio Tier 2
 classification needs the SigLIP and CLAP ONNX bundles — neither ships by
-default because each adds ~200–400 MB to the on-disk install.
+default because each adds several hundred MB to the on-disk install (SigLIP ~370 MB, CLAP ~600 MB).
 
 ```bash
 # Just the SigLIP image encoder (~370 MB).
@@ -163,6 +181,114 @@ the run fails — and unpinned artifacts print their digest + size so a maintain
 can pin them (ideally against an immutable `resolve/<commit-sha>/` revision).
 `cargo xtask verify-models [--siglip --clap | --multimodal]` re-checks an
 existing install on demand.
+
+---
+
+## Quickstart
+
+Nothing moves without your approval — every run proposes changes you review first. Start with a dry run:
+
+```bash
+# See what tidyup would do to a messy folder against the built-in taxonomy — no changes made.
+tidyup scan ~/Downloads --dry-run
+
+# Drop --dry-run to generate proposals and review them interactively (approve / edit / reject).
+tidyup scan ~/Downloads
+
+# Sort a source folder into an existing target hierarchy whose structure tidyup learns.
+tidyup migrate ~/Inbox ~/Documents --dry-run
+
+# Advisory watch: re-scan and report what it *would* propose on each change. Never moves anything.
+tidyup watch ~/Downloads
+
+# Inspect state + recent runs; list and reverse a run (the run id prints in each run summary).
+tidyup status
+tidyup rollback --list
+tidyup rollback <run-id>
+
+# Expire shelved backups past the retention window; print the resolved config + its path.
+tidyup prune --days 30
+tidyup config
+```
+
+Global flags: `--dry-run` (propose only), `--yes` (auto-approve *moves* above the confidence threshold — renames still always surface for review), and `--json` (machine-readable events for scripting). `--llm-fallback` / `--remote` activate the optional Tier 3 backends (see [Privacy guarantees](#privacy-guarantees)). The loop is always **dry-run → review → apply → reversible**.
+
+---
+
+## Configuration
+
+Config is layered: built-in defaults → a TOML file → a few environment overrides. `tidyup config` prints the resolved config and the file path. The file lives at the platform config path — `~/.config/tidyup/config.toml` (Linux), `~/Library/Application Support/tidyup/config.toml` (macOS), `%APPDATA%\tidyup\config.toml` (Windows) — or wherever `TIDYUP_CONFIG_PATH` points. Every section is optional; omitted keys fall back to the defaults shown here, and unknown keys are rejected at load so typos surface immediately.
+
+```toml
+[storage]
+# data_dir = "/custom/path"            # default: platform data dir (see "Where tidyup stores things")
+backup_retention_days = 30             # shelved originals older than this are eligible for `prune`
+
+[classifier]
+tiers = ["heuristics", "embeddings"]   # tier cascade order; "llm" is added only under the triple-gated opt-in
+min_confidence = 0.75                  # fallback auto-classify threshold for the composite score
+
+[inference]
+backends = ["embeddings-ort"]          # ordered backend IDs; "embeddings-ort" is the always-on default
+llm_fallback = false                   # gate (b) for Tier 3 LLM fallback; still needs the feature + flag
+
+# [inference.remote]                    # only consulted under --features remote + --remote / TIDYUP_REMOTE=1
+# endpoint = "https://api.openai.com/v1"
+# api_key_env = "OPENAI_API_KEY"        # name of the env var holding the key (the key is never written to disk)
+# model = "gpt-4o-mini"
+
+[inference.embedding]
+model_id = "bge-small-en-v1.5"         # default on-device embedding model
+
+[rename]
+min_classification_confidence = 0.85   # both thresholds must clear before a rename is proposed
+min_mismatch_score = 0.60              # 1.0 - cosine(embed(filename), content_embedding)
+
+[bundle_detection]
+enabled = true
+extra_markers = []                     # extra directory-bundle marker filenames, e.g. ["deno.json", "flake.nix"]
+soft_bundle_enabled = true             # metadata clusters: EXIF photo bursts, ID3 albums, filename series
+```
+
+Two keys worth knowing: **`bundle_detection.extra_markers`** declares additional directory-bundle markers without a rebuild, and **`classifier.tiers`** controls the cascade order.
+
+---
+
+## Environment variables
+
+| Variable | Effect |
+|---|---|
+| `TIDYUP_CONFIG_PATH` | Override the config-file location. |
+| `TIDYUP_DATA_DIR` | Override the data root (SQLite DB + backup shelf). |
+| `TIDYUP_MODEL_CACHE` | Override the model-cache directory (ONNX bundles + taxonomy cache). |
+| `TIDYUP_LLM_FALLBACK=1` | Per-invocation activation of Tier 3 LLM fallback (same as `--llm-fallback`). Never persisted. |
+| `TIDYUP_REMOTE=1` | Per-invocation activation of the remote backend (same as `--remote`). Never persisted. |
+| `RUST_LOG` | Standard `tracing`/`EnvFilter` log verbosity, e.g. `RUST_LOG=tidyup=debug` (defaults to `info`). |
+
+The two activation gates are evaluated per run and never written back into the config file — config describes *available* capabilities; the flag/env decides whether to use them this run.
+
+---
+
+## Where tidyup stores things
+
+| What | Location |
+|---|---|
+| Config file | `~/.config/tidyup/config.toml` (Linux) · `~/Library/Application Support/tidyup/config.toml` (macOS) · `%APPDATA%\tidyup\config.toml` (Windows) — or `TIDYUP_CONFIG_PATH` |
+| Data root | `<platform data dir>/tidyup/` — or `TIDYUP_DATA_DIR` |
+| ↳ SQLite index | `<data root>/tidyup.db` |
+| ↳ Backup shelf | `<data root>/backup/` (originals, restorable via `rollback`) |
+| Model cache | `<platform cache dir>/tidyup/models/` — or `TIDYUP_MODEL_CACHE` |
+
+The model cache sits under the OS *cache* dir (`~/.cache/tidyup/models/` on Linux, `~/Library/Caches/tidyup/models/` on macOS, `%LOCALAPPDATA%\tidyup\models\` on Windows), separate from the data root — so clearing caches never touches your index or backups.
+
+---
+
+## Troubleshooting
+
+- **"Missing embedding model" on first run.** The default binary ships without the model. Fetch it with `cargo xtask download-models` (or place the `bge-small-en-v1.5` files under the model cache), then re-run. The binary has no network path and never downloads anything itself.
+- **Confirm the model is installed.** `tidyup status` reports embedding-model presence (`--json` for scripts).
+- **"platform cache directory unavailable".** Set `TIDYUP_MODEL_CACHE` to an explicit directory.
+- **Image/audio files aren't classified by content.** That needs the optional SigLIP/CLAP bundles — `cargo xtask download-models --multimodal`. Without them, media falls back to Tier 1 heuristics (not an error).
 
 ---
 
@@ -194,8 +320,8 @@ tidyup is being built in phases. Each phase lands an independently compilable sl
 - `tidyup-extract`: MIME detection + router + `PlainTextExtractor` + `PdfExtractor` + `ExcelExtractor` + `ImageExtractor` (dimensions + EXIF) + `AudioExtractor` (ID3/Vorbis tags), each behind its own cargo feature
 - `tidyup-embeddings-ort`: `bge-small-en-v1.5` ONNX classifier, taxonomy cache (BLAKE3-invalidated), custom-taxonomy loader (`scan --taxonomy file.toml`, validated `[[entry]]` tables), model-install verifier
 - `tidyup-inference-mistralrs` (opt-in `--features llm-fallback`): `TextBackend` + lazy `VisionBackend` via `mistralrs`; Metal/CUDA pass-through features
-- `tidyup-inference-remote` (opt-in `--features remote`): `TextBackend` over OpenAI-compatible, Anthropic, and Ollama endpoints
-- `tidyup-pipeline`: Tier 1 heuristics, directory bundle detection (Cargo/npm/pyproject/Gradle/Xcode/.git/Jupyter), **content-cluster bundle detection** (photo bursts by EXIF capture time, music albums by ID3 album tag, document series by filename family — these move as atomic *file-sets*, each member individually with all-or-nothing rollback), target-tree profiler with name+centroid embeddings, inline n-gram YAKE keyphrase extraction (language-aware stopwords: EN/ES/FR/DE), extractive rename cascade (metadata → keyphrases → adapt → keep), Tier 3 LLM-rerank fallback on low-confidence verdicts (off-by-default; activated via the triple-gate below), scan-mode classifier against a fixed or user-supplied taxonomy, migration-mode classifier against an existing hierarchy
+- `tidyup-inference-remote` (opt-in `--features remote`): `TextBackend` over OpenAI-compatible endpoints. Anthropic and Ollama endpoint variants exist in the crate but are not yet selectable from CLI config — only the OpenAI-compatible path is wired today
+- `tidyup-pipeline`: Tier 1 heuristics, directory bundle detection (Cargo/npm/pyproject/Gradle/Xcode/.git/Jupyter), **content-cluster bundle detection** (photo bursts by EXIF capture time, music albums by ID3 album tag, document series by filename family — these move as atomic *file-sets*, each member individually with all-or-nothing rollback), target-tree profiler with name+centroid embeddings, inline n-gram YAKE keyphrase extraction (language-aware stopwords: EN/ES/FR/DE), extractive rename cascade (metadata → keyphrases → keep), Tier 3 LLM-rerank fallback on low-confidence verdicts (off-by-default; activated via the triple-gate below), scan-mode classifier against a fixed or user-supplied taxonomy, migration-mode classifier against an existing hierarchy
 - **Tier 3 LLM fallback (optional, off-by-default)**: when Tier 2 lands in the review zone (below threshold or inside the ambiguity gap), an optional `TextBackend` re-classifies the content; the LLM's `summary + category + tags` is re-embedded and re-ranked against the same candidate list. Adopted only if it scores above Tier 2. Triple-gated activation per the privacy model: compile with `--features llm-fallback` (or `--features remote`), set `[inference] llm_fallback = true` (or `[inference.remote]`) in config, and pass `--llm-fallback` (or `--remote`) at invocation. Renames stay extractive — the LLM's `suggested_name` is deliberately ignored
 - `tidyup-app`: `ScanService`, `MigrationService`, and `RollbackService` driving the pipeline end-to-end — shelve → move → mark applied → per-run rollback via the `RunLog`. Bundles are decided through the `ReviewHandler::review_bundles` seam — `--yes` auto-applies above a confidence threshold, otherwise each bundle gets an atomic approve/reject — and move all-or-nothing.
 - First-run model check: scan/migrate surface `cargo xtask download-models` (or a manual placement hint) when the embedding bundle is missing, without linking an HTTP client
@@ -229,6 +355,6 @@ See `CONTRIBUTING.md` for setup and style guidelines.
 
 Licensed under the [Apache License, Version 2.0](./LICENSE).
 
-Apache-2.0 is a permissive license: you can use, modify, and redistribute tidyup — including in commercial and closed-source projects — provided you preserve the copyright notice and the `NOTICE` file. It also includes an explicit patent grant from contributors, protecting you and downstream users.
+Apache-2.0 is a permissive license: you can use, modify, and redistribute tidyup — including in commercial and closed-source projects — provided you preserve the copyright notice (and the `NOTICE` file, if present). It also includes an explicit patent grant from contributors, protecting you and downstream users.
 
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in tidyup shall be licensed as above, without any additional terms or conditions.
