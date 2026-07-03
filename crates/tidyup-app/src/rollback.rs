@@ -12,22 +12,49 @@
 //!    path, copy the shelved original back into place, and mark the proposal
 //!    `Unshelved`.
 //!
-//! A proposal or bundle that cannot be rolled back (missing shelf record,
-//! target already moved again, filesystem error) is logged as a failure and
-//! the rollback continues — partial rollback is honest and user-visible via
-//! the returned [`RollbackReport`].
+//! Rollback never destroys data. Before touching any destination, the shelf
+//! copy is verified intact and both the live destination and the original slot
+//! are hash-compared against it (via [`BackupStore::precheck_restore`]). Three
+//! outcomes per item:
 //!
-//! The run record's state is updated to `RolledBack` on success and
-//! `PartiallyRolledBack` isn't represented yet — when failures occur we still
-//! flip the run to `RolledBack` but surface `failures > 0` in the report so
-//! the user can rerun the command or inspect by hand.
+//! - **Restored** — shelf intact, destination unedited (or already gone),
+//!   original slot free (or already holding the shelved content): the
+//!   destination is renamed aside, the original copied back from the shelf,
+//!   and only then is the displaced destination removed. If the restore copy
+//!   fails mid-way, the displaced destination is renamed back — a failed
+//!   restore never leaves the data solely on the shelf.
+//! - **Conflict** — the destination was edited after apply, or a *new* file
+//!   occupies the original slot: nothing is touched and the item is tallied as
+//!   a conflict, so the user's data survives.
+//! - **Failure** — a missing shelf record, missing/corrupt shelf copy, or
+//!   filesystem error: the destination is preserved (pre-restore failures
+//!   leave it untouched; mid-restore failures rename the displaced copy back)
+//!   and the item is tallied as a failure.
+//!
+//! File-set bundles precheck **every** member before restoring any: one edited
+//! member conflicts the whole bundle (never restore some members while an
+//! edited sibling stays). A mid-restore I/O failure leaves already-restored
+//! members restored (their backup rows are `Unshelved`); a retry recognises
+//! those as done and converges to full restoration — partial progress is
+//! never bricked and nothing is lost.
+//!
+//! Partial rollback is honest and user-visible via [`RollbackReport`]. The run
+//! is flipped to `RolledBack` **only when every item restored cleanly** (no
+//! conflicts, no failures); otherwise the run keeps its prior state so a later
+//! `rollback` retries just the still-applied items — the conflicted/failed ones
+//! stay shelved and `Applied`. (`PartiallyRolledBack` isn't a `RunState` yet.)
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use tidyup_core::frontend::{Level, ProgressItem, ProgressReporter};
 use tidyup_core::Result;
-use tidyup_domain::{BundleProposal, ChangeProposal, Phase, RunRecord, RunState};
+use tidyup_domain::{
+    BackupRecord, BackupStatus, BundleProposal, ChangeProposal, Phase, RestorePrecheck, RunRecord,
+    RunState,
+};
 use uuid::Uuid;
 
 use crate::ServiceContext;
@@ -37,12 +64,25 @@ pub struct RollbackService {
     ctx: Arc<ServiceContext>,
 }
 
+/// Per-item result of a rollback attempt. `Conflict` carries a short human
+/// description of why the item was deliberately left in place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RestoreOutcome {
+    Restored,
+    Conflict(&'static str),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RollbackReport {
     pub run_id: Uuid,
     pub restored: usize,
     pub bundles_restored: usize,
     pub failures: usize,
+    /// Items skipped because their destination was modified after apply.
+    /// Restoring nothing for these preserves the user's edits. Non-zero means
+    /// the run was *not* flipped to `RolledBack` and can be retried.
+    #[serde(default)]
+    pub conflicts: usize,
 }
 
 impl RollbackService {
@@ -76,12 +116,26 @@ impl RollbackService {
             restored: 0,
             bundles_restored: 0,
             failures: 0,
+            conflicts: 0,
         };
 
         // Bundles first — atomic per-bundle restore.
         for bundle in &bundles {
             match self.rollback_bundle(bundle, progress).await {
-                Ok(()) => report.bundles_restored += 1,
+                Ok(RestoreOutcome::Restored) => report.bundles_restored += 1,
+                Ok(RestoreOutcome::Conflict(why)) => {
+                    report.conflicts += 1;
+                    progress
+                        .message(
+                            Level::Warn,
+                            &format!(
+                                "bundle rollback skipped for {}: {why} — left untouched to \
+                                 preserve your data",
+                                bundle.root.display()
+                            ),
+                        )
+                        .await;
+                }
                 Err(e) => {
                     report.failures += 1;
                     progress
@@ -96,7 +150,20 @@ impl RollbackService {
 
         for proposal in &proposals {
             match self.rollback_proposal(proposal, progress).await {
-                Ok(()) => report.restored += 1,
+                Ok(RestoreOutcome::Restored) => report.restored += 1,
+                Ok(RestoreOutcome::Conflict(why)) => {
+                    report.conflicts += 1;
+                    progress
+                        .message(
+                            Level::Warn,
+                            &format!(
+                                "rollback skipped for {}: {why} — left untouched to preserve \
+                                 your data",
+                                proposal.original_path.display()
+                            ),
+                        )
+                        .await;
+                }
                 Err(e) => {
                     report.failures += 1;
                     progress
@@ -112,12 +179,16 @@ impl RollbackService {
             }
         }
 
-        // Mark the run regardless — rollback is idempotent, and a partial
-        // success is still a rollback attempt worth recording.
-        self.ctx
-            .run_log
-            .finish_run(run_id, RunState::RolledBack)
-            .await?;
+        // Flip to RolledBack only when everything restored cleanly. If any item
+        // conflicted or errored, keep the run's prior state so a later rollback
+        // retries the still-applied items — and so re-running a fully-successful
+        // rollback stays a no-op instead of masking failures.
+        if report.failures == 0 && report.conflicts == 0 {
+            self.ctx
+                .run_log
+                .finish_run(run_id, RunState::RolledBack)
+                .await?;
+        }
 
         progress.phase_finished(Phase::Rollback).await;
         Ok(report)
@@ -127,32 +198,42 @@ impl RollbackService {
         &self,
         proposal: &ChangeProposal,
         progress: &dyn ProgressReporter,
-    ) -> Result<()> {
-        let record = self
+    ) -> Result<RestoreOutcome> {
+        let record = match self
+            .resolve_record(proposal.id, &proposal.original_path)
+            .await?
+        {
+            RecordState::Restorable(record) => record,
+            RecordState::AlreadyRestored => {
+                // The backup was consumed and the original is back in place
+                // (e.g. a crash between restore and the status update) — heal
+                // the proposal status and count it restored.
+                self.ctx.change_log.mark_unshelved(proposal.id).await?;
+                return Ok(RestoreOutcome::Restored);
+            }
+        };
+
+        // Never touch the destination unverified. If the shelf is missing this
+        // errors (destination untouched); if the destination was edited or the
+        // original slot holds new content it returns Conflict (nothing touched).
+        match self
             .ctx
             .backup_store
-            .find_by_change_id(proposal.id)
+            .precheck_restore(&record, &proposal.proposed_path)
             .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no shelved backup for change {} ({})",
-                    proposal.id,
-                    proposal.original_path.display(),
-                )
-            })?;
-
-        // Remove the moved file at its destination if it's still there — the
-        // restore copies from shelf to original_path, and leaving the dest in
-        // place would silently leave two copies.
-        if proposal.proposed_path.exists() {
-            if proposal.proposed_path.is_dir() {
-                std::fs::remove_dir_all(&proposal.proposed_path)?;
-            } else {
-                std::fs::remove_file(&proposal.proposed_path)?;
+        {
+            RestorePrecheck::Ready => {}
+            RestorePrecheck::ShelfUnusable(why) => return Err(anyhow::anyhow!(why)),
+            RestorePrecheck::DestinationModified => {
+                return Ok(RestoreOutcome::Conflict(CONFLICT_DEST_MODIFIED))
+            }
+            RestorePrecheck::OriginalOccupied => {
+                return Ok(RestoreOutcome::Conflict(CONFLICT_ORIGINAL_OCCUPIED))
             }
         }
 
-        self.ctx.backup_store.restore(&record).await?;
+        self.restore_with_displacement(&record, &proposal.proposed_path)
+            .await?;
         self.ctx.change_log.mark_unshelved(proposal.id).await?;
 
         progress
@@ -165,14 +246,91 @@ impl RollbackService {
                 },
             )
             .await;
+        Ok(RestoreOutcome::Restored)
+    }
+
+    /// Restore `record` while keeping the destination recoverable throughout:
+    /// rename the destination aside, copy the shelf content back to the
+    /// original path, and only then remove the displaced copy. A failure in
+    /// the restore copy renames the displaced destination back, so no step of
+    /// a failed rollback ever leaves the data solely on the shelf.
+    async fn restore_with_displacement(
+        &self,
+        record: &BackupRecord,
+        destination: &Path,
+    ) -> Result<()> {
+        let displaced = displace_destination(destination)?;
+        if let Err(e) = self.ctx.backup_store.restore(record).await {
+            if let Some(temp) = &displaced {
+                if let Err(undo) = std::fs::rename(temp, destination) {
+                    return Err(anyhow::anyhow!(
+                        "restore failed ({e}); renaming displaced destination back also \
+                         failed ({undo}) — the moved content is preserved at {}",
+                        temp.display(),
+                    ));
+                }
+            }
+            return Err(e);
+        }
+        if let Some(temp) = &displaced {
+            // The original is restored; the displaced destination is now a
+            // duplicate. Best-effort removal — a leftover temp wastes space but
+            // never loses data.
+            let removed = if temp.is_dir() {
+                std::fs::remove_dir_all(temp)
+            } else {
+                std::fs::remove_file(temp)
+            };
+            if let Err(e) = removed {
+                tracing::warn!(
+                    "could not remove displaced rollback copy {}: {e}",
+                    temp.display()
+                );
+            }
+        }
         Ok(())
+    }
+
+    /// Look up the backup record for `change_id` and classify what a retrying
+    /// rollback should do with it.
+    async fn resolve_record(&self, change_id: Uuid, original: &Path) -> Result<RecordState> {
+        let record = self
+            .ctx
+            .backup_store
+            .find_by_change_id(change_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no shelved backup for change {change_id} ({})",
+                    original.display(),
+                )
+            })?;
+        match record.status {
+            BackupStatus::Shelved => Ok(RecordState::Restorable(record)),
+            BackupStatus::Unshelved => {
+                if original.exists() {
+                    Ok(RecordState::AlreadyRestored)
+                } else {
+                    Err(anyhow::anyhow!(
+                        "backup for {} was already consumed but the original is missing — \
+                         restore it by hand from {}",
+                        original.display(),
+                        record.backup_path.display(),
+                    ))
+                }
+            }
+            BackupStatus::Expired => Err(anyhow::anyhow!(
+                "backup for {} expired and its shelf content was pruned",
+                original.display(),
+            )),
+        }
     }
 
     async fn rollback_bundle(
         &self,
         bundle: &BundleProposal,
         progress: &dyn ProgressReporter,
-    ) -> Result<()> {
+    ) -> Result<RestoreOutcome> {
         // File-set bundles (photo bursts, music albums, document series) were
         // applied by moving each member individually, so they restore the same
         // way — per member, by the member's own shelf record.
@@ -180,33 +338,37 @@ impl RollbackService {
             return self.rollback_file_set_bundle(bundle, progress).await;
         }
 
-        let record = self
-            .ctx
-            .backup_store
-            .find_by_change_id(bundle.id)
-            .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no shelved backup for bundle {} ({})",
-                    bundle.id,
-                    bundle.root.display(),
-                )
-            })?;
+        let record = match self.resolve_record(bundle.id, &bundle.root).await? {
+            RecordState::Restorable(record) => record,
+            RecordState::AlreadyRestored => {
+                self.ctx.change_log.mark_bundle_unshelved(bundle.id).await?;
+                return Ok(RestoreOutcome::Restored);
+            }
+        };
 
         let leaf = bundle
             .root
             .file_name()
             .ok_or_else(|| anyhow::anyhow!("bundle root has no file_name"))?;
         let moved_to = bundle.target_parent.join(leaf);
-        if moved_to.exists() {
-            if moved_to.is_dir() {
-                std::fs::remove_dir_all(&moved_to)?;
-            } else {
-                std::fs::remove_file(&moved_to)?;
+
+        match self
+            .ctx
+            .backup_store
+            .precheck_restore(&record, &moved_to)
+            .await?
+        {
+            RestorePrecheck::Ready => {}
+            RestorePrecheck::ShelfUnusable(why) => return Err(anyhow::anyhow!(why)),
+            RestorePrecheck::DestinationModified => {
+                return Ok(RestoreOutcome::Conflict(CONFLICT_DEST_MODIFIED))
+            }
+            RestorePrecheck::OriginalOccupied => {
+                return Ok(RestoreOutcome::Conflict(CONFLICT_ORIGINAL_OCCUPIED))
             }
         }
 
-        self.ctx.backup_store.restore(&record).await?;
+        self.restore_with_displacement(&record, &moved_to).await?;
         self.ctx.change_log.mark_bundle_unshelved(bundle.id).await?;
 
         progress
@@ -219,21 +381,69 @@ impl RollbackService {
                 },
             )
             .await;
-        Ok(())
+        Ok(RestoreOutcome::Restored)
     }
 
-    /// Roll back a file-set bundle by restoring each member from its own shelf
-    /// record. Mirrors the directory path's contract: restore (which removes
-    /// each destination first), then mark the whole bundle `Unshelved` only on
-    /// full success — the first member failure propagates *before* the mark, so
-    /// a partially-failed rollback stays retryable.
+    /// Roll back a file-set bundle as a unit. Every member's shelf and
+    /// destination are prechecked *first*: if any destination was edited (or
+    /// any original slot holds new content), the whole bundle is reported as a
+    /// conflict and nothing is touched — we never restore some members while
+    /// leaving an edited sibling in place. Only when every member is `Ready`
+    /// do we restore, each via [`Self::restore_with_displacement`].
+    ///
+    /// A mid-restore I/O failure leaves the members restored so far in place
+    /// (their backup rows are already `Unshelved`) and propagates the error
+    /// before `mark_bundle_unshelved`; the bundle stays `Applied` and a retry
+    /// recognises the already-restored members (`Unshelved` + original
+    /// present) and completes the rest — partial progress converges to full
+    /// restoration instead of bricking.
     async fn rollback_file_set_bundle(
         &self,
         bundle: &BundleProposal,
         progress: &dyn ProgressReporter,
-    ) -> Result<()> {
+    ) -> Result<RestoreOutcome> {
+        // Phase 1: resolve + precheck every member before mutating anything.
+        let mut prepared: Vec<(BackupRecord, &ChangeProposal)> =
+            Vec::with_capacity(bundle.members.len());
         for member in &bundle.members {
-            self.restore_file_set_member(member).await?;
+            let record = match self
+                .resolve_record(member.id, &member.original_path)
+                .await?
+            {
+                RecordState::Restorable(record) => record,
+                // Already restored by an earlier partial rollback — skip it.
+                RecordState::AlreadyRestored => continue,
+            };
+            match self
+                .ctx
+                .backup_store
+                .precheck_restore(&record, &member.proposed_path)
+                .await?
+            {
+                RestorePrecheck::Ready => prepared.push((record, member)),
+                RestorePrecheck::ShelfUnusable(why) => return Err(anyhow::anyhow!(why)),
+                RestorePrecheck::DestinationModified => {
+                    return Ok(RestoreOutcome::Conflict(CONFLICT_MEMBER_MODIFIED))
+                }
+                RestorePrecheck::OriginalOccupied => {
+                    return Ok(RestoreOutcome::Conflict(CONFLICT_MEMBER_ORIGINAL_OCCUPIED))
+                }
+            }
+        }
+
+        // Phase 2: every pending member is safe — restore them, then mark the
+        // bundle unshelved. An error here propagates before the mark, so the
+        // bundle stays retryable (see the docstring's convergence contract).
+        for (record, member) in &prepared {
+            self.restore_with_displacement(record, &member.proposed_path)
+                .await
+                .with_context(|| {
+                    format!(
+                        "restoring file-set member {} — completed members stay restored; \
+                         re-run rollback to finish the bundle",
+                        member.original_path.display(),
+                    )
+                })?;
         }
         self.ctx.change_log.mark_bundle_unshelved(bundle.id).await?;
         progress
@@ -246,33 +456,7 @@ impl RollbackService {
                 },
             )
             .await;
-        Ok(())
-    }
-
-    async fn restore_file_set_member(&self, member: &ChangeProposal) -> Result<()> {
-        let record = self
-            .ctx
-            .backup_store
-            .find_by_change_id(member.id)
-            .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no shelved backup for file-set member {} ({})",
-                    member.id,
-                    member.original_path.display(),
-                )
-            })?;
-
-        if member.proposed_path.exists() {
-            if member.proposed_path.is_dir() {
-                std::fs::remove_dir_all(&member.proposed_path)?;
-            } else {
-                std::fs::remove_file(&member.proposed_path)?;
-            }
-        }
-
-        self.ctx.backup_store.restore(&record).await?;
-        Ok(())
+        Ok(RestoreOutcome::Restored)
     }
 
     /// List recorded runs, most recent first.
@@ -293,4 +477,49 @@ impl RollbackService {
     pub async fn prune_backups(&self, days: u32) -> Result<usize> {
         self.ctx.backup_store.prune_older_than_days(days).await
     }
+}
+
+/// What a retrying rollback should do with a backup record.
+#[derive(Debug)]
+enum RecordState {
+    /// Still shelved — restore it (after precheck).
+    Restorable(BackupRecord),
+    /// Already restored by an earlier (possibly partial) rollback.
+    AlreadyRestored,
+}
+
+const CONFLICT_DEST_MODIFIED: &str = "destination modified since apply";
+const CONFLICT_ORIGINAL_OCCUPIED: &str = "original location now holds different content";
+const CONFLICT_MEMBER_MODIFIED: &str =
+    "a bundle member's destination was modified since apply (bundles restore all-or-nothing)";
+const CONFLICT_MEMBER_ORIGINAL_OCCUPIED: &str =
+    "a bundle member's original location now holds different content (bundles restore \
+     all-or-nothing)";
+
+/// Rename a rollback destination (file or subtree) aside to a unique sibling
+/// temp path, returning it. `Ok(None)` when the destination no longer exists.
+/// A sibling rename stays on the same volume, so it is atomic and cheap; the
+/// displaced copy is removed only after the shelf restore succeeds, and renamed
+/// back if it fails.
+fn displace_destination(path: &Path) -> Result<Option<PathBuf>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("destination has no file name: {}", path.display()))?
+        .to_string_lossy()
+        .into_owned();
+    let temp = path.with_file_name(format!(
+        ".{name}.tidyup-restore-{}",
+        Uuid::new_v4().simple()
+    ));
+    std::fs::rename(path, &temp).map_err(|e| {
+        anyhow::anyhow!(
+            "displacing destination {} -> {}: {e}",
+            path.display(),
+            temp.display(),
+        )
+    })?;
+    Ok(Some(temp))
 }

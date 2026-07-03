@@ -642,6 +642,7 @@ mod tests {
                 shelved_at: chrono::Utc::now(),
                 unshelved_at: None,
                 status: tidyup_domain::BackupStatus::Shelved,
+                content_hash: None,
             })
         }
         async fn shelve_bundle(
@@ -658,6 +659,7 @@ mod tests {
                 shelved_at: chrono::Utc::now(),
                 unshelved_at: None,
                 status: tidyup_domain::BackupStatus::Shelved,
+                content_hash: None,
             })
         }
         async fn restore(&self, _record: &tidyup_domain::BackupRecord) -> CoreResult<()> {
@@ -668,6 +670,13 @@ mod tests {
             _change_id: Uuid,
         ) -> CoreResult<Option<tidyup_domain::BackupRecord>> {
             Ok(None)
+        }
+        async fn precheck_restore(
+            &self,
+            _record: &tidyup_domain::BackupRecord,
+            _destination: &Path,
+        ) -> CoreResult<tidyup_domain::RestorePrecheck> {
+            Ok(tidyup_domain::RestorePrecheck::Ready)
         }
         async fn prune_older_than_days(&self, _days: u32) -> CoreResult<usize> {
             Ok(0)

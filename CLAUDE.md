@@ -175,6 +175,7 @@ Both produce `ChangeProposal`s and `BundleProposal`s that flow through the same 
 
 - Every applied move is preceded by a backup. If backup fails, the move is aborted.
 - Originals are **shelved, never deleted**. `RollbackService` restores them.
+- **Rollback never destroys data.** Shelf records carry a content hash (BLAKE3 for files, a canonical tree digest for bundle subtrees). Before deleting any rollback destination, `BackupStore::precheck_restore` verifies the shelf copy is intact and hash-compares the live destination (and the original location) against it. A destination edited after apply — or a new file occupying the original slot — is reported as a **conflict** and left untouched; a missing/corrupt shelf is a failure that leaves the destination in place. A run flips to `RolledBack` only when every item restored cleanly, so partial rollbacks stay retryable. Don't add any rollback path that deletes unverified.
 - Default backup TTL is 30 days (configurable).
 - `FileIndex::upsert` preserves `FileId` UUIDs across re-scans (upsert-on-path).
 - No file is moved without an approved `ChangeProposal` or `BundleProposal`. `--yes` auto-approves *moves* above a confidence threshold; rename decisions never auto-apply.

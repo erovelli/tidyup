@@ -332,13 +332,24 @@ async fn run_rollback(json: bool, cfg: &config::TidyupConfig, run_id: uuid::Uuid
             "restored": report.restored,
             "bundles_restored": report.bundles_restored,
             "failures": report.failures,
+            "conflicts": report.conflicts,
         });
         println!("{v}");
     } else {
         println!(
-            "Rollback {}: restored {} loose change(s), {} bundle(s); {} failure(s).",
-            report.run_id, report.restored, report.bundles_restored, report.failures,
+            "Rollback {}: restored {} loose change(s), {} bundle(s); {} failure(s), {} conflict(s).",
+            report.run_id,
+            report.restored,
+            report.bundles_restored,
+            report.failures,
+            report.conflicts,
         );
+        if report.conflicts > 0 {
+            println!(
+                "Conflicted item(s) were modified after apply and were left in place to \
+                 preserve your edits. Resolve them by hand, then re-run rollback."
+            );
+        }
     }
     Ok(())
 }
