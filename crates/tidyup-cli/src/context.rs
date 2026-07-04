@@ -7,10 +7,11 @@
 //!
 //! The default build links neither `tidyup-inference-mistralrs` nor
 //! `tidyup-inference-remote`. When those features are compiled in, *inclusion*
-//! does not imply *activation* — config-level `llm_fallback = true` /
-//! `backends = ["remote-..."]` must still be joined with a per-invocation flag
-//! (`--llm-fallback` / `--remote` or the matching env vars). See
-//! `CLAUDE.md` → "Privacy model".
+//! does not imply *activation* — the config gate (`llm_fallback = true` for the
+//! LLM backend, an `[inference.remote]` section for the remote backend) must
+//! still be joined with a per-invocation flag (`--llm-fallback` / `--remote` or
+//! the matching env vars). The `[inference] backends` list is parsed for
+//! forward-compat but not consulted here. See `CLAUDE.md` → "Privacy model".
 //!
 //! [`InferenceActivation`] captures the per-invocation gate. The CLI parses
 //! flags + env vars and builds it before calling [`build`]. With the default

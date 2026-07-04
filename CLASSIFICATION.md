@@ -279,7 +279,7 @@ None of these break a spec invariant. They shift judgment to the human review st
 - `cargo build --features llm-fallback` includes the crate.
 - Runtime activation requires explicit config (`[inference] llm_fallback = true`) **and** a per-invocation flag (`--llm-fallback` / `TIDYUP_LLM_FALLBACK=1`). The CLI rejects activation without the matching cargo feature compiled in.
 - Never recommended in first-run UX or default docs.
-- `cargo-deny` ban on `mistralrs`/`candle` outside the `llm-fallback` feature (same pattern as the existing `remote` rule).
+- `cargo xtask check-privacy` asserts `mistralrs`/`candle-core`/`hf-hub` are absent from the default `tidyup-cli`/`tidyup-ui` dep graph (the same check that guards the `reqwest`/`hyper`/`rustls` network surface). `cargo-deny` covers licenses/advisories/sources — it does **not** enforce these feature-gated crate bans (`deny.toml [bans].deny` is empty).
 
 ### What Tier 3 actually does (current implementation)
 
@@ -293,7 +293,7 @@ When Tier 2 lands in the **review zone** (`needs_review = true` — below `embed
 
 The cost (1–10 s of inference) is paid only on hard cases — Tier 2 hits that already cleared their thresholds skip Tier 3 entirely. The verdict's `reasoning` field records `tier3 llm-rerank: …` so post-hoc auditing can tell which tier resolved each file. In migration mode the result also carries `Tier::Llm` in `ClassificationResult.resolved_at`.
 
-`tidyup-inference-remote` plugs into the same seam: it implements `TextBackend`, so `--remote` swaps the local mistralrs engine for a remote OpenAI-compatible / Anthropic / Ollama endpoint without any pipeline changes.
+`tidyup-inference-remote` plugs into the same seam: it implements `TextBackend`, so `--remote` swaps the local mistralrs engine for a remote endpoint without any pipeline changes. The crate ships OpenAI-compatible, Anthropic, and Ollama `RemoteEndpoint` adapters, but **only the OpenAI-compatible path is selectable from CLI config today** (`RemoteBackendConfig` has no provider discriminator); the Anthropic/Ollama variants exist but aren't yet wired from config. An Ollama server is still reachable via its OpenAI-compatible `/v1` endpoint.
 
 ## Architectural implications
 

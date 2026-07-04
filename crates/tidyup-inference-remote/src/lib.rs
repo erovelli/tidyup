@@ -5,10 +5,11 @@
 //!
 //! This crate is **excluded from default builds** via `optional = true` on the
 //! `tidyup-cli` dep. The default release binary has no HTTP client
-//! (`reqwest` / `hyper` / `rustls`) linked. Inclusion requires `--features
-//! remote` at build time AND `[inference] backends = ["remote-..."]` in
-//! config AND `--remote` or `TIDYUP_REMOTE=1` at runtime. See
-//! `CLAUDE.md#privacy-model`.
+//! (`reqwest` / `hyper` / `rustls`) linked. Activation is triple-gated:
+//! `--features remote` at build time AND an `[inference.remote]` section in
+//! config AND `--remote` or `TIDYUP_REMOTE=1` at runtime. (The `[inference]
+//! backends` list is parsed for forward-compat but not consulted for
+//! activation.) See `CLAUDE.md#privacy-model`.
 //!
 //! # Shape
 //!

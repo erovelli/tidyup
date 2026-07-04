@@ -155,7 +155,10 @@ pub enum DatePattern {
     Week,
 }
 
-/// On-disk cache of all folder profiles for a target root.
+/// All folder profiles for a target root, built per migration run.
+///
+/// Serializable for a future on-disk cache, but not currently persisted or
+/// reloaded — every run rebuilds it in full (see `CLAUDE.md`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileCache {
     /// Target root this cache belongs to.
@@ -170,7 +173,8 @@ pub struct ProfileCache {
     pub last_scan: TargetScan,
     /// Cache creation timestamp.
     pub created_at: SystemTime,
-    /// Last incremental update timestamp.
+    /// Timestamp of the most recent (currently always full) profile build.
+    /// Reserved for incremental rebuilds, which are not yet wired.
     pub last_updated: SystemTime,
 }
 

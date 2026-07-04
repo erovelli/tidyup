@@ -19,12 +19,14 @@
 //!   names: year/quarter/month buckets, workflow-status folders, or plain
 //!   semantic groupings.
 //!
-//! # Caching
+//! # Caching (planned)
 //!
-//! The profile cache invalidates by `FolderMetadata.content_hash`, not by
-//! timestamp — consistent with the rule in `CLAUDE.md`. A
-//! [`ScanDiff`](tidyup_domain::migration::ScanDiff) computed against a prior
-//! scan tells callers which profiles need rebuilding.
+//! `diff_scans` computes a [`ScanDiff`](tidyup_domain::migration::ScanDiff)
+//! by comparing `FolderMetadata.content_hash` (BLAKE3), not timestamps — so an
+//! incremental profiler could rebuild only changed folders. That machinery is
+//! implemented and unit-tested but **not yet wired**: the migration service
+//! currently rebuilds every profile on each run. Incremental caching is future
+//! work (see `CLAUDE.md`).
 
 use std::collections::{HashMap, HashSet};
 use std::fs;

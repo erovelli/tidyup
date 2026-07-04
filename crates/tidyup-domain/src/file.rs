@@ -24,8 +24,10 @@ impl Default for FileId {
 
 /// BLAKE3 content hash, hex-encoded.
 ///
-/// BLAKE3 is ~2–3× faster than SHA-256, pure Rust, and cryptographically strong. Used across
-/// the workspace for content-addressing (`FileIndex` keying, `ProfileCache` invalidation).
+/// BLAKE3 is ~2–3× faster than SHA-256, pure Rust, and cryptographically strong. It
+/// content-addresses files: captured on each `ChangeProposal` for the apply-time TOCTOU
+/// guard and stored in the `files` table's indexed `content_hash` column. (Content-hash
+/// dedup and by-hash `FileIndex` keying are planned, not yet wired — see `CLAUDE.md`.)
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ContentHash(pub String);
 

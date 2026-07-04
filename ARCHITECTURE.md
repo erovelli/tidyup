@@ -72,7 +72,7 @@ tidyup's default binary is both **network-silent and LLM-silent** for inference.
 - The CLI rejects activation when the matching cargo feature wasn't compiled in (with a rebuild hint). The two activation flags are mutually exclusive — only one Tier 3 backend may be active per invocation.
 - `ServiceContext.text` is `Option<Arc<dyn TextBackend>>`. `None` is the privacy-preserving default; the pipeline calls Tier 3 only when both `Some(backend)` is present and `config.enable_llm_fallback` is true. There is **no** `NullTextBackend` stand-in — absence is the signal, not a no-op trait object that the pipeline could mistake for a real backend.
 - Both features are positioned as power-user escape hatches. First-run UX and default docs never recommend either; the tool is designed to be excellent offline with embedding-based classification.
-- `cargo-deny` enforces the guarantee on both axes: `reqwest` and transitive network deps banned outside the `remote` feature flag; `mistralrs` / `candle` / `hf-hub` banned outside the `llm-fallback` feature flag. `cargo xtask check-privacy` re-checks the default `tidyup-cli` dep graph in CI.
+- **`cargo xtask check-privacy`** enforces the guarantee in CI: it inspects the default `tidyup-cli` (and `tidyup-ui`) dependency graph and fails if any of `reqwest` / `hyper` / `rustls` / `mistralrs` / `candle-core` / `hf-hub` is present. This is asserted on the *default* graph rather than by banning `reqwest` outright, because `reqwest` legitimately links under `--features llm-fallback` too (via `hf-hub` / `mistralrs` for model download). `cargo-deny` covers licenses, advisories, and sources — it does **not** enforce these feature-gated crate bans (`[bans].deny` in `deny.toml` is empty).
 
 This is the single most load-bearing decision in the project. Every other architectural choice (embedding-default classification, local-only models, first-run model download, SQLite-only storage, extractive-only renames) flows from it.
 
@@ -128,7 +128,7 @@ Both thresholds are config-tunable (`[rename] min_classification_confidence`, `[
 
 `FileIndex`, `ChangeLog`, `BackupStore`, `RunLog` are traits. `tidyup-storage-sqlite` is the default implementation. Alternatives (sled, redb, an in-memory test double) slot in without touching the pipeline. `RunLog` records every scan/migration invocation so `tidyup rollback <run_id>` can enumerate applied changes and drive `BackupStore::restore` for each.
 
-Content-addressed dedup is a first-class concern: `FileIndex` is keyed by `ContentHash` (BLAKE3), and `IndexedFile` is a many-to-one presence record. Classification happens once per unique hash; a single result applies to every path sharing that content.
+Content-addressed dedup is a design goal, not yet implemented. `IndexedFile` carries a BLAKE3 `content_hash` in an indexed, non-unique column, but `FileIndex` is keyed by `path`/`id` and exposes no by-hash lookup. Classify-once-per-unique-hash (a single result fanning out to every path sharing that content) is future work; today the pipeline classifies per path and does not currently populate or read `FileIndex` — the scan/migration flows walk the filesystem directly.
 
 ## Why these crate boundaries
 

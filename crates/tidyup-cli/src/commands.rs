@@ -402,7 +402,10 @@ async fn run_rollback(json: bool, cfg: &config::TidyupConfig, run_id: uuid::Uuid
 
 fn run_config(cfg: &config::TidyupConfig) -> Result<()> {
     let data = describe_data_dir(cfg).unwrap_or_else(|| "<unresolved>".into());
-    let config_path = config::platform_config_path()
+    // Show the path `load` actually reads (honors `TIDYUP_CONFIG_PATH`), not
+    // the bare platform path — otherwise `tidyup config` prints one file while
+    // loading another under an env override.
+    let config_path = config::resolved_config_path()
         .map_or_else(|_| "<unresolved>".into(), |p| p.display().to_string());
     println!("tidyup config");
     println!("  config file: {config_path}");

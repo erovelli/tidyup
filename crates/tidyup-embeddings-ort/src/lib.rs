@@ -26,7 +26,8 @@
 //!   target folders. `classify()` returns the highest-cosine-similarity
 //!   folder with a raw score in `[-1.0, 1.0]` (unit-normalized).
 //! - [`taxonomy`] defines the default hierarchical taxonomy plus a disk
-//!   cache keyed by BLAKE3 hash of descriptions + model id.
+//!   cache invalidated by the BLAKE3 hash of the descriptions plus a
+//!   `model_id` equality check.
 //! - [`util`] provides cosine similarity, L2 normalization, and year
 //!   extraction helpers.
 

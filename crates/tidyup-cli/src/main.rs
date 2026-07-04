@@ -58,13 +58,14 @@ struct Cli {
     #[arg(long, global = true)]
     llm_fallback: bool,
 
-    /// Activate the remote Tier 3 backend (`OpenAI`-compatible / Anthropic /
-    /// Ollama).
+    /// Activate the remote Tier 3 backend (`OpenAI`-compatible endpoint).
     ///
     /// Power-user opt-in. Triple-gated: requires `--features remote` at
     /// build time, an `[inference.remote]` section in config, and this flag
     /// (or `TIDYUP_REMOTE=1`) at invocation. The env var is parsed boolishly
-    /// in `commands::dispatch` (see `--llm-fallback`).
+    /// in `commands::dispatch` (see `--llm-fallback`). Only the OpenAI-compatible
+    /// endpoint is selectable from config today; Anthropic/Ollama adapters exist
+    /// in `tidyup-inference-remote` but aren't yet wired.
     #[arg(long, global = true)]
     remote: bool,
 }

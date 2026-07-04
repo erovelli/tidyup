@@ -5,12 +5,12 @@
 //!   handler relies on the trait's default (approve nothing) for bundles.
 //! - [`InteractiveHandler`] — prompt-per-proposal via `console`. For each
 //!   proposal, print a diff-like summary and read a single keystroke:
-//!   `a` approve, `r` reject, `s`/`k` skip (same as reject), `q` reject all
-//!   remaining, `Enter` = reject as default (safe choice). Renames that
-//!   changed the filename are always surfaced explicitly even in `--yes`
-//!   mode — but `--yes` doesn't auto-approve them; they stay rejected
-//!   unless the user is in interactive mode (`CLAUDE.md` → "Don't auto-apply
-//!   rename proposals"). Bundles get their own atomic approve/reject pass via
+//!   `a` approve, `r` reject, `q` reject all remaining, `Enter` = reject as
+//!   default (safe choice). Rename proposals are surfaced explicitly here so
+//!   the user can approve them interactively; under `--yes` the
+//!   [`AutoApproveHandler`] auto-rejects every rename, so renames are never
+//!   auto-applied (`CLAUDE.md` → "Don't auto-apply rename proposals").
+//!   Bundles get their own atomic approve/reject pass via
 //!   [`InteractiveHandler::review_bundles`] after the loose-proposal pass.
 
 use async_trait::async_trait;
