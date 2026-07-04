@@ -204,10 +204,12 @@ impl RollbackService {
             .await?
         {
             RecordState::Restorable(record) => record,
-            RecordState::AlreadyRestored => {
-                // The backup was consumed and the original is back in place
-                // (e.g. a crash between restore and the status update) — heal
-                // the proposal status and count it restored.
+            RecordState::AlreadyRestored | RecordState::NeverMoved => {
+                // AlreadyRestored: a crash between restore and the status update
+                // left the original back in place. NeverMoved: a crash after the
+                // write-ahead journal but before shelve+move left it at its
+                // origin. Either way there is nothing to move — heal the
+                // proposal status and count it restored.
                 self.ctx.change_log.mark_unshelved(proposal.id).await?;
                 return Ok(RestoreOutcome::Restored);
             }
@@ -294,17 +296,21 @@ impl RollbackService {
     /// Look up the backup record for `change_id` and classify what a retrying
     /// rollback should do with it.
     async fn resolve_record(&self, change_id: Uuid, original: &Path) -> Result<RecordState> {
-        let record = self
-            .ctx
-            .backup_store
-            .find_by_change_id(change_id)
-            .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no shelved backup for change {change_id} ({})",
-                    original.display(),
-                )
-            })?;
+        let Some(record) = self.ctx.backup_store.find_by_change_id(change_id).await? else {
+            // No shelf record. Under write-ahead journaling a change is shelved
+            // before it is marked applied, so the only way an *applied* change
+            // has no shelf record is a crash after the journal write but before
+            // shelve+move — the original never moved. If it's still there,
+            // there is nothing to restore; if it's gone, the state is
+            // genuinely inconsistent and we surface it.
+            if original.exists() {
+                return Ok(RecordState::NeverMoved);
+            }
+            return Err(anyhow::anyhow!(
+                "no shelved backup for change {change_id} and the original {} is missing",
+                original.display(),
+            ));
+        };
         match record.status {
             BackupStatus::Shelved => Ok(RecordState::Restorable(record)),
             BackupStatus::Unshelved => {
@@ -340,7 +346,7 @@ impl RollbackService {
 
         let record = match self.resolve_record(bundle.id, &bundle.root).await? {
             RecordState::Restorable(record) => record,
-            RecordState::AlreadyRestored => {
+            RecordState::AlreadyRestored | RecordState::NeverMoved => {
                 self.ctx.change_log.mark_bundle_unshelved(bundle.id).await?;
                 return Ok(RestoreOutcome::Restored);
             }
@@ -397,6 +403,12 @@ impl RollbackService {
     /// recognises the already-restored members (`Unshelved` + original
     /// present) and completes the rest — partial progress converges to full
     /// restoration instead of bricking.
+    ///
+    /// This also recovers a bundle whose *apply* was interrupted by a crash:
+    /// write-ahead journaling marks the bundle applied before moving any member,
+    /// so a partially-applied bundle enumerates here; members that were never
+    /// shelved (still at their origin) resolve to `NeverMoved` and are skipped,
+    /// while the moved members restore normally.
     async fn rollback_file_set_bundle(
         &self,
         bundle: &BundleProposal,
@@ -411,8 +423,11 @@ impl RollbackService {
                 .await?
             {
                 RecordState::Restorable(record) => record,
-                // Already restored by an earlier partial rollback — skip it.
-                RecordState::AlreadyRestored => continue,
+                // AlreadyRestored: restored by an earlier partial rollback.
+                // NeverMoved: a crash left the bundle journaled applied before
+                // this member was shelved+moved (it's still at its origin).
+                // Either way, skip it.
+                RecordState::AlreadyRestored | RecordState::NeverMoved => continue,
             };
             match self
                 .ctx
@@ -479,13 +494,17 @@ impl RollbackService {
     }
 }
 
-/// What a retrying rollback should do with a backup record.
+/// What a retrying rollback should do with a change's backup record.
 #[derive(Debug)]
 enum RecordState {
     /// Still shelved — restore it (after precheck).
     Restorable(BackupRecord),
     /// Already restored by an earlier (possibly partial) rollback.
     AlreadyRestored,
+    /// No shelf record and the original is still in place — the change was
+    /// journaled applied (write-ahead) but a crash killed the process before it
+    /// was shelved/moved. Nothing to restore; the file never left its origin.
+    NeverMoved,
 }
 
 const CONFLICT_DEST_MODIFIED: &str = "destination modified since apply";

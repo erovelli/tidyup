@@ -259,6 +259,14 @@ async fn run_status(json: bool, cfg: &config::TidyupConfig) -> Result<()> {
     let service = RollbackService::new(ctx);
     let runs = service.list_runs().await?;
     let recent: Vec<_> = runs.iter().take(10).collect();
+    // A run left `InProgress` is one whose process died mid-apply (a crash or
+    // Ctrl-C): the applied subset is journaled per-move in the change log, so
+    // `tidyup rollback <id>` reverses whatever landed. Surface these so the user
+    // can reconcile.
+    let interrupted: Vec<_> = runs
+        .iter()
+        .filter(|r| r.state == tidyup_domain::RunState::InProgress)
+        .collect();
 
     if json {
         let rows: Vec<_> = recent
@@ -280,6 +288,7 @@ async fn run_status(json: bool, cfg: &config::TidyupConfig) -> Result<()> {
                 "model_ready": model_ready,
                 "backup_retention_days": cfg.storage.backup_retention_days,
                 "total_runs": runs.len(),
+                "interrupted_runs": interrupted.iter().map(|r| r.id).collect::<Vec<_>>(),
                 "recent_runs": rows,
             }),
         );
@@ -301,6 +310,23 @@ async fn run_status(json: bool, cfg: &config::TidyupConfig) -> Result<()> {
         cfg.storage.backup_retention_days,
     );
     println!("  recorded runs:     {}", runs.len());
+    if interrupted.is_empty() {
+        println!("  interrupted runs:  none");
+    } else {
+        println!(
+            "  interrupted runs:  {} (process died mid-apply)",
+            interrupted.len()
+        );
+        for r in &interrupted {
+            println!(
+                "    {}  {:<8}  started {}  — reverse with `tidyup rollback {}`",
+                r.id,
+                r.mode.as_str(),
+                r.started_at,
+                r.id,
+            );
+        }
+    }
     if recent.is_empty() {
         println!("  recent runs:       none");
     } else {

@@ -803,6 +803,7 @@ fn build_proposal(source: &Path, output_root: &Path, c: &ClassifiedFile) -> Chan
         bundle_id: None,
         classification_confidence: c.classification_confidence,
         rename_mismatch_score: c.rename_mismatch_score,
+        content_hash: crate::hashing::content_hash_of(source),
     }
 }
 
@@ -891,6 +892,7 @@ fn build_bundle_proposal(bundle: &DetectedBundle, output_root: &Path) -> Result<
             bundle_id: None, // stamped by BundleProposal::new
             classification_confidence: None,
             rename_mismatch_score: None,
+            content_hash: crate::hashing::content_hash_of(m),
         });
     }
 

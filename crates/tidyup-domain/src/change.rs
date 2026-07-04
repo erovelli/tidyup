@@ -106,6 +106,14 @@ pub struct ChangeProposal {
     /// jointly with `classification_confidence`. `None` when no rename was considered.
     #[serde(default)]
     pub rename_mismatch_score: Option<f32>,
+    /// BLAKE3 of the source file's bytes captured when the proposal was built
+    /// (scan/migration time). The executor re-hashes the source at apply time
+    /// and aborts the move if it no longer matches — a file edited or replaced
+    /// between review and apply is never silently moved. `None` when the hash
+    /// couldn't be computed at build time (e.g. an unreadable file); the apply
+    /// then proceeds without the TOCTOU guard, preserving prior behaviour.
+    #[serde(default)]
+    pub content_hash: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -175,6 +183,7 @@ mod tests {
             bundle_id: None,
             classification_confidence: Some(0.91),
             rename_mismatch_score: Some(0.72),
+            content_hash: Some("af1349b9f5f9a1a6".to_string()),
         };
         let json = serde_json::to_string(&p).unwrap();
         let back: ChangeProposal = serde_json::from_str(&json).unwrap();
@@ -200,6 +209,7 @@ mod tests {
             bundle_id: Some(bundle_id),
             classification_confidence: None,
             rename_mismatch_score: None,
+            content_hash: None,
         };
         let json = serde_json::to_string(&p).unwrap();
         let back: ChangeProposal = serde_json::from_str(&json).unwrap();

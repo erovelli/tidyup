@@ -18,7 +18,7 @@ use crate::SqliteStore;
 
 const CHANGE_COLS: &str = "id, file_id, change_type, original_path, proposed_path, \
      proposed_name, confidence, reasoning, needs_review, status, created_at, applied_at, \
-     bundle_id, classification_confidence, rename_mismatch_score, run_id";
+     bundle_id, classification_confidence, rename_mismatch_score, run_id, content_hash";
 
 const BUNDLE_COLS: &str = "id, root, kind, target_parent, status, reasoning, confidence, \
      created_at, applied_at, run_id";
@@ -79,6 +79,7 @@ fn row_to_proposal(row: &Row<'_>) -> rusqlite::Result<ChangeProposal> {
         bundle_id,
         classification_confidence,
         rename_mismatch_score,
+        content_hash: row.get::<_, Option<String>>("content_hash")?,
     })
 }
 
@@ -110,7 +111,7 @@ fn insert_proposal(tx: &Transaction<'_>, p: &ChangeProposal, run_id: Option<Uuid
     tx.execute(
         &format!(
             "INSERT INTO change_proposals ({CHANGE_COLS}) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)"
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"
         ),
         params![
             p.id.to_string(),
@@ -129,6 +130,7 @@ fn insert_proposal(tx: &Transaction<'_>, p: &ChangeProposal, run_id: Option<Uuid
             p.classification_confidence.map(f64::from),
             p.rename_mismatch_score.map(f64::from),
             run_id.map(|r| r.to_string()),
+            p.content_hash,
         ],
     )
     .context("inserting change proposal")?;

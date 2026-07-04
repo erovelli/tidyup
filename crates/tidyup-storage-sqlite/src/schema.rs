@@ -69,7 +69,8 @@ CREATE TABLE IF NOT EXISTS change_proposals (
     bundle_id                  TEXT REFERENCES bundles(id) ON DELETE CASCADE,
     classification_confidence  REAL,
     rename_mismatch_score      REAL,
-    run_id                     TEXT REFERENCES runs(id)
+    run_id                     TEXT REFERENCES runs(id),
+    content_hash               TEXT
 );
 ";
 
@@ -140,5 +141,6 @@ pub(super) fn apply(conn: &mut Connection) -> rusqlite::Result<()> {
     )?;
     // Additive migrations for databases created before a column existed.
     add_column_if_missing(&tx, "backups", "content_hash", "TEXT")?;
+    add_column_if_missing(&tx, "change_proposals", "content_hash", "TEXT")?;
     tx.commit()
 }

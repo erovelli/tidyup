@@ -310,6 +310,52 @@ async fn scan_service_records_bundles_separately() {
 }
 
 #[tokio::test]
+async fn migration_refuses_source_target_overlap() {
+    // Target nested inside source, source nested inside target, and equal roots
+    // must all be refused before any run is recorded.
+    let root = TempDir::new().unwrap();
+    let outer = root.path().join("outer");
+    let inner = outer.join("inner");
+    std::fs::create_dir_all(&inner).unwrap();
+
+    let (ctx, store) = make_ctx();
+    let service = MigrationService::new(Arc::clone(&ctx));
+    let reviewer = AutoApprove::new();
+
+    let cases = [
+        (outer.clone(), inner.clone()), // target inside source
+        (inner.clone(), outer.clone()), // source inside target
+        (outer.clone(), outer.clone()), // equal
+    ];
+    for (source, target) in cases {
+        let err = service
+            .run(
+                tidyup_app::migration::MigrationRequest {
+                    source: source.clone(),
+                    target: target.clone(),
+                    dry_run: false,
+                    auto_approve_bundles: false,
+                    bundle_min_confidence: 0.85,
+                },
+                &NullProgress,
+                &reviewer,
+            )
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("inside") || msg.contains("same directory"),
+            "expected overlap error for {source:?} -> {target:?}, got: {msg}"
+        );
+    }
+    // No run should have been recorded for a rejected overlap.
+    assert!(
+        store.list_runs().await.unwrap().is_empty(),
+        "overlap must be refused before a run is recorded"
+    );
+}
+
+#[tokio::test]
 async fn migration_service_builds_profiles_and_classifies() {
     let src = TempDir::new().unwrap();
     let tgt = TempDir::new().unwrap();
@@ -922,6 +968,7 @@ async fn rollback_restore_failure_preserves_destination() {
         bundle_id: None,
         classification_confidence: Some(0.95),
         rename_mismatch_score: None,
+        content_hash: None,
     };
     store
         .record_proposal(&proposal, Some(run.id))
@@ -1059,6 +1106,112 @@ async fn file_set_rollback_conflicts_whole_bundle_when_one_member_edited() {
 }
 
 #[tokio::test]
+async fn file_set_crash_mid_apply_is_recovered_by_rollback() {
+    // Build, by hand, the exact on-disk + DB state a crash leaves mid-file-set
+    // under write-ahead journaling: the bundle is marked applied first, then
+    // member 0 is shelved+moved, then the process dies before members 1-2 are
+    // touched. `rollback_run` must restore member 0 and skip the never-moved
+    // members, converging to all-at-origin with no data loss.
+    use tidyup_app::RollbackService;
+    use tidyup_core::storage::{BackupStore as _, ChangeLog as _, RunLog as _};
+
+    let workdir = TempDir::new().unwrap();
+    let shelf = workdir.path().join("shelf");
+    std::fs::create_dir_all(&shelf).unwrap();
+    let src_root = workdir.path().join("src");
+    let tgt = workdir.path().join("Photos/Bursts/x");
+    std::fs::create_dir_all(&src_root).unwrap();
+    std::fs::create_dir_all(&tgt).unwrap();
+
+    let (ctx, store) = make_ctx_with_shelf(Some(shelf));
+    let run = tidyup_domain::RunRecord::begin(tidyup_domain::RunMode::Scan, src_root.clone(), None);
+    store.record_run(&run).await.unwrap();
+
+    // Three members forming a photo burst (a file-set bundle).
+    let mut members = Vec::new();
+    let mut paths = Vec::new();
+    for n in ["IMG_001.jpg", "IMG_002.jpg", "IMG_003.jpg"] {
+        let orig = src_root.join(n);
+        std::fs::write(&orig, format!("bytes of {n}").as_bytes()).unwrap();
+        let dst = tgt.join(n);
+        paths.push((orig.clone(), dst.clone()));
+        members.push(ChangeProposal {
+            id: uuid::Uuid::new_v4(),
+            file_id: None,
+            change_type: tidyup_domain::ChangeType::Move,
+            original_path: orig,
+            proposed_path: dst,
+            proposed_name: n.to_string(),
+            confidence: 0.9,
+            reasoning: "burst".to_string(),
+            needs_review: false,
+            status: tidyup_domain::ChangeStatus::Pending,
+            created_at: chrono::Utc::now(),
+            applied_at: None,
+            bundle_id: None,
+            classification_confidence: None,
+            rename_mismatch_score: None,
+            content_hash: None,
+        });
+    }
+    let bundle = BundleProposal::new(
+        src_root.join("burst"),
+        tidyup_domain::BundleKind::PhotoBurst,
+        tgt.clone(),
+        members.clone(),
+        0.9,
+        "photo burst".to_string(),
+    )
+    .unwrap();
+    store.record_bundle(&bundle, Some(run.id)).await.unwrap();
+
+    // Write-ahead journal fires first...
+    store.mark_bundle_applied(bundle.id).await.unwrap();
+    // ...then member 0 is shelved + moved, and the process "crashes".
+    let m0 = &bundle.members[0];
+    let indexed = tidyup_domain::IndexedFile {
+        id: tidyup_domain::FileId::new(),
+        path: m0.original_path.clone(),
+        name: "IMG_001.jpg".to_string(),
+        extension: "jpg".to_string(),
+        mime_type: "image/jpeg".to_string(),
+        size_bytes: 0,
+        content_hash: tidyup_domain::ContentHash(String::new()),
+        indexed_at: chrono::Utc::now(),
+    };
+    store.shelve(&indexed, m0.id).await.unwrap();
+    std::fs::rename(&paths[0].0, &paths[0].1).unwrap();
+
+    // The run never finished — `status`-style detection surfaces it as an
+    // interrupted (InProgress) run that rollback can reconcile.
+    assert_eq!(
+        store.get_run(run.id).await.unwrap().unwrap().state,
+        tidyup_domain::RunState::InProgress,
+    );
+    // Sanity: member 0 moved+shelved; members 1-2 at origin, never shelved.
+    assert!(!paths[0].0.exists() && paths[0].1.exists());
+    assert!(store.find_by_change_id(m0.id).await.unwrap().is_some());
+    assert!(store
+        .find_by_change_id(bundle.members[1].id)
+        .await
+        .unwrap()
+        .is_none());
+
+    let rollback = RollbackService::new(Arc::clone(&ctx));
+    let rb = rollback.rollback_run(run.id, &NullProgress).await.unwrap();
+
+    assert_eq!(rb.bundles_restored, 1, "partial bundle recovered: {rb:?}");
+    assert_eq!(rb.failures, 0);
+    assert_eq!(rb.conflicts, 0);
+    // Everything ends at its origin; nothing stranded at a destination.
+    for (orig, dst) in &paths {
+        assert!(orig.exists(), "restored: {}", orig.display());
+        assert!(!dst.exists(), "cleared: {}", dst.display());
+    }
+    assert_eq!(std::fs::read(&paths[0].0).unwrap(), b"bytes of IMG_001.jpg");
+}
+
+#[tokio::test]
 async fn file_set_rollback_retry_completes_after_partial_restore() {
     use tidyup_app::RollbackService;
     use tidyup_core::storage::BackupStore as _;
@@ -1070,13 +1223,13 @@ async fn file_set_rollback_retry_completes_after_partial_restore() {
     // Simulate an interrupted earlier rollback: member 0 was already restored
     // (shelf copy back at the original, backup row flipped Unshelved,
     // destination removed) but the bundle never got marked unshelved.
-    let member0 = &bundle.members[0];
-    let record0 = store
-        .find_by_change_id(member0.id)
+    let first_member = &bundle.members[0];
+    let first_record = store
+        .find_by_change_id(first_member.id)
         .await
         .unwrap()
-        .expect("member 0 has a shelf record");
-    store.restore(&record0).await.unwrap();
+        .unwrap();
+    store.restore(&first_record).await.unwrap();
     std::fs::remove_file(&members[0].1).unwrap();
 
     // Retry must recognise member 0 as done and complete the remaining two.
@@ -1138,6 +1291,7 @@ async fn rollback_of_a_rename_restores_the_original_name() {
         bundle_id: None,
         classification_confidence: Some(0.95),
         rename_mismatch_score: Some(0.7),
+        content_hash: None,
     };
     store
         .record_proposal(&proposal, Some(run.id))

@@ -906,6 +906,7 @@ fn build_proposal(source: &Path, v: &Verdict) -> ChangeProposal {
         bundle_id: None,
         classification_confidence: v.classification_confidence,
         rename_mismatch_score: v.rename_mismatch_score,
+        content_hash: crate::hashing::content_hash_of(source),
     }
 }
 
@@ -959,6 +960,7 @@ async fn build_bundle_proposal(
             bundle_id: None,
             classification_confidence: None,
             rename_mismatch_score: None,
+            content_hash: crate::hashing::content_hash_of(m),
         });
     }
 
