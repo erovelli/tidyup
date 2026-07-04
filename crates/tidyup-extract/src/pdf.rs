@@ -51,6 +51,22 @@ impl ContentExtractor for PdfExtractor {
     }
 
     async fn extract(&self, path: &Path) -> Result<ExtractedContent> {
+        // `pdf_extract` parses the whole file in memory, so bound the input:
+        // above the ceiling, defer to review with no text rather than risk OOM.
+        if let Ok(meta) = tokio::fs::metadata(path).await {
+            if meta.len() > crate::MAX_DOCUMENT_BYTES {
+                tracing::warn!(
+                    "pdf too large to parse safely ({} bytes) {}: deferring to review",
+                    meta.len(),
+                    path.display(),
+                );
+                return Ok(ExtractedContent {
+                    text: None,
+                    mime: "application/pdf".to_string(),
+                    metadata: serde_json::json!({ "too_large": true, "size_bytes": meta.len() }),
+                });
+            }
+        }
         let owned: PathBuf = path.to_path_buf();
         let result = tokio::task::spawn_blocking(move || pdf_extract::extract_text(&owned)).await?;
 
@@ -118,5 +134,25 @@ mod tests {
         assert_eq!(out.mime, "application/pdf");
         assert!(out.text.is_none());
         assert!(out.metadata.get("error").is_some());
+    }
+
+    #[tokio::test]
+    async fn oversized_pdf_is_deferred_not_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.pdf");
+        // Sparse file just over the ceiling — no real bytes hit disk, and the
+        // size guard short-circuits before pdf_extract ever touches it.
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(crate::MAX_DOCUMENT_BYTES + 1).unwrap();
+        drop(f);
+
+        let out = PdfExtractor::new().extract(&path).await.unwrap();
+        assert!(out.text.is_none(), "oversized pdf must not be parsed");
+        assert_eq!(
+            out.metadata
+                .get("too_large")
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+        );
     }
 }
