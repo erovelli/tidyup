@@ -238,69 +238,48 @@ async fn classify_file(
     // Heuristics give us a class label (e.g. `"Code/"`), but in migration
     // mode we need an actual folder path. Use the heuristic's taxonomy
     // string as a soft routing signal: pick the profile leaf whose path
-    // *contains* that label case-insensitively. If none matches, fall
-    // through to Tier 2.
-    if let Some(hit) = heuristics::classify(path, effective_mime.as_deref()) {
-        if hit.confidence >= config.heuristic_threshold {
-            if let Some(folder) = route_heuristic(&hit, profiles) {
-                let text = extracted.as_ref().and_then(|e| e.text.as_deref());
-                let metadata_json = extracted
-                    .as_ref()
-                    .map_or(serde_json::Value::Null, |e| e.metadata.clone());
-                let keywords = text
-                    .map(|t| yake::extract_keywords(t, 8))
-                    .unwrap_or_default();
-                let year = text.and_then(|t| find_year(char_prefix(t, 1000)));
-                let rename = gate_rename(
+    // *contains* that label case-insensitively (`route_heuristic`). If none
+    // matches, fall through to Tier 2.
+    let tier1_route = heuristics::classify(path, effective_mime.as_deref())
+        .filter(|hit| hit.confidence >= config.heuristic_threshold)
+        .and_then(|hit| route_heuristic(&hit, profiles).map(|folder| (hit, folder)));
+
+    // Ordering: for image/audio whose cross-modal backend is loaded, prefer the
+    // image/audio-centroid classifier and use Tier 1 as the fallback — otherwise
+    // a `.jpg`/`.mp3` short-circuits at Tier 1 (whenever a folder name happens to
+    // match the heuristic label) and never reaches Tier 2. With no backend (the
+    // default install) Tier 1 wins first, unchanged.
+    let modality = file_modality(path, effective_mime.as_deref());
+    let media_backend_present = match modality {
+        FileModality::Image => multimodal.image.is_some(),
+        FileModality::Audio => multimodal.audio.is_some(),
+        _ => false,
+    };
+
+    if !media_backend_present {
+        if let Some((hit, folder)) = &tier1_route {
+            return Ok(Some(
+                tier1_verdict(
                     path,
-                    &metadata_json,
-                    &keywords,
-                    year,
-                    hit.confidence,
+                    hit,
+                    folder.clone(),
+                    extracted.as_ref(),
                     embeddings,
-                    text,
                     &filename,
                     config,
                 )
-                .await?;
-                return Ok(Some(Verdict {
-                    result: ClassificationResult {
-                        source_file: path.to_path_buf(),
-                        candidates: vec![Candidate {
-                            folder: folder.clone(),
-                            score: hit.confidence,
-                            score_breakdown: ScoreBreakdown {
-                                name_similarity: 0.0,
-                                centroid_similarity: None,
-                                metadata_score: 0.0,
-                                hierarchy_adjustment: 0.0,
-                            },
-                        }],
-                        resolved_at: Tier::Heuristic,
-                        needs_review: false,
-                        suggested_rename: match &rename.proposal {
-                            RenameProposal::Rename { name, .. } => Some(name.clone()),
-                            RenameProposal::Keep => None,
-                        },
-                    },
-                    rename: rename.proposal,
-                    destination_folder: folder,
-                    confidence: hit.confidence,
-                    reasoning: format!("tier1 heuristic: {}", hit.reason),
-                    classification_confidence: Some(hit.confidence),
-                    rename_mismatch_score: rename.mismatch_score,
-                }));
-            }
+                .await?,
+            ));
         }
     }
 
     // Tier 2 (cross-modal) — image/audio files route against the folders'
     // image/audio centroids when the matching backend is loaded. A miss
-    // (backend absent, no folder has a centroid, unreadable file) falls through
-    // to the text Tier 2 path below.
+    // (backend absent, no folder has a centroid, unreadable/oversized file)
+    // falls through to the deferred Tier-1 route, then the text Tier 2 path.
     if let Some(verdict) = classify_modality_file(
         path,
-        file_modality(path, effective_mime.as_deref()),
+        modality,
         effective_mime.as_deref(),
         multimodal,
         profiles,
@@ -309,6 +288,23 @@ async fn classify_file(
     .await
     {
         return Ok(Some(verdict));
+    }
+
+    if media_backend_present {
+        if let Some((hit, folder)) = &tier1_route {
+            return Ok(Some(
+                tier1_verdict(
+                    path,
+                    hit,
+                    folder.clone(),
+                    extracted.as_ref(),
+                    embeddings,
+                    &filename,
+                    config,
+                )
+                .await?,
+            ));
+        }
     }
 
     // Tier 2 — composite scoring against all leaf profiles.
@@ -512,6 +508,66 @@ fn build_llm_query(c: &tidyup_core::inference::ContentClassification) -> String 
     parts.join(" ")
 }
 
+/// Build the Tier-1 (`needs_review = false`) verdict for a confident heuristic
+/// hit routed to `folder`. Shared by the two call sites in `classify_file`: the
+/// normal Tier-1 short-circuit, and the fallback when a media file's cross-modal
+/// Tier 2 was tried first and missed.
+async fn tier1_verdict(
+    path: &Path,
+    hit: &HeuristicMatch,
+    folder: PathBuf,
+    extracted: Option<&tidyup_core::extractor::ExtractedContent>,
+    embeddings: &dyn EmbeddingBackend,
+    filename: &str,
+    config: &ClassifierConfig,
+) -> Result<Verdict> {
+    let text = extracted.and_then(|e| e.text.as_deref());
+    let metadata_json = extracted.map_or(serde_json::Value::Null, |e| e.metadata.clone());
+    let keywords = text
+        .map(|t| yake::extract_keywords(t, 8))
+        .unwrap_or_default();
+    let year = text.and_then(|t| find_year(char_prefix(t, 1000)));
+    let rename = gate_rename(
+        path,
+        &metadata_json,
+        &keywords,
+        year,
+        hit.confidence,
+        embeddings,
+        text,
+        filename,
+        config,
+    )
+    .await?;
+    Ok(Verdict {
+        result: ClassificationResult {
+            source_file: path.to_path_buf(),
+            candidates: vec![Candidate {
+                folder: folder.clone(),
+                score: hit.confidence,
+                score_breakdown: ScoreBreakdown {
+                    name_similarity: 0.0,
+                    centroid_similarity: None,
+                    metadata_score: 0.0,
+                    hierarchy_adjustment: 0.0,
+                },
+            }],
+            resolved_at: Tier::Heuristic,
+            needs_review: false,
+            suggested_rename: match &rename.proposal {
+                RenameProposal::Rename { name, .. } => Some(name.clone()),
+                RenameProposal::Keep => None,
+            },
+        },
+        rename: rename.proposal,
+        destination_folder: folder,
+        confidence: hit.confidence,
+        reasoning: format!("tier1 heuristic: {}", hit.reason),
+        classification_confidence: Some(hit.confidence),
+        rename_mismatch_score: rename.mismatch_score,
+    })
+}
+
 fn weak_heuristic(hit: &HeuristicMatch, folder: PathBuf, path: &Path) -> Verdict {
     Verdict {
         result: ClassificationResult {
@@ -553,6 +609,11 @@ async fn classify_modality_file(
     config: &ClassifierConfig,
 ) -> Option<Verdict> {
     let mime_str = mime.unwrap_or("application/octet-stream");
+    // Bound the read: an oversized media file is left to the Tier-1 fallback
+    // rather than slurped whole into memory for embedding.
+    if tokio::fs::metadata(path).await.map_or(0, |m| m.len()) > tidyup_extract::MAX_DOCUMENT_BYTES {
+        return None;
+    }
     let bytes = tokio::fs::read(path).await.ok()?;
     match modality {
         FileModality::Image => {
@@ -1723,6 +1784,72 @@ mod tests {
             p.proposed_path.starts_with(&photos),
             "image should route to Photos, got {:?}",
             p.proposed_path,
+        );
+        assert_eq!(out.classifications[0].resolved_at, Tier::Embedding);
+    }
+
+    /// WP-7 regression signal (migration mode): even when the target has a
+    /// `Photos/` folder — whose name the Tier-1 `route_heuristic` matches on the
+    /// "photos" label — an image source under the SHIPPED default threshold
+    /// (0.60) must still route via the image centroid because the `SigLIP`
+    /// backend is loaded. Before the fix, the name match short-circuited to
+    /// Tier 1.
+    #[tokio::test]
+    async fn image_reaches_centroid_at_default_threshold_when_backend_present() {
+        use crate::profiler::{build_profile_cache_multimodal, scan_target, MultimodalProfilers};
+
+        let tgt = TempDir::new().unwrap();
+        let photos = tgt.path().join("Photos");
+        fs::create_dir_all(&photos).unwrap();
+        let png = make_png_bytes();
+        fs::write(photos.join("a.png"), &png).unwrap();
+        fs::write(photos.join("b.png"), &png).unwrap();
+
+        let eb = BucketEmbeddings;
+        let img = BucketImageBackend;
+        let scan = scan_target(tgt.path()).unwrap();
+        let profiles = build_profile_cache_multimodal(
+            &scan,
+            &eb,
+            MultimodalProfilers {
+                image: Some(&img),
+                audio: None,
+                extractors: &[],
+            },
+        )
+        .await
+        .unwrap();
+
+        let src = TempDir::new().unwrap();
+        fs::write(src.path().join("vacation.png"), &png).unwrap();
+        let ex: Vec<Arc<dyn ContentExtractor>> = vec![];
+        let cfg = ClassifierConfig {
+            heuristic_threshold: 0.6, // shipped default — Tier-1 route_heuristic("photos") WOULD match Photos/
+            embedding_threshold: 0.0,
+            ambiguity_gap: 0.0,
+            ..ClassifierConfig::default()
+        };
+        let out = run_migration(
+            src.path(),
+            &profiles,
+            &eb,
+            None,
+            MigrationMultimodal {
+                image: Some(&img),
+                audio: None,
+            },
+            &ex,
+            &cfg,
+            &NullProgress,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.proposals.len(), 1);
+        assert!(
+            out.proposals[0].reasoning.contains("tier2 image-centroid"),
+            "at the default threshold the image must reach the centroid path, not Tier 1; got: {}",
+            out.proposals[0].reasoning,
         );
         assert_eq!(out.classifications[0].resolved_at, Tier::Embedding);
     }
