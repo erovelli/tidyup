@@ -10,8 +10,11 @@
 //!   (safe choice). Rename proposals are surfaced explicitly here so the user
 //!   can approve them interactively; under `--yes` the [`AutoApproveHandler`]
 //!   auto-rejects every rename, so renames are never auto-applied (`CLAUDE.md`
-//!   → "Don't auto-apply rename proposals"). Bulk approve (`A`) covers moves
-//!   only — a pending rename still gets its own explicit prompt. If there is no
+//!   → "Don't auto-apply rename proposals"). Bulk approve (`A`) approves the
+//!   item on screen (which may be a rename you're looking at — that's an
+//!   explicit keystroke on a surfaced proposal) and then auto-approves the
+//!   remaining **moves**; every subsequent rename still gets its own explicit
+//!   prompt, so a rename is never approved without being seen. If there is no
 //!   TTY (piped/redirected/CI), the handler errors up front pointing at
 //!   `--yes`, rather than spinning on a stream that never yields a keystroke.
 //!   Bundles get their own atomic approve/reject pass via
@@ -100,6 +103,14 @@ fn ensure_attended(stdin_tty: bool, stdout_tty: bool) -> Result<()> {
 const LOOSE_LEGEND: &str =
     "a=approve  A=approve-all-remaining  r=reject  q=reject-all-remaining  Esc=abort  ENTER=reject (default)";
 
+/// Abort a per-item prompt after this many *consecutive* unrecognized reads.
+/// The upfront TTY guard already makes the non-interactive spin unreachable, so
+/// on a real terminal an occasional stray key (e.g. invalid-UTF-8 Alt combo)
+/// just re-prompts; only a flood — which a non-tty that somehow slipped the
+/// guard would produce instantly via endless `Key::Unknown` — aborts. A human
+/// never types this many invalid keys in a row.
+const MAX_UNRECOGNIZED_KEYS: u32 = 100;
+
 const fn is_rename(p: &ChangeProposal) -> bool {
     matches!(
         p.change_type,
@@ -133,6 +144,7 @@ fn prompt_each(proposals: Vec<ChangeProposal>) -> Result<Vec<ReviewDecision>> {
             continue;
         }
         render_proposal(&term, i + 1, total, &p);
+        let mut misses = 0u32;
         loop {
             let key = match term.read_key() {
                 Ok(k) => k,
@@ -185,15 +197,20 @@ fn prompt_each(proposals: Vec<ChangeProposal>) -> Result<Vec<ReviewDecision>> {
                     let _ = term.write_line(&style(" → rejected (default)").dim().to_string());
                     break;
                 }
-                // Non-TTY stdin yields Unknown forever; abort rather than spin
-                // (defense in depth behind `ensure_interactive_terminal`).
-                Key::Unknown => {
-                    return Err(anyhow::anyhow!(
-                        "interactive review got no keyboard input (non-interactive \
-                         terminal); re-run in a TTY or pass --yes"
-                    ));
-                }
+                // Any unrecognized read — including `Key::Unknown`, which a
+                // non-tty that slipped the guard returns endlessly. Re-prompt,
+                // but abort after a flood so it can never spin (see
+                // MAX_UNRECOGNIZED_KEYS); a single stray key on a real terminal
+                // just re-prompts without losing prior decisions.
                 _ => {
+                    misses += 1;
+                    if misses >= MAX_UNRECOGNIZED_KEYS {
+                        return Err(anyhow::anyhow!(
+                            "interactive review received no valid keystroke after \
+                             {misses} attempts (non-interactive terminal?); re-run \
+                             in a TTY or pass --yes"
+                        ));
+                    }
                     let _ = term.write_line(&style(" (a/A/r/q/Esc/enter)").red().to_string());
                 }
             }
@@ -261,6 +278,7 @@ fn prompt_each_bundle(bundles: Vec<BundleProposal>) -> Result<Vec<Uuid>> {
             continue;
         }
         render_bundle(&term, i + 1, total, &b);
+        let mut misses = 0u32;
         loop {
             let key = match term.read_key() {
                 Ok(k) => k,
@@ -302,13 +320,15 @@ fn prompt_each_bundle(bundles: Vec<BundleProposal>) -> Result<Vec<Uuid>> {
                     let _ = term.write_line(&style(" → rejected (default)").dim().to_string());
                     break;
                 }
-                Key::Unknown => {
-                    return Err(anyhow::anyhow!(
-                        "interactive review got no keyboard input (non-interactive \
-                         terminal); re-run in a TTY or pass --yes"
-                    ));
-                }
                 _ => {
+                    misses += 1;
+                    if misses >= MAX_UNRECOGNIZED_KEYS {
+                        return Err(anyhow::anyhow!(
+                            "interactive review received no valid keystroke after \
+                             {misses} attempts (non-interactive terminal?); re-run \
+                             in a TTY or pass --yes"
+                        ));
+                    }
                     let _ = term.write_line(&style(" (a/A/r/q/Esc/enter)").red().to_string());
                 }
             }
