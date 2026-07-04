@@ -86,6 +86,58 @@ fn missing_model_surfaces_installation_instructions() {
 }
 
 #[test]
+fn boolish_env_vars_activate_the_tier3_gates() {
+    // End-to-end guard for the WP-3 env-activation wiring: `TIDYUP_LLM_FALLBACK=1`
+    // and `TIDYUP_REMOTE=1` are read (boolishly) in dispatch. Setting BOTH must
+    // trip the mutual-exclusion error, which fires in dispatch *before* any model
+    // load — so this needs no ONNX model and proves both env vars activated.
+    // If the env wiring were reverted (env ignored), neither would activate and
+    // the run would instead fail later on the missing model, not here.
+    let data = TempDir::new().unwrap();
+    let source = TempDir::new().unwrap();
+    let out = Command::new(bin())
+        .args(["scan", source.path().to_str().unwrap(), "--dry-run"])
+        .env("TIDYUP_DATA_DIR", data.path())
+        .env("TIDYUP_LLM_FALLBACK", "1")
+        .env("TIDYUP_REMOTE", "1")
+        .output()
+        .expect("binary runs");
+    assert!(!out.status.success(), "conflicting activation must fail");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("mutually exclusive"),
+        "both env vars must activate (mutual-exclusion error expected), got: {stderr}"
+    );
+}
+
+#[test]
+fn falsey_env_var_does_not_activate() {
+    // `TIDYUP_LLM_FALLBACK=0` must NOT activate — with a falsey value the run
+    // proceeds past dispatch to the model check (default build is LLM-silent).
+    let data = TempDir::new().unwrap();
+    let model_cache = TempDir::new().unwrap();
+    let source = TempDir::new().unwrap();
+    let out = Command::new(bin())
+        .args(["scan", source.path().to_str().unwrap(), "--dry-run"])
+        .env("TIDYUP_DATA_DIR", data.path())
+        .env("TIDYUP_MODEL_CACHE", model_cache.path())
+        .env("TIDYUP_LLM_FALLBACK", "0")
+        .env("TIDYUP_REMOTE", "0")
+        .output()
+        .expect("binary runs");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    // Not a mutual-exclusion or activation error — it fails later, on the model.
+    assert!(
+        !stderr.contains("mutually exclusive"),
+        "falsey env must not activate anything: {stderr}"
+    );
+    assert!(
+        stderr.contains("Missing embedding model"),
+        "falsey env should let the run proceed to the model check: {stderr}"
+    );
+}
+
+#[test]
 fn config_subcommand_prints_parsed_defaults() {
     let data = TempDir::new().unwrap();
     let out = Command::new(bin())

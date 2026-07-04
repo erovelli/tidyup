@@ -169,9 +169,16 @@ impl Default for RenameConfig {
 ///
 /// v0.1 ships with the compiled-in marker set (`.git`, `Cargo.toml`, `package.json`,
 /// `pyproject.toml`, `*.xcodeproj`, `settings.gradle`/`build.gradle`, `.ipynb`
-/// neighbours). `extra_markers` lets users declare additional *filename* markers
-/// without a rebuild; `soft_bundle_enabled` gates the metadata-clustering paths
-/// (EXIF bursts, ID3 albums, filename regex families) once those land in Phase 4.
+/// neighbours). `extra_markers` is intended to let users declare additional
+/// *filename* markers without a rebuild; `soft_bundle_enabled`/`enabled` gate the
+/// marker- and metadata-clustering passes (EXIF bursts, ID3 albums, filename
+/// families).
+///
+/// **Not yet wired.** These fields are parsed and round-trip through the config
+/// but the scan/migration pipelines don't yet consume them — bundle detection
+/// currently always runs with the compiled-in marker set. Threading this section
+/// into `scanner::scan` + `clustering::cluster_loose` is tracked as follow-up
+/// (see the roadmap); `[rename]` and `[classifier]` config *are* consumed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BundleDetectionConfig {

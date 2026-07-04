@@ -32,21 +32,30 @@ pub use migration::{MigrationReport, MigrationService};
 pub use rollback::{RollbackReport, RollbackService};
 pub use scan::{ScanReport, ScanService};
 
-/// Build the pipeline's [`ClassifierConfig`](tidyup_domain::ClassifierConfig)
-/// for a run.
+/// Materialise the pipeline's [`ClassifierConfig`](tidyup_domain::ClassifierConfig)
+/// from the loaded [`TidyupConfig`](config::TidyupConfig) for a run.
 ///
-/// Tier 3 (`enable_llm_fallback`) is enabled **iff** a text backend was
-/// activated (`text_present`): [`ServiceContext::text`] is `Some` only when the
-/// three-gate model passed (cargo feature + config bool + per-invocation flag),
-/// so this ties Tier 3 to activation while keeping it off by default (the domain
-/// default is `false`). Without this, an activated backend would be loaded but
-/// never consulted, since the app otherwise passes `ClassifierConfig::default()`.
-///
-/// WP-3 will materialise the remaining fields (thresholds, rename config) from
-/// the loaded `TidyupConfig`; this is the minimal activation tie-in.
-pub(crate) fn classifier_config_for(text_present: bool) -> tidyup_domain::ClassifierConfig {
+/// - The `[rename]` TOML section drives the rename gate thresholds
+///   (`min_classification_confidence`, `min_mismatch_score`).
+/// - Tier 3 (`enable_llm_fallback`) is enabled **iff** a text backend was
+///   activated (`text_present`): [`ServiceContext::text`] is `Some` only when
+///   the three-gate model passed (cargo feature + config bool + per-invocation
+///   flag), so this ties Tier 3 to activation while keeping it off by default.
+/// - The scoring thresholds (`heuristic_threshold`, `embedding_threshold`,
+///   `ambiguity_gap`), weights, and calibration keep their pipeline-tuned
+///   domain defaults — the app-config `[classifier]` section's `min_confidence`
+///   drives the `--yes` auto-approve threshold at the CLI, not these.
+#[must_use]
+pub fn classifier_config_for(
+    cfg: &config::TidyupConfig,
+    text_present: bool,
+) -> tidyup_domain::ClassifierConfig {
     tidyup_domain::ClassifierConfig {
         enable_llm_fallback: text_present,
+        rename: tidyup_domain::migration::RenameConfig {
+            min_classification_confidence: cfg.rename.min_classification_confidence,
+            min_mismatch_score: cfg.rename.min_mismatch_score,
+        },
         ..tidyup_domain::ClassifierConfig::default()
     }
 }
@@ -80,21 +89,44 @@ pub struct ServiceContext {
     pub image_embeddings: Option<std::sync::Arc<dyn tidyup_core::inference::ImageEmbeddingBackend>>,
     pub audio_embeddings: Option<std::sync::Arc<dyn tidyup_core::inference::AudioEmbeddingBackend>>,
     pub extractors: Vec<std::sync::Arc<dyn tidyup_core::extractor::ContentExtractor>>,
+    /// Classifier config materialised from the loaded `TidyupConfig` (rename
+    /// thresholds, Tier-3 activation). Built once at context construction via
+    /// [`classifier_config_for`]; the scan/migration services pass it straight
+    /// to the pipeline. Test contexts can use `classifier_config_for(&cfg, …)`
+    /// or a literal.
+    pub classifier: tidyup_domain::ClassifierConfig,
 }
 
 #[cfg(test)]
 mod classifier_config_tests {
+    use super::config::{RenameConfig, TidyupConfig};
+
     #[test]
     fn tier3_enabled_only_when_text_backend_present() {
         // Regression guard: flipping the domain default to `false` must not
         // leave an activated backend dead. Tier 3 tracks `text_present`.
+        let cfg = TidyupConfig::default();
         assert!(
-            super::classifier_config_for(true).enable_llm_fallback,
+            super::classifier_config_for(&cfg, true).enable_llm_fallback,
             "an activated text backend must enable Tier 3",
         );
         assert!(
-            !super::classifier_config_for(false).enable_llm_fallback,
+            !super::classifier_config_for(&cfg, false).enable_llm_fallback,
             "no text backend must keep Tier 3 off (privacy default)",
         );
+    }
+
+    #[test]
+    fn rename_thresholds_come_from_config() {
+        let cfg = TidyupConfig {
+            rename: RenameConfig {
+                min_classification_confidence: 0.42,
+                min_mismatch_score: 0.99,
+            },
+            ..TidyupConfig::default()
+        };
+        let cc = super::classifier_config_for(&cfg, false);
+        assert!((cc.rename.min_classification_confidence - 0.42).abs() < f32::EPSILON);
+        assert!((cc.rename.min_mismatch_score - 0.99).abs() < f32::EPSILON);
     }
 }

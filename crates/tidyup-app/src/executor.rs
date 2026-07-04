@@ -87,8 +87,21 @@ pub async fn apply_loose_decisions(
                 proposal_id,
                 new_target,
             } => (*proposal_id, Some(new_target.clone())),
-            ReviewDecision::Reject(_) => {
+            ReviewDecision::Reject(id) => {
                 report.skipped += 1;
+                // Persist the review outcome so the rejected proposal leaves the
+                // pending set (else it re-surfaces on every run). Only on a real
+                // apply — a dry-run is a pure preview that mutates no state.
+                if !dry_run {
+                    if let Err(e) = deps.change_log.mark_rejected(*id).await {
+                        deps.progress
+                            .message(
+                                Level::Warn,
+                                &format!("recording rejection for {id} failed: {e}"),
+                            )
+                            .await;
+                    }
+                }
                 continue;
             }
         };
@@ -698,6 +711,7 @@ mod tests {
     struct RecordingLog {
         applied: Mutex<Vec<Uuid>>,
         applied_bundles: Mutex<Vec<Uuid>>,
+        rejected: Mutex<Vec<Uuid>>,
     }
 
     impl RecordingLog {
@@ -705,6 +719,7 @@ mod tests {
             Self {
                 applied: Mutex::new(Vec::new()),
                 applied_bundles: Mutex::new(Vec::new()),
+                rejected: Mutex::new(Vec::new()),
             }
         }
     }
@@ -716,6 +731,10 @@ mod tests {
         }
         async fn mark_applied(&self, id: Uuid) -> CoreResult<()> {
             self.applied.lock().unwrap().push(id);
+            Ok(())
+        }
+        async fn mark_rejected(&self, id: Uuid) -> CoreResult<()> {
+            self.rejected.lock().unwrap().push(id);
             Ok(())
         }
         async fn mark_unshelved(&self, _id: Uuid) -> CoreResult<()> {

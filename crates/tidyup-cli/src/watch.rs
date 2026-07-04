@@ -34,10 +34,7 @@ use crate::context::{
 use crate::reporter::CliReporter;
 use crate::review::AutoApproveHandler;
 
-/// Loose-proposal confidence above which a watch rescan counts a file as one it
-/// *would* organize. Matches the CLI's `--yes` threshold.
-const WATCH_MIN_CONFIDENCE: f32 = 0.75;
-/// Bundle confidence threshold for the same "would organize" tally.
+/// Bundle confidence threshold for the "would organize" tally.
 const WATCH_BUNDLE_MIN_CONFIDENCE: f32 = 0.85;
 
 /// Run the advisory watch loop. Builds the context + scan candidates once,
@@ -67,8 +64,9 @@ pub(crate) async fn run_watch(
 
     let service = ScanService::new(ctx);
     let reporter = CliReporter::new(json);
+    // Same auto-approve threshold as `--yes`, from `[classifier] min_confidence`.
     let reviewer = AutoApproveHandler {
-        min_confidence: WATCH_MIN_CONFIDENCE,
+        min_confidence: cfg.classifier.min_confidence,
     };
     let candidate_set = CandidateSet {
         text: candidates,

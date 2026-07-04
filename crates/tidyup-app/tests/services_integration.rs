@@ -92,6 +92,19 @@ impl ReviewHandler for ApproveEverything {
     }
 }
 
+/// Review handler that rejects every loose proposal it sees.
+struct RejectAll;
+
+#[async_trait]
+impl ReviewHandler for RejectAll {
+    async fn review(&self, proposals: Vec<ChangeProposal>) -> CoreResult<Vec<ReviewDecision>> {
+        Ok(proposals
+            .into_iter()
+            .map(|p| ReviewDecision::Reject(p.id))
+            .collect())
+    }
+}
+
 /// Deterministic 7-bucket embedder. Not semantically meaningful but stable.
 struct BucketEmbeddings;
 #[async_trait]
@@ -204,6 +217,10 @@ fn make_ctx_with_shelf(shelf: Option<std::path::PathBuf>) -> (Arc<ServiceContext
         image_embeddings: None,
         audio_embeddings: None,
         extractors: vec![Arc::new(PlainExtractor)],
+        classifier: tidyup_app::classifier_config_for(
+            &tidyup_app::config::TidyupConfig::default(),
+            true,
+        ),
     });
     (ctx, store)
 }
@@ -269,6 +286,59 @@ async fn scan_service_persists_proposals_and_auto_approves() {
     assert_eq!(pending.len(), 1);
     let seen = reviewer.seen_ids();
     assert!(seen.contains(&pending[0].id));
+}
+
+#[tokio::test]
+async fn rejected_proposal_leaves_the_pending_set() {
+    // A real (non-dry-run) scan where review rejects the only proposal must
+    // persist that outcome: the proposal is recorded, then marked Rejected, so
+    // it no longer appears in pending() (which previously grew forever because
+    // no rejection status was ever written). The file itself stays put.
+    let workdir = TempDir::new().unwrap();
+    let shelf = workdir.path().join("shelf");
+    std::fs::create_dir_all(&shelf).unwrap();
+    let src_root = workdir.path().join("src");
+    std::fs::create_dir_all(&src_root).unwrap();
+    let src_file = src_root.join("helpers.rs");
+    std::fs::write(&src_file, b"fn main() {}").unwrap();
+
+    let (ctx, store) = make_ctx_with_shelf(Some(shelf));
+    let candidates = sample_scan_candidates().await;
+    let service = ScanService::new(Arc::clone(&ctx));
+
+    let report = service
+        .run(
+            tidyup_app::scan::ScanRequest {
+                root: src_root.clone(),
+                taxonomy_path: None,
+                dry_run: false,
+                auto_approve_bundles: false,
+                bundle_min_confidence: 0.85,
+            },
+            &candidates,
+            &[],
+            &[],
+            &NullProgress,
+            &RejectAll,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.proposed, 1);
+    assert_eq!(report.skipped, 1, "the proposal was rejected");
+    assert_eq!(report.applied, 0);
+    // The rejection is persisted: the proposal is no longer pending, and it was
+    // never applied. The file stays where it was.
+    assert!(
+        store.pending().await.unwrap().is_empty(),
+        "a rejected proposal must not remain in the pending set"
+    );
+    assert!(store
+        .applied_proposals_for_run(report.run_id)
+        .await
+        .unwrap()
+        .is_empty(),);
+    assert!(src_file.exists(), "a rejected file is left in place");
 }
 
 #[tokio::test]

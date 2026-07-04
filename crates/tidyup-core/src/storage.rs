@@ -37,6 +37,10 @@ pub trait ChangeLog: Send + Sync {
     /// `run_id` optionally ties this proposal to a run record for rollback lookup.
     async fn record_proposal(&self, proposal: &ChangeProposal, run_id: Option<Uuid>) -> Result<()>;
     async fn mark_applied(&self, proposal_id: Uuid) -> Result<()>;
+    /// Record a review rejection so the proposal leaves the pending set. Without
+    /// this a rejected proposal stays `Pending` forever and re-surfaces from
+    /// [`pending`](Self::pending) on every run. A no-op for unknown ids.
+    async fn mark_rejected(&self, proposal_id: Uuid) -> Result<()>;
     /// Mark a proposal as rolled back (originals restored from the shelf).
     async fn mark_unshelved(&self, proposal_id: Uuid) -> Result<()>;
     /// Pending **loose** proposals only (`bundle_id IS NULL`).
