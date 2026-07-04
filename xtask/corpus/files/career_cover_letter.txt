@@ -1,0 +1,5 @@
+Dear Hiring Manager, I am writing to apply for the Backend Engineer position.
+With a strong background in Rust and distributed systems, I am excited about
+the opportunity to contribute to your platform team. My experience leading
+migrations and mentoring engineers aligns well with the role. Thank you for
+your consideration. Sincerely, a candidate.

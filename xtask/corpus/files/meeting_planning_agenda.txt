@@ -1,0 +1,4 @@
+Sprint planning agenda. 1. Review last sprint velocity and carryover. 2. Groom
+the backlog and estimate new stories. 3. Confirm sprint goal and capacity given
+two people on vacation. 4. Assign owners for the top priorities. 5. Risks and
+dependencies. Meeting notes and decisions to be circulated afterward.

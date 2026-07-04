@@ -370,7 +370,10 @@ async fn classify_file(
         return Ok(None);
     };
 
-    let embedding = embeddings.embed_text(text).await?;
+    // Embed the canonical Tier-2 query (filename + body) — the same construction
+    // the offline eval uses, so the eval measures this shipped path.
+    let query = tidyup_domain::classification_query(text, &filename);
+    let embedding = embeddings.embed_text(&query).await?;
     let (best_idx, best_score, gap) = best_match(&embedding, candidates);
     if best_idx.is_none() {
         return Ok(None);

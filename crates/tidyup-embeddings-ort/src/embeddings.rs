@@ -44,6 +44,11 @@ pub const DEFAULT_EMBEDDING_DIMS: usize = 384;
 /// Default model identifier, used as a cache key.
 pub const DEFAULT_MODEL_ID: &str = "BAAI/bge-small-en-v1.5";
 
+/// Upper bound on texts fed to one ONNX inference from [`EmbeddingBackend::embed_texts`].
+/// Each call builds a `[batch, seq_len, hidden]` tensor, so an unbounded batch
+/// (e.g. a whole corpus) allocates gigabytes; chunking keeps peak memory flat.
+const MAX_EMBED_BATCH: usize = 64;
+
 /// Configuration for [`OrtEmbeddings::load`].
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -299,8 +304,14 @@ impl EmbeddingBackend for OrtEmbeddings {
         let dims = self.dims;
         let owned: Vec<String> = texts.iter().map(|s| (*s).to_string()).collect();
         tokio::task::spawn_blocking(move || {
-            let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
-            embed_sync_impl(&session, &tokenizer, &refs, dims)
+            // Chunk internally so a large caller batch never builds one giant
+            // `[batch, seq_len, hidden]` tensor. Without this, embedding a whole
+            // corpus in a single call allocated gigabytes and stalled the
+            // nightly eval lane; bounding the batch keeps peak memory flat.
+            // `chunk_flat_map` guarantees the outputs come back in input order.
+            chunk_flat_map(&owned, MAX_EMBED_BATCH, |refs| {
+                embed_sync_impl(&session, &tokenizer, refs, dims)
+            })
         })
         .await
         .context("embed_texts join")?
@@ -433,6 +444,27 @@ fn push_padded(out: &mut Vec<i64>, src: &[u32], seq_len: usize, pad: i64) {
     }
 }
 
+/// Apply `f` to `items` in fixed-size batches and concatenate the per-item
+/// results **in input order**. Bounds the batch handed to `f` (so the ONNX
+/// path never builds one giant `[batch, seq_len, hidden]` tensor) while
+/// guaranteeing the returned vector is the outputs in the original order —
+/// order preservation across chunk seams is the property callers depend on
+/// (results are zipped positionally against their inputs). `batch` is clamped
+/// to at least 1 so a `0` never yields empty chunks.
+fn chunk_flat_map<T>(
+    items: &[String],
+    batch: usize,
+    mut f: impl FnMut(&[&str]) -> Result<Vec<T>>,
+) -> Result<Vec<T>> {
+    let batch = batch.max(1);
+    let mut out = Vec::with_capacity(items.len());
+    for chunk in items.chunks(batch) {
+        let refs: Vec<&str> = chunk.iter().map(String::as_str).collect();
+        out.extend(f(&refs)?);
+    }
+    Ok(out)
+}
+
 /// Ensure `ort::init()` runs exactly once per process. `commit` returns
 /// `true` on first install, `false` if the global env options were already
 /// set — either outcome is fine.
@@ -494,5 +526,45 @@ mod tests {
         let mut out = Vec::new();
         push_padded(&mut out, &[1, 2], 5, 0);
         assert_eq!(out, vec![1, 2, 0, 0, 0]);
+    }
+
+    #[test]
+    fn chunk_flat_map_bounds_batch_and_preserves_order() {
+        // Model-free coverage of the reassembly logic `embed_texts` relies on:
+        // spanning multiple full chunks plus a short remainder, no batch handed
+        // to `f` may exceed the bound, and output[i] must still equal input[i].
+        let items: Vec<String> = (0..MAX_EMBED_BATCH * 2 + 5)
+            .map(|i| i.to_string())
+            .collect();
+        let mut max_seen = 0usize;
+        let out: Vec<usize> = chunk_flat_map(&items, MAX_EMBED_BATCH, |refs| {
+            max_seen = max_seen.max(refs.len());
+            refs.iter()
+                .map(|s| s.parse::<usize>().map_err(anyhow::Error::from))
+                .collect()
+        })
+        .unwrap();
+
+        assert_eq!(out.len(), items.len(), "every input is mapped exactly once");
+        assert!(max_seen <= MAX_EMBED_BATCH, "no batch exceeds the bound");
+        assert!(
+            out.iter().enumerate().all(|(i, &v)| v == i),
+            "output order must match input order across chunk seams",
+        );
+    }
+
+    #[test]
+    fn chunk_flat_map_clamps_zero_batch() {
+        // A `0` batch must not produce empty chunks (which would drop items or
+        // spin); it is clamped to 1.
+        let items: Vec<String> = (0..3).map(|i| i.to_string()).collect();
+        let mut max_seen = 0usize;
+        let out: Vec<usize> = chunk_flat_map(&items, 0, |refs| {
+            max_seen = max_seen.max(refs.len());
+            Ok(refs.iter().map(|_| 1usize).collect())
+        })
+        .unwrap();
+        assert_eq!(out.len(), 3);
+        assert_eq!(max_seen, 1);
     }
 }
