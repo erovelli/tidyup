@@ -185,7 +185,7 @@ fn build_remote_backend(config: &TidyupConfig) -> Result<Arc<dyn TextBackend>> {
     })?;
     let endpoint = RemoteEndpoint::OpenAi {
         url: remote_cfg.endpoint.clone(),
-        api_key,
+        api_key: api_key.into(),
         model: remote_cfg.model.clone(),
     };
     tracing::info!(model = %remote_cfg.model, "loading remote text backend (Tier 3)");
