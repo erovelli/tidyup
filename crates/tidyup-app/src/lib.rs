@@ -32,6 +32,25 @@ pub use migration::{MigrationReport, MigrationService};
 pub use rollback::{RollbackReport, RollbackService};
 pub use scan::{ScanReport, ScanService};
 
+/// Build the pipeline's [`ClassifierConfig`](tidyup_domain::ClassifierConfig)
+/// for a run.
+///
+/// Tier 3 (`enable_llm_fallback`) is enabled **iff** a text backend was
+/// activated (`text_present`): [`ServiceContext::text`] is `Some` only when the
+/// three-gate model passed (cargo feature + config bool + per-invocation flag),
+/// so this ties Tier 3 to activation while keeping it off by default (the domain
+/// default is `false`). Without this, an activated backend would be loaded but
+/// never consulted, since the app otherwise passes `ClassifierConfig::default()`.
+///
+/// WP-3 will materialise the remaining fields (thresholds, rename config) from
+/// the loaded `TidyupConfig`; this is the minimal activation tie-in.
+pub(crate) fn classifier_config_for(text_present: bool) -> tidyup_domain::ClassifierConfig {
+    tidyup_domain::ClassifierConfig {
+        enable_llm_fallback: text_present,
+        ..tidyup_domain::ClassifierConfig::default()
+    }
+}
+
 /// Bundle of backend handles a service needs. Constructed once per process.
 ///
 /// Using `Arc<dyn Trait>` everywhere keeps the services object-safe and lets
@@ -61,4 +80,21 @@ pub struct ServiceContext {
     pub image_embeddings: Option<std::sync::Arc<dyn tidyup_core::inference::ImageEmbeddingBackend>>,
     pub audio_embeddings: Option<std::sync::Arc<dyn tidyup_core::inference::AudioEmbeddingBackend>>,
     pub extractors: Vec<std::sync::Arc<dyn tidyup_core::extractor::ContentExtractor>>,
+}
+
+#[cfg(test)]
+mod classifier_config_tests {
+    #[test]
+    fn tier3_enabled_only_when_text_backend_present() {
+        // Regression guard: flipping the domain default to `false` must not
+        // leave an activated backend dead. Tier 3 tracks `text_present`.
+        assert!(
+            super::classifier_config_for(true).enable_llm_fallback,
+            "an activated text backend must enable Tier 3",
+        );
+        assert!(
+            !super::classifier_config_for(false).enable_llm_fallback,
+            "no text backend must keep Tier 3 off (privacy default)",
+        );
+    }
 }

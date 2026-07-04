@@ -140,12 +140,16 @@ async fn cluster_dir(
     let (album_bundles, album_left) = cluster_music_albums(dir, &audio, extractors, config).await;
     bundles.extend(album_bundles);
 
-    // Document series runs over everything not already clustered.
-    let mut series_input = burst_left;
-    series_input.extend(album_left);
-    series_input.extend(others);
-    let (series_bundles, leftover) = cluster_document_series(dir, &series_input, config);
+    // Document series runs over NON-media loose files only. Media that failed
+    // burst/album clustering — EXIF-less photos, untagged audio — must NOT be
+    // swept into a DocumentSeries by filename family (e.g. IMG_0001.jpg,
+    // IMG_0002.jpg): those belong in Photos/Music via the Tier-1 heuristic, not
+    // Documents/Series. Excluding them by modality is the guard; they fall
+    // through as individual leftover files.
+    let (series_bundles, mut leftover) = cluster_document_series(dir, &others, config);
     bundles.extend(series_bundles);
+    leftover.extend(burst_left);
+    leftover.extend(album_left);
 
     (bundles, leftover)
 }
@@ -533,6 +537,40 @@ mod tests {
         let (bundles, leftover) = cluster_loose(&files, &[], &ClusterConfig::default()).await;
         assert!(bundles.is_empty());
         assert_eq!(leftover.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn exif_less_photos_do_not_become_a_document_series() {
+        // IMG_0001.jpg / _0002 / _0003 with no EXIF (no extractors → no capture
+        // time) must NOT be swept into a DocumentSeries by filename family —
+        // they belong in Photos via the Tier-1 heuristic. The MIME-class guard
+        // excludes image leftovers from the series pass; they fall through loose.
+        let files = vec![
+            p("/dcim/IMG_0001.jpg"),
+            p("/dcim/IMG_0002.jpg"),
+            p("/dcim/IMG_0003.jpg"),
+        ];
+        let (bundles, leftover) = cluster_loose(&files, &[], &ClusterConfig::default()).await;
+        assert!(
+            bundles.is_empty(),
+            "EXIF-less photos must not form any bundle, got {:?}",
+            bundles.iter().map(|b| &b.kind).collect::<Vec<_>>(),
+        );
+        assert_eq!(leftover.len(), 3, "all three fall through as loose files");
+    }
+
+    #[tokio::test]
+    async fn untagged_audio_does_not_become_a_document_series() {
+        // Same guard for audio: untagged tracks with a filename family must not
+        // cluster as a DocumentSeries.
+        let files = vec![
+            p("/music/track-01.mp3"),
+            p("/music/track-02.mp3"),
+            p("/music/track-03.mp3"),
+        ];
+        let (bundles, leftover) = cluster_loose(&files, &[], &ClusterConfig::default()).await;
+        assert!(bundles.is_empty(), "untagged audio must not form a bundle");
+        assert_eq!(leftover.len(), 3);
     }
 
     #[tokio::test]

@@ -32,8 +32,14 @@ pub fn l2_normalize(v: &mut [f32]) {
 #[must_use]
 pub fn extract_year(text: &str, filename: &str) -> Option<i32> {
     find_year_in(filename).or_else(|| {
-        let window = &text[..text.len().min(1000)];
-        find_year_in(window)
+        // Char-boundary-safe window: byte 1000 may split a multibyte codepoint,
+        // which a raw `&text[..1000]` would panic on. Round the cut down to a
+        // boundary. (`is_char_boundary(0)` is always true, so this terminates.)
+        let mut end = text.len().min(1000);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        find_year_in(&text[..end])
     })
 }
 
@@ -124,6 +130,17 @@ mod tests {
             Some(2024),
         );
         assert_eq!(extract_year("no year here", "scan.pdf"), None);
+    }
+
+    #[test]
+    fn extract_year_does_not_panic_on_multibyte_content() {
+        // The 1000-byte window must land on a char boundary. A 2-byte-codepoint
+        // run puts byte 1000 on a boundary, but a 3-byte run makes byte 1000
+        // fall mid-codepoint — a raw `&text[..1000]` would panic there.
+        let filler = "字".repeat(400); // 1200 bytes; byte 1000 is mid-codepoint
+        let with_year = format!("Tax Year 2024 {filler}");
+        assert_eq!(extract_year(&with_year, "scan.pdf"), Some(2024)); // no panic
+        assert_eq!(extract_year(&filler, "文書.pdf"), None); // no panic
     }
 
     #[test]

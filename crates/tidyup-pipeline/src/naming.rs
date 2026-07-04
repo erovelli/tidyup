@@ -257,14 +257,17 @@ fn truncate_at_boundary(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
     }
-    let window = &s[..max];
+    // Clamp the budget to a char boundary first — `&s[..max]` panics if `max`
+    // splits a multi-byte codepoint. (Today's caller passes ASCII, but the name
+    // promises boundary-safety, so honour it.)
+    let window = crate::text_util::char_prefix(s, max);
     if let Some(pos) = window.rfind('_') {
         // Only back off to the underscore if it leaves at least half the budget.
         if pos >= max / 2 {
             return s[..pos].to_string();
         }
     }
-    s[..max].to_string()
+    window.to_string()
 }
 
 /// Stitch sanitized stem + original extension back into a filename.

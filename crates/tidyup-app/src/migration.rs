@@ -151,6 +151,12 @@ impl MigrationService {
             .await;
 
         let text_backend = self.ctx.text.as_deref();
+        // Tier 3 fires only when a text backend was activated (three-gate model);
+        // `ctx.text` being `Some` encodes that activation. See the matching note
+        // in `scan.rs` — without this the domain default (`false`) leaves an
+        // activated backend loaded but never consulted. WP-3 materialises the
+        // full config; this is the minimal activation tie-in.
+        let classifier_config = crate::classifier_config_for(text_backend.is_some());
         let outcome = run_migration(
             &request.source,
             &profile_cache,
@@ -158,7 +164,7 @@ impl MigrationService {
             text_backend,
             multimodal,
             &self.ctx.extractors,
-            &tidyup_domain::ClassifierConfig::default(),
+            &classifier_config,
             progress,
         )
         .await?;

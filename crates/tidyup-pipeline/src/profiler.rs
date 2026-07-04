@@ -755,7 +755,7 @@ async fn content_centroid(
             continue;
         }
         // Cap per-file text so one huge document doesn't dominate the embedding.
-        let snippet = &trimmed[..trimmed.len().min(4000)];
+        let snippet = crate::text_util::char_prefix(trimmed, 4000);
         match embeddings.embed_text(snippet).await {
             Ok(vec) => acc.add(&vec, path),
             Err(e) => {

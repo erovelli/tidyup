@@ -329,10 +329,11 @@ pub struct ClassifierConfig {
     pub embedding_threshold: f32,
     /// Tier 2 ambiguity gap threshold.
     pub ambiguity_gap: f32,
-    /// Whether to invoke Tier 3 for ambiguous files.
+    /// Whether to invoke Tier 3 (LLM) for ambiguous files. Defaults to `false`
+    /// (privacy-preserving): activation is materialised from the layered config
+    /// only under the three-gate model (cargo feature + config bool +
+    /// per-invocation flag), never from this default alone.
     pub enable_llm_fallback: bool,
-    /// Whether to invoke Tier 3 for vague filenames.
-    pub enable_llm_renaming: bool,
     /// Composite score weights.
     pub weights: ScoreWeights,
     /// Rename proposal thresholds.
@@ -367,8 +368,11 @@ impl Default for ClassifierConfig {
             heuristic_threshold: 0.60,
             embedding_threshold: 0.35,
             ambiguity_gap: 0.05,
-            enable_llm_fallback: true,
-            enable_llm_renaming: true,
+            // Privacy default: Tier 3 stays off unless the layered config +
+            // three-gate activation explicitly turns it on. A dead
+            // `enable_llm_renaming` field used to default true here — it was
+            // never read and contradicted the extractive-only rename invariant.
+            enable_llm_fallback: false,
             weights: ScoreWeights::default(),
             rename: RenameConfig::default(),
             calibration: Calibration::default(),

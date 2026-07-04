@@ -180,6 +180,15 @@ impl ScanService {
         };
 
         let text_backend = self.ctx.text.as_deref();
+        // Tier 3 fires only when a text backend was activated. `ctx.text` is
+        // `Some` exactly when the three-gate model passed (feature + config +
+        // per-invocation flag), so deriving the pipeline's `enable_llm_fallback`
+        // from it keeps Tier 3 off by default yet reachable once activated —
+        // without this the domain default (`false`) would leave an activated
+        // backend loaded but never consulted. (WP-3 materialises the full
+        // ClassifierConfig from the loaded TidyupConfig; this is the minimal
+        // activation tie-in.)
+        let classifier_config = crate::classifier_config_for(text_backend.is_some());
         let outcome = run_scan(
             &request.root,
             &output_root,
@@ -188,7 +197,7 @@ impl ScanService {
             &multimodal,
             text_backend,
             &self.ctx.extractors,
-            &tidyup_domain::ClassifierConfig::default(),
+            &classifier_config,
             progress,
         )
         .await?;

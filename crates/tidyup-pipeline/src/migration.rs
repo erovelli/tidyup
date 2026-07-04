@@ -50,6 +50,7 @@ use uuid::Uuid;
 use crate::heuristics::{self, HeuristicMatch};
 use crate::naming::{propose_rename, RenameProposal};
 use crate::scanner::{self, DetectedBundle};
+use crate::text_util::char_prefix;
 use crate::yake;
 
 /// Optional cross-modal backends for routing image/audio source files.
@@ -249,7 +250,7 @@ async fn classify_file(
                 let keywords = text
                     .map(|t| yake::extract_keywords(t, 8))
                     .unwrap_or_default();
-                let year = text.and_then(|t| find_year(&t[..t.len().min(1000)]));
+                let year = text.and_then(|t| find_year(char_prefix(t, 1000)));
                 let rename = gate_rename(
                     path,
                     &metadata_json,
@@ -389,13 +390,16 @@ async fn classify_file(
         .as_ref()
         .map_or(serde_json::Value::Null, |e| e.metadata.clone());
     let keywords = yake::extract_keywords(text, 8);
-    let year = find_year(&text[..text.len().min(1000)]);
+    let year = find_year(char_prefix(text, 1000));
+    // Rename gate is driven by Tier 2's confidence (`tier2_score`), NOT the
+    // post-Tier-3 rerank (`chosen_score`) — see the scan-mode gate and the
+    // "Tier 3 reroutes never produce renames" invariant in CLAUDE.md.
     let rename = gate_rename(
         path,
         &metadata_json,
         &keywords,
         year,
-        chosen_score,
+        tier2_score,
         embeddings,
         Some(text),
         &filename,
@@ -453,7 +457,8 @@ async fn classify_file(
         destination_folder: chosen_folder,
         confidence: chosen_score,
         reasoning,
-        classification_confidence: Some(chosen_score),
+        // The Tier-2 sub-score that gated the rename (not the Tier-3 rerank).
+        classification_confidence: Some(tier2_score),
         rename_mismatch_score: rename.mismatch_score,
     }))
 }
@@ -1459,6 +1464,65 @@ mod tests {
         );
         assert_eq!(out.classifications.len(), 1);
         assert_eq!(out.classifications[0].resolved_at, Tier::Llm);
+    }
+
+    #[tokio::test]
+    async fn tier3_reroute_gates_rename_on_tier2_confidence_not_rerank() {
+        // Migration-mode counterpart of the scan-mode regression: the rename
+        // gate must read Tier 2's confidence (`tier2_score`), not the boosted
+        // post-Tier-3 `chosen_score`. classification_confidence on the proposal
+        // is therefore the (lower) Tier-2 score, strictly below the routing
+        // confidence after a reroute. Pre-fix, both equalled chosen_score.
+        let src = TempDir::new().unwrap();
+        let tgt = TempDir::new().unwrap();
+        fs::write(src.path().join("anonymous.dat"), b"x x x x x x").unwrap();
+
+        let eb = BucketEmbeddings;
+        let profiles = sample_cache(tgt.path(), &eb).await;
+        let ex: Vec<Arc<dyn ContentExtractor>> = vec![Arc::new(PlainExtractor)];
+        let cfg = ClassifierConfig {
+            embedding_threshold: 0.99,
+            ambiguity_gap: 0.50,
+            enable_llm_fallback: true,
+            ..ClassifierConfig::default()
+        };
+        let llm = StubTextBackend {
+            category: "",
+            tags: vec![],
+            summary: "tax return W-2 1099 1040 IRS refund withholding",
+        };
+
+        let out = run_migration(
+            src.path(),
+            &profiles,
+            &eb,
+            Some(&llm),
+            MigrationMultimodal::default(),
+            &ex,
+            &cfg,
+            &NullProgress,
+        )
+        .await
+        .unwrap();
+
+        let p = &out.proposals[0];
+        assert!(
+            p.reasoning.contains("tier3 llm-rerank"),
+            "precondition: Tier 3 must have rerouted, got {}",
+            p.reasoning,
+        );
+        let gate_score = p.classification_confidence.unwrap();
+        assert!(
+            gate_score < p.confidence,
+            "rename gate score {gate_score} must be the (lower) Tier-2 score, \
+             not the boosted routing confidence {}",
+            p.confidence,
+        );
+        assert_eq!(
+            p.change_type,
+            ChangeType::Move,
+            "Tier-3 reroute must not produce a rename"
+        );
     }
 
     #[test]
