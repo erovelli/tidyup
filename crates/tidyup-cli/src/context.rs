@@ -259,11 +259,14 @@ pub(crate) async fn verify_and_load_default_embeddings(
 
 fn default_extractors() -> Vec<Arc<dyn tidyup_core::extractor::ContentExtractor>> {
     // Registration order matters: more-specific extractors first, plain text
-    // as the catch-all fallback. The CLI picks up `tidyup-extract`'s default
-    // features (`text`, `pdf`, `image`), so these modules are always in scope.
+    // as the catch-all fallback. The CLI enables `tidyup-extract`'s `text`,
+    // `pdf`, `image`, and `audio` features (see Cargo.toml), so these modules
+    // are always in scope. `AudioExtractor` supplies ID3/Vorbis tags, which is
+    // what music-album clustering keys on.
     vec![
         Arc::new(tidyup_extract::pdf::PdfExtractor),
         Arc::new(tidyup_extract::image::ImageExtractor),
+        Arc::new(tidyup_extract::audio::AudioExtractor),
         Arc::new(tidyup_extract::text::PlainTextExtractor),
     ]
 }
