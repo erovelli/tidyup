@@ -81,9 +81,14 @@ impl SqliteStore {
 
 fn configure(conn: &Connection) -> Result<()> {
     conn.execute_batch(
+        // WAL + NORMAL: durable across app crashes, one connection per process.
+        // busy_timeout: under WAL a write can still collide with the
+        // auto-checkpointer or a second `tidyup` process on the same DB; wait
+        // up to 5s for the lock instead of failing immediately with SQLITE_BUSY.
         "PRAGMA journal_mode = WAL;\n\
          PRAGMA foreign_keys = ON;\n\
-         PRAGMA synchronous = NORMAL;",
+         PRAGMA synchronous = NORMAL;\n\
+         PRAGMA busy_timeout = 5000;",
     )
     .context("configuring sqlite pragmas")?;
     Ok(())
