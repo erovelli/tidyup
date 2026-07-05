@@ -69,7 +69,8 @@ CREATE TABLE IF NOT EXISTS change_proposals (
     bundle_id                  TEXT REFERENCES bundles(id) ON DELETE CASCADE,
     classification_confidence  REAL,
     rename_mismatch_score      REAL,
-    run_id                     TEXT REFERENCES runs(id)
+    run_id                     TEXT REFERENCES runs(id),
+    content_hash               TEXT
 );
 ";
 
@@ -93,9 +94,31 @@ CREATE TABLE IF NOT EXISTS backups (
     backup_path    TEXT NOT NULL,
     shelved_at     TEXT NOT NULL,
     unshelved_at   TEXT,
-    status         TEXT NOT NULL
+    status         TEXT NOT NULL,
+    content_hash   TEXT
 );
 ";
+
+/// Add `column` to `table` if it isn't already present. `ALTER TABLE ... ADD
+/// COLUMN` is the only additive migration `SQLite` supports in place; guarding
+/// on `PRAGMA table_info` keeps it idempotent so re-opening an already-migrated
+/// database is a no-op. Used for columns introduced after the initial schema
+/// (e.g. `backups.content_hash`) so pre-existing databases pick them up.
+fn add_column_if_missing(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    column: &str,
+    decl: &str,
+) -> rusqlite::Result<()> {
+    let mut stmt = tx.prepare(&format!("PRAGMA table_info({table})"))?;
+    let existing: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !existing.iter().any(|c| c == column) {
+        tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl};"))?;
+    }
+    Ok(())
+}
 
 /// Apply every migration inside a single transaction.
 #[allow(clippy::redundant_pub_crate)]
@@ -116,5 +139,8 @@ pub(super) fn apply(conn: &mut Connection) -> rusqlite::Result<()> {
         ]
         .join("\n"),
     )?;
+    // Additive migrations for databases created before a column existed.
+    add_column_if_missing(&tx, "backups", "content_hash", "TEXT")?;
+    add_column_if_missing(&tx, "change_proposals", "content_hash", "TEXT")?;
     tx.commit()
 }

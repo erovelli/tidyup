@@ -201,6 +201,7 @@ mod tests {
             bundle_id: None,
             classification_confidence: None,
             rename_mismatch_score: None,
+            content_hash: None,
         }
     }
 

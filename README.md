@@ -71,7 +71,7 @@ tidyup takes a different stance:
 - **Content-aware renames, but never silent.** When a filename clearly disagrees with the contents, tidyup proposes a rename — driven by tunable confidence thresholds. Renames always require explicit approval.
 - **No telemetry.** No analytics, no crash reporting, no "anonymous usage data."
 - **Human-in-the-loop, always.** Every rename and move is a _proposal_. Nothing touches your filesystem until you approve it.
-- **Every change is reversible.** Originals are copied to a backup shelf before any move. Restore anything within 30 days (configurable).
+- **Every change is reversible.** Originals are copied to a backup shelf before any move. Restore anything within 30 days (configurable). Rollback is edit-safe: before deleting a moved file it verifies the shelf copy is intact (content hash) and that the destination still matches what was moved — a file you've edited since apply is reported as a **conflict** and left in place rather than overwritten, and a new file occupying the original location is never clobbered.
 
 This is a portfolio project and a personal tool. It is also a statement: useful AI does not require surrendering your data.
 

@@ -15,7 +15,7 @@ pub mod file;
 pub mod migration;
 pub mod run;
 
-pub use backup::{BackupRecord, BackupStatus};
+pub use backup::{BackupRecord, BackupStatus, RestorePrecheck};
 pub use bundle::{BundleError, BundleKind, BundleProposal};
 pub use change::{ChangeProposal, ChangeStatus, ChangeType, ParseError};
 pub use file::{ContentHash, FileId, IndexedFile};

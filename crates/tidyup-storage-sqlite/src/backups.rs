@@ -16,14 +16,14 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Row, Transaction};
 use tidyup_core::storage::BackupStore;
-use tidyup_domain::{BackupRecord, BackupStatus, IndexedFile};
+use tidyup_domain::{BackupRecord, BackupStatus, IndexedFile, RestorePrecheck};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
 use crate::SqliteStore;
 
 const BACKUP_COLS: &str =
-    "id, change_id, original_path, backup_path, shelved_at, unshelved_at, status";
+    "id, change_id, original_path, backup_path, shelved_at, unshelved_at, status, content_hash";
 
 fn path_str(p: &Path) -> Result<&str> {
     p.to_str()
@@ -51,6 +51,7 @@ fn row_to_backup(row: &Row<'_>) -> rusqlite::Result<BackupRecord> {
         shelved_at: row.get::<_, DateTime<Utc>>("shelved_at")?,
         unshelved_at: row.get::<_, Option<DateTime<Utc>>>("unshelved_at")?,
         status,
+        content_hash: row.get::<_, Option<String>>("content_hash")?,
     })
 }
 
@@ -58,7 +59,7 @@ fn insert_backup(tx: &Transaction<'_>, r: &BackupRecord) -> Result<()> {
     tx.execute(
         &format!(
             "INSERT INTO backups ({BACKUP_COLS}) VALUES \
-             (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+             (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
         ),
         params![
             r.id.to_string(),
@@ -68,10 +69,91 @@ fn insert_backup(tx: &Transaction<'_>, r: &BackupRecord) -> Result<()> {
             r.shelved_at,
             r.unshelved_at,
             r.status.as_str(),
+            r.content_hash,
         ],
     )
     .context("inserting backup record")?;
     Ok(())
+}
+
+/// Streaming BLAKE3 of a single file. Reads in fixed-size chunks so a multi-GB
+/// shelf entry never lands in memory at once.
+fn hash_file(path: &Path) -> Result<String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("open for hashing {}", path.display()))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .with_context(|| format!("read for hashing {}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// Canonical content digest of a directory subtree: every entry's relative
+/// path plus a kind-tagged content token, sorted and folded into one hash.
+/// Order-independent and stable across the shelf copy and the live destination
+/// (both hashed relative to their own root), so a bundle whose destination was
+/// edited after apply produces a different digest.
+///
+/// Entry semantics mirror how [`copy_dir_recursive`] materialises a shelf copy:
+/// - Anything that resolves to a file (`Path::is_file`, which **follows
+///   symlinks** — just like the `std::fs::copy` used at shelve time) hashes as
+///   `F:<blake3 of followed content>`. A symlink-to-file at the destination
+///   therefore matches the regular file the shelf stored for it.
+/// - Directories (including symlinks to directories) contribute a `D` token,
+///   so a user-added empty directory changes the digest.
+/// - Anything else (e.g. a broken symlink) contributes an `L` token, so its
+///   appearance or disappearance is also detected.
+fn tree_hash(root: &Path) -> Result<String> {
+    let mut entries: Vec<(String, String)> = Vec::new();
+    for entry in WalkDir::new(root).min_depth(1).sort_by_file_name() {
+        let entry = entry.with_context(|| format!("walking {}", root.display()))?;
+        let path = entry.path();
+        let relative = path
+            .strip_prefix(root)
+            .context("strip_prefix during tree hash")?;
+        // Normalise separators so the digest is stable regardless of platform.
+        let rel = relative
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        let token = if path.is_file() {
+            format!("F:{}", hash_file(path)?)
+        } else if path.is_dir() {
+            "D".to_string()
+        } else {
+            "L".to_string()
+        };
+        entries.push((rel, token));
+    }
+    entries.sort();
+    let mut hasher = blake3::Hasher::new();
+    for (rel, token) in entries {
+        hasher.update(rel.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(token.as_bytes());
+        hasher.update(b"\n");
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// Content digest of a path, dispatching to [`tree_hash`] for directories and
+/// [`hash_file`] for files. This is the single algorithm shared by shelve-time
+/// recording and rollback-time verification.
+fn hash_path(path: &Path) -> Result<String> {
+    if path.is_dir() {
+        tree_hash(path)
+    } else {
+        hash_file(path)
+    }
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
@@ -138,6 +220,9 @@ impl BackupStore for SqliteStore {
                     backup_path.display()
                 )
             })?;
+            // Hash the shelved copy (identical bytes to the original, and the
+            // exact bytes rollback verifies against later).
+            let content_hash = Some(hash_file(&backup_path)?);
             let record = BackupRecord {
                 id: Uuid::new_v4(),
                 change_id,
@@ -146,6 +231,7 @@ impl BackupStore for SqliteStore {
                 shelved_at,
                 unshelved_at: None,
                 status: BackupStatus::Shelved,
+                content_hash,
             };
             {
                 let mut guard = conn.lock().map_err(|e| anyhow!("lock poisoned: {e}"))?;
@@ -178,6 +264,7 @@ impl BackupStore for SqliteStore {
             let target_dir = shelf_dir(backup_root.as_path(), shelved_at, bundle_id);
             let backup_path = target_dir.join(&name);
             copy_dir_recursive(&original_path, &backup_path)?;
+            let content_hash = Some(tree_hash(&backup_path)?);
             let record = BackupRecord {
                 id: Uuid::new_v4(),
                 change_id: bundle_id,
@@ -186,6 +273,7 @@ impl BackupStore for SqliteStore {
                 shelved_at,
                 unshelved_at: None,
                 status: BackupStatus::Shelved,
+                content_hash,
             };
             {
                 let mut guard = conn.lock().map_err(|e| anyhow!("lock poisoned: {e}"))?;
@@ -207,16 +295,17 @@ impl BackupStore for SqliteStore {
         let conn = self.conn();
         let result = tokio::task::spawn_blocking(move || -> Result<Option<BackupRecord>> {
             let guard = conn.lock().map_err(|e| anyhow!("lock poisoned: {e}"))?;
+            // Latest record regardless of status: callers branch on
+            // `record.status` — a partially-rolled-back bundle needs to see its
+            // already-`Unshelved` members to retry to completion instead of
+            // erroring on "no shelved backup" forever.
             let mut stmt = guard.prepare(&format!(
                 "SELECT {BACKUP_COLS} FROM backups \
-                 WHERE change_id = ?1 AND status = ?2 \
+                 WHERE change_id = ?1 \
                  ORDER BY shelved_at DESC LIMIT 1"
             ))?;
             let fetched = stmt
-                .query_row(
-                    params![change_id.to_string(), BackupStatus::Shelved.as_str()],
-                    row_to_backup,
-                )
+                .query_row(params![change_id.to_string()], row_to_backup)
                 .ok();
             Ok(fetched)
         })
@@ -261,6 +350,69 @@ impl BackupStore for SqliteStore {
         .await
         .context("join restore task")??;
         Ok(())
+    }
+
+    async fn precheck_restore(
+        &self,
+        record: &BackupRecord,
+        destination: &Path,
+    ) -> tidyup_core::Result<RestorePrecheck> {
+        let record = record.clone();
+        let destination = destination.to_path_buf();
+        let verdict = tokio::task::spawn_blocking(move || -> Result<RestorePrecheck> {
+            // 1. The shelf copy must exist — without it, restore has nothing to
+            //    put back, so deleting the destination would lose data outright.
+            if !record.backup_path.exists() {
+                return Ok(RestorePrecheck::ShelfUnusable(format!(
+                    "shelf copy missing: {}",
+                    record.backup_path.display()
+                )));
+            }
+            // 2. The shelf copy must be intact. Recompute its digest; if a
+            //    stored digest exists and disagrees, the shelf was corrupted and
+            //    can't be trusted as the restore source.
+            let shelf_hash = hash_path(&record.backup_path)
+                .with_context(|| format!("hashing shelf {}", record.backup_path.display()))?;
+            if let Some(stored) = &record.content_hash {
+                if stored != &shelf_hash {
+                    return Ok(RestorePrecheck::ShelfUnusable(format!(
+                        "shelf copy corrupt (digest changed): {}",
+                        record.backup_path.display()
+                    )));
+                }
+            }
+            // 3. The original slot must be free or already hold the shelved
+            //    content. Restore copies shelf → original unconditionally, so a
+            //    NEW file the user saved into the vacated slot would be
+            //    overwritten — refuse instead. (An original that matches the
+            //    shelf is fine: re-restoring it is a no-op.)
+            if record.original_path.exists() {
+                let original_hash = hash_path(&record.original_path).with_context(|| {
+                    format!("hashing original slot {}", record.original_path.display())
+                })?;
+                if original_hash != shelf_hash {
+                    return Ok(RestorePrecheck::OriginalOccupied);
+                }
+            }
+            // 4. If the destination is already gone, there is nothing to clobber
+            //    — restoring the shelf copy is safe.
+            if !destination.exists() {
+                return Ok(RestorePrecheck::Ready);
+            }
+            // 5. Compare the live destination against the shelved bytes. A match
+            //    means the move's target is untouched and safe to replace; a
+            //    mismatch means the user edited it post-apply — never delete.
+            let dest_hash = hash_path(&destination)
+                .with_context(|| format!("hashing destination {}", destination.display()))?;
+            if dest_hash == shelf_hash {
+                Ok(RestorePrecheck::Ready)
+            } else {
+                Ok(RestorePrecheck::DestinationModified)
+            }
+        })
+        .await
+        .context("join precheck_restore task")??;
+        Ok(verdict)
     }
 
     async fn prune_older_than_days(&self, days: u32) -> tidyup_core::Result<usize> {
@@ -493,7 +645,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn find_by_change_id_returns_only_shelved() {
+    async fn find_by_change_id_returns_latest_record_any_status() {
         let dir = TempDir::new().unwrap();
         let store = store_with_backup_root(&dir);
 
@@ -503,10 +655,313 @@ mod tests {
 
         let found = store.find_by_change_id(change_id).await.unwrap().unwrap();
         assert_eq!(found.id, shelved.id);
+        assert_eq!(found.status, BackupStatus::Shelved);
 
-        // After restore, status flips to Unshelved and lookup returns None.
+        // After restore the record stays visible with status Unshelved, so a
+        // retrying rollback can recognise already-restored members instead of
+        // erroring on "no shelved backup" forever.
         store.restore(&shelved).await.unwrap();
-        assert!(store.find_by_change_id(change_id).await.unwrap().is_none());
+        let after = store.find_by_change_id(change_id).await.unwrap().unwrap();
+        assert_eq!(after.id, shelved.id);
+        assert_eq!(after.status, BackupStatus::Unshelved);
+    }
+
+    #[tokio::test]
+    async fn shelve_records_content_hash() {
+        let dir = TempDir::new().unwrap();
+        let store = store_with_backup_root(&dir);
+        let src = write_file(dir.path(), "h.txt", b"hash me");
+        let record = store
+            .shelve(&sample_indexed(src), Uuid::new_v4())
+            .await
+            .unwrap();
+        assert_eq!(
+            record.content_hash,
+            Some(blake3::hash(b"hash me").to_hex().to_string()),
+        );
+    }
+
+    #[tokio::test]
+    async fn precheck_ready_when_destination_matches_shelf() {
+        let dir = TempDir::new().unwrap();
+        let store = store_with_backup_root(&dir);
+        let src = write_file(dir.path(), "orig.txt", b"payload");
+        let record = store
+            .shelve(&sample_indexed(src), Uuid::new_v4())
+            .await
+            .unwrap();
+        // The "destination" is a moved copy with identical bytes.
+        let dest = write_file(dir.path(), "moved.txt", b"payload");
+        assert_eq!(
+            store.precheck_restore(&record, &dest).await.unwrap(),
+            RestorePrecheck::Ready,
+        );
+    }
+
+    #[tokio::test]
+    async fn precheck_flags_edited_destination() {
+        let dir = TempDir::new().unwrap();
+        let store = store_with_backup_root(&dir);
+        let src = write_file(dir.path(), "orig.txt", b"payload");
+        let record = store
+            .shelve(&sample_indexed(src), Uuid::new_v4())
+            .await
+            .unwrap();
+        let dest = write_file(dir.path(), "moved.txt", b"payload EDITED");
+        assert_eq!(
+            store.precheck_restore(&record, &dest).await.unwrap(),
+            RestorePrecheck::DestinationModified,
+        );
+    }
+
+    #[tokio::test]
+    async fn precheck_ready_when_destination_missing() {
+        let dir = TempDir::new().unwrap();
+        let store = store_with_backup_root(&dir);
+        let src = write_file(dir.path(), "orig.txt", b"payload");
+        let record = store
+            .shelve(&sample_indexed(src), Uuid::new_v4())
+            .await
+            .unwrap();
+        let dest = dir.path().join("gone.txt");
+        assert_eq!(
+            store.precheck_restore(&record, &dest).await.unwrap(),
+            RestorePrecheck::Ready,
+        );
+    }
+
+    #[tokio::test]
+    async fn precheck_reports_missing_shelf() {
+        let dir = TempDir::new().unwrap();
+        let store = store_with_backup_root(&dir);
+        let src = write_file(dir.path(), "orig.txt", b"payload");
+        let record = store
+            .shelve(&sample_indexed(src), Uuid::new_v4())
+            .await
+            .unwrap();
+        std::fs::remove_file(&record.backup_path).unwrap();
+        let dest = write_file(dir.path(), "moved.txt", b"payload");
+        assert!(matches!(
+            store.precheck_restore(&record, &dest).await.unwrap(),
+            RestorePrecheck::ShelfUnusable(_),
+        ));
+    }
+
+    #[tokio::test]
+    async fn precheck_reports_corrupt_shelf() {
+        let dir = TempDir::new().unwrap();
+        let store = store_with_backup_root(&dir);
+        let src = write_file(dir.path(), "orig.txt", b"payload");
+        let record = store
+            .shelve(&sample_indexed(src), Uuid::new_v4())
+            .await
+            .unwrap();
+        // Corrupt the shelf copy so its recomputed digest no longer matches.
+        std::fs::write(&record.backup_path, b"tampered").unwrap();
+        let dest = write_file(dir.path(), "moved.txt", b"payload");
+        assert!(matches!(
+            store.precheck_restore(&record, &dest).await.unwrap(),
+            RestorePrecheck::ShelfUnusable(_),
+        ));
+    }
+
+    #[tokio::test]
+    async fn precheck_flags_new_file_in_original_slot() {
+        let dir = TempDir::new().unwrap();
+        let store = store_with_backup_root(&dir);
+        let src = write_file(dir.path(), "orig.txt", b"payload");
+        let record = store
+            .shelve(&sample_indexed(src.clone()), Uuid::new_v4())
+            .await
+            .unwrap();
+        // Simulate the apply-move, then the user saving a NEW file into the
+        // vacated original slot.
+        let dest = write_file(dir.path(), "moved.txt", b"payload");
+        std::fs::write(&src, b"BRAND NEW FILE, not the original").unwrap();
+        assert_eq!(
+            store.precheck_restore(&record, &dest).await.unwrap(),
+            RestorePrecheck::OriginalOccupied,
+        );
+    }
+
+    #[tokio::test]
+    async fn precheck_ready_when_original_slot_matches_shelf() {
+        // Re-restoring over an original that already holds the shelved content
+        // is a harmless no-op, not a conflict.
+        let dir = TempDir::new().unwrap();
+        let store = store_with_backup_root(&dir);
+        let src = write_file(dir.path(), "orig.txt", b"payload");
+        let record = store
+            .shelve(&sample_indexed(src), Uuid::new_v4())
+            .await
+            .unwrap();
+        // Original still in place (as after a healed partial rollback).
+        let dest = dir.path().join("moved.txt");
+        assert_eq!(
+            store.precheck_restore(&record, &dest).await.unwrap(),
+            RestorePrecheck::Ready,
+        );
+    }
+
+    #[tokio::test]
+    async fn precheck_detects_empty_dir_added_to_bundle_destination() {
+        let dir = TempDir::new().unwrap();
+        let store = store_with_backup_root(&dir);
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"a").unwrap();
+        let record = store.shelve_bundle(&root, Uuid::new_v4()).await.unwrap();
+        std::fs::remove_dir_all(&root).unwrap(); // simulate the move
+
+        let dest = dir.path().join("moved");
+        copy_dir_recursive(&record.backup_path, &dest).unwrap();
+        assert_eq!(
+            store.precheck_restore(&record, &dest).await.unwrap(),
+            RestorePrecheck::Ready,
+        );
+        // A user-created empty directory inside the moved bundle must flip the
+        // verdict — deleting the destination would destroy it.
+        std::fs::create_dir(dest.join("notes")).unwrap();
+        assert_eq!(
+            store.precheck_restore(&record, &dest).await.unwrap(),
+            RestorePrecheck::DestinationModified,
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn precheck_ready_for_pristine_bundle_containing_symlink() {
+        // shelve_bundle materialises a symlink-to-file as a regular file
+        // (fs::copy follows links); the destination keeps the symlink after a
+        // same-volume rename. tree_hash follows links the same way fs::copy
+        // does, so a pristine destination must precheck Ready, not
+        // DestinationModified-forever.
+        let dir = TempDir::new().unwrap();
+        let store = store_with_backup_root(&dir);
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("real.txt"), b"linked content").unwrap();
+        std::os::unix::fs::symlink(root.join("real.txt"), root.join("link.txt")).unwrap();
+
+        let record = store.shelve_bundle(&root, Uuid::new_v4()).await.unwrap();
+        // Simulate the same-volume rename apply: the destination subtree keeps
+        // the symlink exactly as the source had it.
+        let dest = dir.path().join("moved");
+        std::fs::rename(&root, &dest).unwrap();
+        // Repair the link target (it pointed into the old root).
+        std::fs::remove_file(dest.join("link.txt")).unwrap();
+        std::os::unix::fs::symlink(dest.join("real.txt"), dest.join("link.txt")).unwrap();
+
+        assert_eq!(
+            store.precheck_restore(&record, &dest).await.unwrap(),
+            RestorePrecheck::Ready,
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_database_gains_content_hash_column_and_precheck_falls_back() {
+        // A database created before content hashing shipped must (a) migrate
+        // via ALTER TABLE on open and (b) still precheck correctly for its old
+        // records (content_hash = NULL → compare destination against the shelf
+        // bytes directly).
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("legacy.db");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            // The pre-WP0 backups schema, verbatim minus content_hash.
+            conn.execute_batch(
+                "CREATE TABLE backups (
+                    id             TEXT PRIMARY KEY,
+                    change_id      TEXT NOT NULL,
+                    original_path  TEXT NOT NULL,
+                    backup_path    TEXT NOT NULL,
+                    shelved_at     TEXT NOT NULL,
+                    unshelved_at   TEXT,
+                    status         TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+            // A legacy row written by the old code.
+            let shelf_file = dir.path().join("legacy-shelf.txt");
+            std::fs::write(&shelf_file, b"legacy bytes").unwrap();
+            conn.execute(
+                "INSERT INTO backups (id, change_id, original_path, backup_path, shelved_at, status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    Uuid::new_v4().to_string(),
+                    dir.path().join("orig.txt").to_str().unwrap(),
+                    shelf_file.to_str().unwrap(),
+                    Utc::now(),
+                    "Shelved",
+                ],
+            )
+            .unwrap();
+        }
+
+        // Re-open through SqliteStore: the additive migration must fire.
+        let store = SqliteStore::open(&db)
+            .unwrap()
+            .with_backup_root(dir.path().join("shelf"));
+        std::fs::create_dir_all(dir.path().join("shelf")).unwrap();
+
+        // The legacy row hydrates with content_hash = None...
+        let conn = store.conn();
+        let record = tokio::task::spawn_blocking(move || {
+            let guard = conn.lock().unwrap();
+            let mut stmt = guard
+                .prepare(&format!("SELECT {BACKUP_COLS} FROM backups LIMIT 1"))
+                .unwrap();
+            stmt.query_row([], row_to_backup).unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(record.content_hash, None);
+
+        // ...and precheck falls back to direct shelf-vs-destination compare.
+        let matching = write_file(dir.path(), "dest-match.txt", b"legacy bytes");
+        assert_eq!(
+            store.precheck_restore(&record, &matching).await.unwrap(),
+            RestorePrecheck::Ready,
+        );
+        let edited = write_file(dir.path(), "dest-edit.txt", b"edited after apply");
+        assert_eq!(
+            store.precheck_restore(&record, &edited).await.unwrap(),
+            RestorePrecheck::DestinationModified,
+        );
+
+        // New shelves into the migrated DB record a hash (8-param insert works).
+        let src = write_file(dir.path(), "new.txt", b"new");
+        let rec2 = store
+            .shelve(&sample_indexed(src), Uuid::new_v4())
+            .await
+            .unwrap();
+        assert!(rec2.content_hash.is_some());
+    }
+
+    #[tokio::test]
+    async fn precheck_detects_edited_bundle_member() {
+        let dir = TempDir::new().unwrap();
+        let store = store_with_backup_root(&dir);
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), b"[package]").unwrap();
+        std::fs::write(root.join("src/main.rs"), b"fn main() {}").unwrap();
+        let record = store.shelve_bundle(&root, Uuid::new_v4()).await.unwrap();
+
+        // A destination subtree that mirrors the shelf exactly → Ready.
+        let dest = dir.path().join("moved");
+        copy_dir_recursive(&record.backup_path, &dest).unwrap();
+        assert_eq!(
+            store.precheck_restore(&record, &dest).await.unwrap(),
+            RestorePrecheck::Ready,
+        );
+        // Edit a member → DestinationModified.
+        std::fs::write(dest.join("src/main.rs"), b"fn main() { edited() }").unwrap();
+        assert_eq!(
+            store.precheck_restore(&record, &dest).await.unwrap(),
+            RestorePrecheck::DestinationModified,
+        );
     }
 
     #[tokio::test]

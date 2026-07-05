@@ -1735,7 +1735,10 @@ fn LastReportCard(signals: SignalBundle) -> Element {
         LastReport::Rollback(r) => rsx! {
             div {
                 class: "card",
-                h2 { class: "card-title", "Rollback complete" }
+                h2 {
+                    class: "card-title",
+                    if r.failures > 0 || r.conflicts > 0 { "Rollback incomplete" } else { "Rollback complete" }
+                }
                 div { class: "small muted", "Run {r.run_id}" }
                 div {
                     class: "button-row",
@@ -1744,6 +1747,16 @@ fn LastReportCard(signals: SignalBundle) -> Element {
                     span { class: "chip chip-high", "restored {r.bundles_restored} bundle(s)" }
                     if r.failures > 0 {
                         span { class: "chip chip-low", "{r.failures} failure(s)" }
+                    }
+                    if r.conflicts > 0 {
+                        span { class: "chip chip-low", "{r.conflicts} conflict(s)" }
+                    }
+                }
+                if r.conflicts > 0 {
+                    p {
+                        class: "small muted",
+                        "Conflicted items were modified after apply and were left in place \
+                         to preserve your edits. Resolve them by hand, then roll back again."
                     }
                 }
             }

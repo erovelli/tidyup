@@ -57,6 +57,7 @@ fn sample_proposal(src: &str, dst: &str, file: Option<FileId>) -> ChangeProposal
         bundle_id: None,
         classification_confidence: Some(0.88),
         rename_mismatch_score: None,
+        content_hash: None,
     }
 }
 
@@ -98,6 +99,60 @@ async fn upsert_preserves_id_across_rescan() {
         .unwrap()
         .unwrap();
     assert_eq!(got.id.0, original, "FileId must be stable across re-scans");
+}
+
+#[tokio::test]
+async fn proposal_content_hash_round_trips_through_pending() {
+    let dir = TempDir::new().unwrap();
+    let store = new_store(&dir);
+
+    let mut p = sample_proposal("/src/a.pdf", "/docs/a.pdf", None);
+    p.content_hash = Some("af1349b9f5f9a1a6a0404dea36dcc949".to_string());
+    store.record_proposal(&p, None).await.unwrap();
+
+    let pending = store.pending().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        pending[0].content_hash.as_deref(),
+        Some("af1349b9f5f9a1a6a0404dea36dcc949"),
+        "scan-time content hash must survive a persist + reload"
+    );
+}
+
+#[tokio::test]
+async fn legacy_change_proposals_table_gains_content_hash_column() {
+    // A database created before the change_proposals.content_hash column existed
+    // must migrate on open and then accept + round-trip the new field.
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("legacy.db");
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        // Pre-WP1 change_proposals schema (no content_hash). SQLite permits the
+        // forward FK references to runs/bundles before those tables exist;
+        // schema::apply creates the rest of the (real) schema on open.
+        conn.execute_batch(
+            "CREATE TABLE change_proposals (
+                id TEXT PRIMARY KEY, file_id TEXT, change_type TEXT NOT NULL,
+                original_path TEXT NOT NULL, proposed_path TEXT NOT NULL,
+                proposed_name TEXT NOT NULL, confidence REAL NOT NULL,
+                reasoning TEXT NOT NULL, needs_review INTEGER NOT NULL,
+                status TEXT NOT NULL, created_at TEXT NOT NULL, applied_at TEXT,
+                bundle_id TEXT REFERENCES bundles(id) ON DELETE CASCADE,
+                classification_confidence REAL,
+                rename_mismatch_score REAL, run_id TEXT REFERENCES runs(id)
+             );",
+        )
+        .unwrap();
+    }
+
+    // Re-open through SqliteStore: the additive migration runs.
+    let store = SqliteStore::open(&db).unwrap();
+    let mut p = sample_proposal("/src/legacy.pdf", "/docs/legacy.pdf", None);
+    p.content_hash = Some("deadbeefcafe".to_string());
+    store.record_proposal(&p, None).await.unwrap();
+    let pending = store.pending().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].content_hash.as_deref(), Some("deadbeefcafe"));
 }
 
 #[tokio::test]

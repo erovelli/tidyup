@@ -10,6 +10,7 @@
 
 pub mod calibration;
 pub mod clustering;
+pub mod hashing;
 pub mod heuristics;
 pub mod migration;
 pub mod naming;

@@ -18,7 +18,7 @@ use tidyup_app::{MigrationService, ScanService, ServiceContext};
 use tidyup_core::extractor::{ContentExtractor, ExtractedContent};
 use tidyup_core::frontend::{Level, ProgressItem, ProgressReporter};
 use tidyup_core::inference::{EmbeddingBackend, TextBackend};
-use tidyup_core::storage::ChangeLog;
+use tidyup_core::storage::{BackupStore, ChangeLog, RunLog};
 use tidyup_core::{Result as CoreResult, ReviewHandler};
 use tidyup_domain::{BundleProposal, ChangeProposal, Phase, ReviewDecision};
 use tidyup_storage_sqlite::SqliteStore;
@@ -307,6 +307,52 @@ async fn scan_service_records_bundles_separately() {
     let bundles = store.pending_bundles().await.unwrap();
     assert_eq!(bundles.len(), 1);
     assert_eq!(bundles[0].members.len(), 2);
+}
+
+#[tokio::test]
+async fn migration_refuses_source_target_overlap() {
+    // Target nested inside source, source nested inside target, and equal roots
+    // must all be refused before any run is recorded.
+    let root = TempDir::new().unwrap();
+    let outer = root.path().join("outer");
+    let inner = outer.join("inner");
+    std::fs::create_dir_all(&inner).unwrap();
+
+    let (ctx, store) = make_ctx();
+    let service = MigrationService::new(Arc::clone(&ctx));
+    let reviewer = AutoApprove::new();
+
+    let cases = [
+        (outer.clone(), inner.clone()), // target inside source
+        (inner.clone(), outer.clone()), // source inside target
+        (outer.clone(), outer.clone()), // equal
+    ];
+    for (source, target) in cases {
+        let err = service
+            .run(
+                tidyup_app::migration::MigrationRequest {
+                    source: source.clone(),
+                    target: target.clone(),
+                    dry_run: false,
+                    auto_approve_bundles: false,
+                    bundle_min_confidence: 0.85,
+                },
+                &NullProgress,
+                &reviewer,
+            )
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("inside") || msg.contains("same directory"),
+            "expected overlap error for {source:?} -> {target:?}, got: {msg}"
+        );
+    }
+    // No run should have been recorded for a rejected overlap.
+    assert!(
+        store.list_runs().await.unwrap().is_empty(),
+        "overlap must be refused before a run is recorded"
+    );
 }
 
 #[tokio::test]
@@ -700,4 +746,579 @@ async fn bundle_held_when_interactive_review_rejects_it() {
     assert_eq!(report.bundles_applied, 0, "rejected bundle must not move");
     assert_eq!(report.bundles_skipped, 1);
     assert!(proj.exists(), "rejected bundle stays in place");
+}
+
+/// Apply a single loose scan move and return the context, store, run id, and
+/// the path the file was moved to. Shared setup for the WP-0 rollback-integrity
+/// tests below.
+async fn apply_one_scan_move(
+    workdir: &TempDir,
+) -> (
+    Arc<ServiceContext>,
+    SqliteStore,
+    uuid::Uuid,
+    std::path::PathBuf,
+) {
+    let shelf = workdir.path().join("shelf");
+    std::fs::create_dir_all(&shelf).unwrap();
+    let src_root = workdir.path().join("src");
+    std::fs::create_dir_all(&src_root).unwrap();
+    std::fs::write(src_root.join("helpers.rs"), b"fn main() {}").unwrap();
+
+    let (ctx, store) = make_ctx_with_shelf(Some(shelf));
+    let candidates = sample_scan_candidates().await;
+    let service = ScanService::new(Arc::clone(&ctx));
+    let reviewer = AutoApprove::new();
+    let report = service
+        .run(
+            tidyup_app::scan::ScanRequest {
+                root: src_root.clone(),
+                taxonomy_path: None,
+                dry_run: false,
+                auto_approve_bundles: false,
+                bundle_min_confidence: 0.85,
+            },
+            &candidates,
+            &[],
+            &[],
+            &NullProgress,
+            &reviewer,
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.applied, 1);
+
+    let applied = store
+        .applied_proposals_for_run(report.run_id)
+        .await
+        .unwrap();
+    assert_eq!(applied.len(), 1);
+    let dest = applied[0].proposed_path.clone();
+    assert!(dest.exists(), "move landed at destination");
+    (ctx, store, report.run_id, dest)
+}
+
+#[tokio::test]
+async fn rollback_preserves_a_destination_edited_after_apply() {
+    use tidyup_app::RollbackService;
+
+    let workdir = TempDir::new().unwrap();
+    let (ctx, store, run_id, dest) = apply_one_scan_move(&workdir).await;
+
+    // The user edits the moved file after apply.
+    let edited = b"fn main() { /* user edit after apply */ }";
+    std::fs::write(&dest, edited).unwrap();
+
+    let rollback = RollbackService::new(Arc::clone(&ctx));
+    let rb = rollback.rollback_run(run_id, &NullProgress).await.unwrap();
+
+    assert_eq!(rb.conflicts, 1, "edited destination must be a conflict");
+    assert_eq!(rb.restored, 0, "nothing is restored on conflict");
+    assert_eq!(rb.failures, 0);
+    // The edit survives — the destination was never deleted.
+    assert!(dest.exists());
+    assert_eq!(std::fs::read(&dest).unwrap(), edited);
+    // The item stays applied so it can be retried after the user resolves it.
+    assert_eq!(
+        store.applied_proposals_for_run(run_id).await.unwrap().len(),
+        1,
+    );
+    // A conflicted run is NOT flipped to RolledBack.
+    let run = store.get_run(run_id).await.unwrap().unwrap();
+    assert_ne!(run.state, tidyup_domain::RunState::RolledBack);
+}
+
+#[tokio::test]
+async fn rollback_with_missing_shelf_leaves_destination_untouched() {
+    use tidyup_app::RollbackService;
+
+    let workdir = TempDir::new().unwrap();
+    let (ctx, store, run_id, dest) = apply_one_scan_move(&workdir).await;
+
+    // Simulate a lost/corrupted shelf: delete the shelved copy on disk.
+    let proposal = &store.applied_proposals_for_run(run_id).await.unwrap()[0];
+    let record = store.find_by_change_id(proposal.id).await.unwrap().unwrap();
+    std::fs::remove_file(&record.backup_path).unwrap();
+    let dest_before = std::fs::read(&dest).unwrap();
+
+    let rollback = RollbackService::new(Arc::clone(&ctx));
+    let rb = rollback.rollback_run(run_id, &NullProgress).await.unwrap();
+
+    assert_eq!(rb.failures, 1, "missing shelf copy is a failure");
+    assert_eq!(rb.restored, 0);
+    // Destination is left exactly as it was — never deleted on a failed restore.
+    assert!(dest.exists());
+    assert_eq!(std::fs::read(&dest).unwrap(), dest_before);
+    // Run is NOT marked RolledBack when every restore failed (idempotence).
+    let run = store.get_run(run_id).await.unwrap().unwrap();
+    assert_ne!(run.state, tidyup_domain::RunState::RolledBack);
+
+    // Re-running is stable: still a failure, destination still untouched.
+    let rb2 = rollback.rollback_run(run_id, &NullProgress).await.unwrap();
+    assert_eq!(rb2.failures, 1);
+    assert!(dest.exists());
+}
+
+#[tokio::test]
+async fn re_rollback_after_success_is_a_noop() {
+    use tidyup_app::RollbackService;
+
+    let workdir = TempDir::new().unwrap();
+    let (ctx, store, run_id, dest) = apply_one_scan_move(&workdir).await;
+    let src_file = workdir.path().join("src/helpers.rs");
+
+    let rollback = RollbackService::new(Arc::clone(&ctx));
+    let rb = rollback.rollback_run(run_id, &NullProgress).await.unwrap();
+    assert_eq!(rb.restored, 1);
+    assert_eq!(rb.failures, 0);
+    assert_eq!(rb.conflicts, 0);
+    assert!(src_file.exists(), "original restored");
+    assert!(!dest.exists(), "destination removed");
+    let run = store.get_run(run_id).await.unwrap().unwrap();
+    assert_eq!(run.state, tidyup_domain::RunState::RolledBack);
+
+    // Second rollback: nothing left to do, no error, no double-restore.
+    let rb2 = rollback.rollback_run(run_id, &NullProgress).await.unwrap();
+    assert_eq!(rb2.restored, 0);
+    assert_eq!(rb2.failures, 0);
+    assert_eq!(rb2.conflicts, 0);
+    assert!(src_file.exists());
+}
+
+#[tokio::test]
+async fn rollback_never_overwrites_new_file_in_original_slot() {
+    use tidyup_app::RollbackService;
+
+    let workdir = TempDir::new().unwrap();
+    let (ctx, store, run_id, dest) = apply_one_scan_move(&workdir).await;
+    let src_file = workdir.path().join("src/helpers.rs");
+
+    // The user saves a brand-new file into the vacated original slot.
+    let new_content = b"totally new file, not the moved one";
+    std::fs::write(&src_file, new_content).unwrap();
+
+    let rollback = RollbackService::new(Arc::clone(&ctx));
+    let rb = rollback.rollback_run(run_id, &NullProgress).await.unwrap();
+
+    assert_eq!(rb.conflicts, 1, "occupied original slot must be a conflict");
+    assert_eq!(rb.restored, 0);
+    assert_eq!(rb.failures, 0);
+    // The new file survives untouched; the moved copy stays at the destination.
+    assert_eq!(std::fs::read(&src_file).unwrap(), new_content);
+    assert!(dest.exists());
+    let run = store.get_run(run_id).await.unwrap().unwrap();
+    assert_ne!(run.state, tidyup_domain::RunState::RolledBack);
+}
+
+#[tokio::test]
+async fn rollback_restores_when_destination_already_gone() {
+    use tidyup_app::RollbackService;
+
+    let workdir = TempDir::new().unwrap();
+    let (ctx, store, run_id, dest) = apply_one_scan_move(&workdir).await;
+    let src_file = workdir.path().join("src/helpers.rs");
+
+    // The user deleted (or re-moved) the destination after apply.
+    std::fs::remove_file(&dest).unwrap();
+
+    let rollback = RollbackService::new(Arc::clone(&ctx));
+    let rb = rollback.rollback_run(run_id, &NullProgress).await.unwrap();
+
+    assert_eq!(rb.restored, 1, "missing destination is still restorable");
+    assert_eq!(rb.failures, 0);
+    assert_eq!(rb.conflicts, 0);
+    assert!(src_file.exists(), "original restored from the shelf");
+    assert_eq!(std::fs::read(&src_file).unwrap(), b"fn main() {}");
+    let run = store.get_run(run_id).await.unwrap().unwrap();
+    assert_eq!(run.state, tidyup_domain::RunState::RolledBack);
+}
+
+#[tokio::test]
+async fn rollback_restore_failure_preserves_destination() {
+    use tidyup_app::executor::{apply_loose_decisions, ExecutorDeps};
+    use tidyup_app::RollbackService;
+
+    // A move whose destination is NOT under the original's parent, so we can
+    // sabotage the original side without touching the destination.
+    let workdir = TempDir::new().unwrap();
+    let shelf = workdir.path().join("shelf");
+    std::fs::create_dir_all(&shelf).unwrap();
+    let src_dir = workdir.path().join("a");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    let src = src_dir.join("orig.txt");
+    std::fs::write(&src, b"payload").unwrap();
+    let dest = workdir.path().join("b/moved.txt");
+
+    let (ctx, store) = make_ctx_with_shelf(Some(shelf));
+    let run = tidyup_domain::RunRecord::begin(tidyup_domain::RunMode::Scan, src_dir.clone(), None);
+    store.record_run(&run).await.unwrap();
+    let proposal = ChangeProposal {
+        id: uuid::Uuid::new_v4(),
+        file_id: None,
+        change_type: tidyup_domain::ChangeType::Move,
+        original_path: src.clone(),
+        proposed_path: dest.clone(),
+        proposed_name: "moved.txt".to_string(),
+        confidence: 0.95,
+        reasoning: "t".to_string(),
+        needs_review: false,
+        status: tidyup_domain::ChangeStatus::Pending,
+        created_at: chrono::Utc::now(),
+        applied_at: None,
+        bundle_id: None,
+        classification_confidence: Some(0.95),
+        rename_mismatch_score: None,
+        content_hash: None,
+    };
+    store
+        .record_proposal(&proposal, Some(run.id))
+        .await
+        .unwrap();
+    let deps = ExecutorDeps {
+        change_log: ctx.change_log.as_ref(),
+        backup_store: ctx.backup_store.as_ref(),
+        progress: &NullProgress,
+    };
+    let ar = apply_loose_decisions(
+        std::slice::from_ref(&proposal),
+        &[ReviewDecision::Approve(proposal.id)],
+        &deps,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(ar.applied, 1);
+    assert!(dest.exists());
+
+    // Make the restore copy fail after the destination has been displaced:
+    // replace the (now-empty) original directory with a regular FILE of the
+    // same name, so restore()'s create_dir_all errors. (Permission tricks
+    // don't work here — tests may run as root.)
+    std::fs::remove_dir_all(&src_dir).unwrap();
+    std::fs::write(&src_dir, b"a file where the dir used to be").unwrap();
+
+    let rollback = RollbackService::new(Arc::clone(&ctx));
+    let rb = rollback.rollback_run(run.id, &NullProgress).await.unwrap();
+
+    assert_eq!(rb.failures, 1, "blocked original parent is a failure");
+    assert_eq!(rb.restored, 0);
+    // The displaced destination was renamed back — the data is NOT stranded
+    // solely on the shelf.
+    assert!(
+        dest.exists(),
+        "failed restore must leave the destination in place"
+    );
+    assert_eq!(std::fs::read(&dest).unwrap(), b"payload");
+    let run_row = store.get_run(run.id).await.unwrap().unwrap();
+    assert_ne!(run_row.state, tidyup_domain::RunState::RolledBack);
+
+    // With the obstruction removed, a retry completes.
+    std::fs::remove_file(&src_dir).unwrap();
+    let rb2 = rollback.rollback_run(run.id, &NullProgress).await.unwrap();
+    assert_eq!(rb2.restored, 1);
+    assert!(src.exists(), "original restored on retry");
+    assert!(!dest.exists(), "destination cleaned up after retry");
+}
+
+/// Apply a 3-member file-set (document-series) bundle and return the context,
+/// store, run id, and the members' (original, destination) path pairs.
+async fn apply_invoice_bundle(
+    workdir: &TempDir,
+) -> (
+    Arc<ServiceContext>,
+    SqliteStore,
+    uuid::Uuid,
+    Vec<(std::path::PathBuf, std::path::PathBuf)>,
+) {
+    let shelf = workdir.path().join("shelf");
+    std::fs::create_dir_all(&shelf).unwrap();
+    let src_root = workdir.path().join("src");
+    std::fs::create_dir_all(&src_root).unwrap();
+    for n in ["invoice-01.pdf", "invoice-02.pdf", "invoice-03.pdf"] {
+        std::fs::write(src_root.join(n), format!("contents of {n}").as_bytes()).unwrap();
+    }
+
+    let (ctx, store) = make_ctx_with_shelf(Some(shelf));
+    let candidates = sample_scan_candidates().await;
+    let service = ScanService::new(Arc::clone(&ctx));
+    let reviewer = ApproveEverything::new();
+    let report = service
+        .run(
+            tidyup_app::scan::ScanRequest {
+                root: src_root.clone(),
+                taxonomy_path: None,
+                dry_run: false,
+                auto_approve_bundles: false,
+                bundle_min_confidence: 0.85,
+            },
+            &candidates,
+            &[],
+            &[],
+            &NullProgress,
+            &reviewer,
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.bundles_applied, 1);
+
+    let bundles = store.applied_bundles_for_run(report.run_id).await.unwrap();
+    assert_eq!(bundles.len(), 1);
+    let members = bundles[0]
+        .members
+        .iter()
+        .map(|m| (m.original_path.clone(), m.proposed_path.clone()))
+        .collect::<Vec<_>>();
+    assert_eq!(members.len(), 3);
+    for (_, dst) in &members {
+        assert!(dst.exists());
+    }
+    (ctx, store, report.run_id, members)
+}
+
+#[tokio::test]
+async fn file_set_rollback_conflicts_whole_bundle_when_one_member_edited() {
+    use tidyup_app::RollbackService;
+
+    let workdir = TempDir::new().unwrap();
+    let (ctx, store, run_id, members) = apply_invoice_bundle(&workdir).await;
+
+    // The user edits ONE member's destination after apply.
+    let edited = b"user-edited invoice, do not destroy";
+    std::fs::write(&members[1].1, edited).unwrap();
+
+    let rollback = RollbackService::new(Arc::clone(&ctx));
+    let rb = rollback.rollback_run(run_id, &NullProgress).await.unwrap();
+
+    assert_eq!(rb.conflicts, 1, "edited member conflicts the whole bundle");
+    assert_eq!(rb.bundles_restored, 0);
+    assert_eq!(rb.failures, 0);
+    // All-or-nothing: NO member was restored, the edit survives.
+    for (orig, dst) in &members {
+        assert!(!orig.exists(), "no member may be restored on conflict");
+        assert!(dst.exists(), "every destination stays in place");
+    }
+    assert_eq!(std::fs::read(&members[1].1).unwrap(), edited);
+    // The bundle stays applied so the rollback can be retried after resolution.
+    assert_eq!(
+        store.applied_bundles_for_run(run_id).await.unwrap().len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn file_set_crash_mid_apply_is_recovered_by_rollback() {
+    // Build, by hand, the exact on-disk + DB state a crash leaves mid-file-set
+    // under write-ahead journaling: the bundle is marked applied first, then
+    // member 0 is shelved+moved, then the process dies before members 1-2 are
+    // touched. `rollback_run` must restore member 0 and skip the never-moved
+    // members, converging to all-at-origin with no data loss.
+    use tidyup_app::RollbackService;
+    use tidyup_core::storage::{BackupStore as _, ChangeLog as _, RunLog as _};
+
+    let workdir = TempDir::new().unwrap();
+    let shelf = workdir.path().join("shelf");
+    std::fs::create_dir_all(&shelf).unwrap();
+    let src_root = workdir.path().join("src");
+    let tgt = workdir.path().join("Photos/Bursts/x");
+    std::fs::create_dir_all(&src_root).unwrap();
+    std::fs::create_dir_all(&tgt).unwrap();
+
+    let (ctx, store) = make_ctx_with_shelf(Some(shelf));
+    let run = tidyup_domain::RunRecord::begin(tidyup_domain::RunMode::Scan, src_root.clone(), None);
+    store.record_run(&run).await.unwrap();
+
+    // Three members forming a photo burst (a file-set bundle).
+    let mut members = Vec::new();
+    let mut paths = Vec::new();
+    for n in ["IMG_001.jpg", "IMG_002.jpg", "IMG_003.jpg"] {
+        let orig = src_root.join(n);
+        std::fs::write(&orig, format!("bytes of {n}").as_bytes()).unwrap();
+        let dst = tgt.join(n);
+        paths.push((orig.clone(), dst.clone()));
+        members.push(ChangeProposal {
+            id: uuid::Uuid::new_v4(),
+            file_id: None,
+            change_type: tidyup_domain::ChangeType::Move,
+            original_path: orig,
+            proposed_path: dst,
+            proposed_name: n.to_string(),
+            confidence: 0.9,
+            reasoning: "burst".to_string(),
+            needs_review: false,
+            status: tidyup_domain::ChangeStatus::Pending,
+            created_at: chrono::Utc::now(),
+            applied_at: None,
+            bundle_id: None,
+            classification_confidence: None,
+            rename_mismatch_score: None,
+            content_hash: None,
+        });
+    }
+    let bundle = BundleProposal::new(
+        src_root.join("burst"),
+        tidyup_domain::BundleKind::PhotoBurst,
+        tgt.clone(),
+        members.clone(),
+        0.9,
+        "photo burst".to_string(),
+    )
+    .unwrap();
+    store.record_bundle(&bundle, Some(run.id)).await.unwrap();
+
+    // Write-ahead journal fires first...
+    store.mark_bundle_applied(bundle.id).await.unwrap();
+    // ...then member 0 is shelved + moved, and the process "crashes".
+    let m0 = &bundle.members[0];
+    let indexed = tidyup_domain::IndexedFile {
+        id: tidyup_domain::FileId::new(),
+        path: m0.original_path.clone(),
+        name: "IMG_001.jpg".to_string(),
+        extension: "jpg".to_string(),
+        mime_type: "image/jpeg".to_string(),
+        size_bytes: 0,
+        content_hash: tidyup_domain::ContentHash(String::new()),
+        indexed_at: chrono::Utc::now(),
+    };
+    store.shelve(&indexed, m0.id).await.unwrap();
+    std::fs::rename(&paths[0].0, &paths[0].1).unwrap();
+
+    // The run never finished — `status`-style detection surfaces it as an
+    // interrupted (InProgress) run that rollback can reconcile.
+    assert_eq!(
+        store.get_run(run.id).await.unwrap().unwrap().state,
+        tidyup_domain::RunState::InProgress,
+    );
+    // Sanity: member 0 moved+shelved; members 1-2 at origin, never shelved.
+    assert!(!paths[0].0.exists() && paths[0].1.exists());
+    assert!(store.find_by_change_id(m0.id).await.unwrap().is_some());
+    assert!(store
+        .find_by_change_id(bundle.members[1].id)
+        .await
+        .unwrap()
+        .is_none());
+
+    let rollback = RollbackService::new(Arc::clone(&ctx));
+    let rb = rollback.rollback_run(run.id, &NullProgress).await.unwrap();
+
+    assert_eq!(rb.bundles_restored, 1, "partial bundle recovered: {rb:?}");
+    assert_eq!(rb.failures, 0);
+    assert_eq!(rb.conflicts, 0);
+    // Everything ends at its origin; nothing stranded at a destination.
+    for (orig, dst) in &paths {
+        assert!(orig.exists(), "restored: {}", orig.display());
+        assert!(!dst.exists(), "cleared: {}", dst.display());
+    }
+    assert_eq!(std::fs::read(&paths[0].0).unwrap(), b"bytes of IMG_001.jpg");
+}
+
+#[tokio::test]
+async fn file_set_rollback_retry_completes_after_partial_restore() {
+    use tidyup_app::RollbackService;
+    use tidyup_core::storage::BackupStore as _;
+
+    let workdir = TempDir::new().unwrap();
+    let (ctx, store, run_id, members) = apply_invoice_bundle(&workdir).await;
+    let bundle = &store.applied_bundles_for_run(run_id).await.unwrap()[0];
+
+    // Simulate an interrupted earlier rollback: member 0 was already restored
+    // (shelf copy back at the original, backup row flipped Unshelved,
+    // destination removed) but the bundle never got marked unshelved.
+    let first_member = &bundle.members[0];
+    let first_record = store
+        .find_by_change_id(first_member.id)
+        .await
+        .unwrap()
+        .unwrap();
+    store.restore(&first_record).await.unwrap();
+    std::fs::remove_file(&members[0].1).unwrap();
+
+    // Retry must recognise member 0 as done and complete the remaining two.
+    let rollback = RollbackService::new(Arc::clone(&ctx));
+    let rb = rollback.rollback_run(run_id, &NullProgress).await.unwrap();
+
+    assert_eq!(rb.bundles_restored, 1, "retry converges: {rb:?}");
+    assert_eq!(rb.failures, 0);
+    assert_eq!(rb.conflicts, 0);
+    for (orig, dst) in &members {
+        assert!(orig.exists(), "every member restored: {}", orig.display());
+        assert!(
+            !dst.exists(),
+            "every destination cleared: {}",
+            dst.display()
+        );
+    }
+    assert!(store
+        .applied_bundles_for_run(run_id)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn rollback_of_a_rename_restores_the_original_name() {
+    use tidyup_app::executor::{apply_loose_decisions, ExecutorDeps};
+    use tidyup_app::RollbackService;
+
+    let workdir = TempDir::new().unwrap();
+    let shelf = workdir.path().join("shelf");
+    std::fs::create_dir_all(&shelf).unwrap();
+    let dir = workdir.path().join("docs");
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("scan001.pdf");
+    std::fs::write(&src, b"tax return 2023").unwrap();
+    // Rename-and-move: different basename in a different folder.
+    let dst = dir.join("Finance/tax-return-2023.pdf");
+
+    let (ctx, store) = make_ctx_with_shelf(Some(shelf));
+    let run = tidyup_domain::RunRecord::begin(tidyup_domain::RunMode::Scan, dir.clone(), None);
+    store.record_run(&run).await.unwrap();
+
+    let proposal = ChangeProposal {
+        id: uuid::Uuid::new_v4(),
+        // No file_id: the change_proposals.file_id FK requires a persisted files
+        // row, and the real pipeline records loose proposals with `None`.
+        file_id: None,
+        change_type: tidyup_domain::ChangeType::RenameAndMove,
+        original_path: src.clone(),
+        proposed_path: dst.clone(),
+        proposed_name: "tax-return-2023.pdf".to_string(),
+        confidence: 0.95,
+        reasoning: "rename".to_string(),
+        needs_review: false,
+        status: tidyup_domain::ChangeStatus::Pending,
+        created_at: chrono::Utc::now(),
+        applied_at: None,
+        bundle_id: None,
+        classification_confidence: Some(0.95),
+        rename_mismatch_score: Some(0.7),
+        content_hash: None,
+    };
+    store
+        .record_proposal(&proposal, Some(run.id))
+        .await
+        .unwrap();
+
+    let deps = ExecutorDeps {
+        change_log: ctx.change_log.as_ref(),
+        backup_store: ctx.backup_store.as_ref(),
+        progress: &NullProgress,
+    };
+    let ar = apply_loose_decisions(
+        std::slice::from_ref(&proposal),
+        &[ReviewDecision::Approve(proposal.id)],
+        &deps,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(ar.applied, 1);
+    assert!(!src.exists() && dst.exists(), "rename applied");
+
+    let rollback = RollbackService::new(Arc::clone(&ctx));
+    let rb = rollback.rollback_run(run.id, &NullProgress).await.unwrap();
+    assert_eq!(rb.restored, 1);
+    assert_eq!(rb.failures, 0);
+    assert!(src.exists(), "rename rollback restores the original name");
+    assert!(!dst.exists(), "renamed destination removed");
+    assert_eq!(std::fs::read(&src).unwrap(), b"tax return 2023");
 }

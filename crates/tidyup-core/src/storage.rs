@@ -4,7 +4,8 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use tidyup_domain::{
-    BackupRecord, BundleProposal, ChangeProposal, FileId, IndexedFile, RunRecord, RunState,
+    BackupRecord, BundleProposal, ChangeProposal, FileId, IndexedFile, RestorePrecheck, RunRecord,
+    RunState,
 };
 use uuid::Uuid;
 
@@ -77,10 +78,28 @@ pub trait BackupStore: Send + Sync {
     /// Restore a shelved backup to `original_path`. Handles files and subtrees uniformly.
     async fn restore(&self, record: &BackupRecord) -> Result<()>;
 
-    /// Look up the shelved backup for a given change or bundle id.
+    /// Decide whether `record`'s destination can be safely deleted and restored.
     ///
-    /// Returns the single most-recent `Shelved` record with matching `change_id`, or
-    /// `None` if no such record exists (never shelved, or already restored/expired).
+    /// Rollback must never destroy data: this recomputes the shelf copy's digest
+    /// (rejecting a missing or corrupt shelf) and compares the live `destination`
+    /// against it, so a destination edited after the move is reported as a
+    /// conflict instead of being clobbered. `destination` is the path the change
+    /// moved the original *to* (a file for loose proposals, a subtree root for
+    /// directory bundles). Owning the algorithm here keeps the rollback caller
+    /// from re-deriving the tree-hash.
+    async fn precheck_restore(
+        &self,
+        record: &BackupRecord,
+        destination: &Path,
+    ) -> Result<RestorePrecheck>;
+
+    /// Look up the backup record for a given change or bundle id.
+    ///
+    /// Returns the single most-recent record with matching `change_id`
+    /// **regardless of status**, or `None` if the change was never shelved.
+    /// Callers branch on [`BackupRecord::status`]: `Shelved` is restorable;
+    /// `Unshelved` means already restored (a retrying rollback treats it as
+    /// done); `Expired` means the shelf content was pruned.
     async fn find_by_change_id(&self, change_id: Uuid) -> Result<Option<BackupRecord>>;
 
     /// Expire backups older than `days`: marks rows as [`BackupStatus::Expired`] and best-effort

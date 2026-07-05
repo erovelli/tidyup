@@ -82,6 +82,11 @@ impl MigrationService {
         progress: &dyn ProgressReporter,
         review: &dyn ReviewHandler,
     ) -> Result<MigrationReport> {
+        // Overlap guard: a source nested under the target (or vice versa) would
+        // move files into their own subtree — duplicating or endlessly
+        // re-routing them. Refuse before recording a run.
+        guard_source_target_overlap(&request.source, &request.target)?;
+
         let run = RunRecord::begin(
             RunMode::Migrate,
             request.source.clone(),
@@ -247,4 +252,42 @@ impl MigrationService {
         let _ = (&self.ctx, root, progress);
         anyhow::bail!("stand-alone indexing pass is not part of the v0.1 scope")
     }
+}
+
+/// Reject a migration whose source and target trees overlap. Moving files from
+/// a source nested inside the target (or a target nested inside the source)
+/// would relocate files into their own subtree — duplicating them or feeding
+/// them back into the classifier on a later run. Equal roots are also refused.
+///
+/// Paths are compared after best-effort canonicalisation so `.`/`..`/symlink
+/// spellings of the same directory are caught; when a path can't be
+/// canonicalised (e.g. doesn't exist yet) the lexical form is used.
+fn guard_source_target_overlap(source: &Path, target: &Path) -> Result<()> {
+    let s = canonical_or_lexical(source);
+    let t = canonical_or_lexical(target);
+    if s == t {
+        return Err(anyhow::anyhow!(
+            "source and target are the same directory ({}); nothing to migrate into",
+            source.display(),
+        ));
+    }
+    if t.starts_with(&s) {
+        return Err(anyhow::anyhow!(
+            "target {} is inside source {}; migrating would move files into their own subtree",
+            target.display(),
+            source.display(),
+        ));
+    }
+    if s.starts_with(&t) {
+        return Err(anyhow::anyhow!(
+            "source {} is inside target {}; migrating would move files within the target tree",
+            source.display(),
+            target.display(),
+        ));
+    }
+    Ok(())
+}
+
+fn canonical_or_lexical(p: &Path) -> std::path::PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }

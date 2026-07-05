@@ -66,6 +66,13 @@ pub async fn apply_loose_decisions(
     dry_run: bool,
 ) -> Result<ApplyReport> {
     let by_id: HashMap<Uuid, &ChangeProposal> = proposals.iter().map(|p| (p.id, p)).collect();
+
+    // Proactive duplicate-destination guard: if two approved decisions resolve
+    // to the same target path, moving them in sequence would clobber the first.
+    // Detect it up front and refuse the whole apply rather than silently losing
+    // a file. (Rejected decisions don't contribute a target.)
+    check_no_duplicate_targets(decisions, &by_id)?;
+
     #[allow(clippy::cast_possible_truncation)]
     let total = decisions.len() as u64;
     deps.progress
@@ -183,23 +190,34 @@ async fn apply_single(
     if !source.exists() {
         return Err(anyhow!("source missing: {}", source.display()));
     }
+    // TOCTOU guard: refuse to move a file that changed since it was classified.
+    verify_unchanged(&source, proposal.content_hash.as_deref())?;
     if dry_run {
         // Dry run: count in the report but never mutate FS or DB state.
         return Ok(());
     }
 
-    // Shelve before any filesystem mutation.
+    // Order matters for crash consistency:
+    //   1. shelve (safety net — the original is preserved before anything moves)
+    //   2. mark_applied (write-ahead journal — records intent BEFORE the move)
+    //   3. move
+    // A crash between 2 and 3 leaves the proposal marked applied but not yet
+    // moved; rollback's precheck sees the destination absent and the original
+    // still in place and treats the restore as a safe no-op. The reverse order
+    // (move then mark) would strand a moved-but-unjournaled file that rollback
+    // — which enumerates *applied* changes — could never reach.
     let indexed = indexed_stub(&source, proposal.file_id.clone())?;
     deps.backup_store
         .shelve(&indexed, proposal.id)
         .await
         .with_context(|| format!("shelving {}", source.display()))?;
 
+    deps.change_log.mark_applied(proposal.id).await?;
+
     ensure_parent(target)?;
     move_path(&source, target)
         .with_context(|| format!("moving {} -> {}", source.display(), target.display()))?;
 
-    deps.change_log.mark_applied(proposal.id).await?;
     Ok(())
 }
 
@@ -221,16 +239,21 @@ async fn apply_bundle_atomic(
         return Ok(());
     }
 
+    // Write-ahead journal: shelve, then mark applied, then move (see
+    // `apply_single`). A crash after the mark but before the atomic rename
+    // leaves the bundle marked applied yet un-moved; rollback no-ops it (the
+    // destination is absent, the original still present).
     deps.backup_store
         .shelve_bundle(&source, bundle.id)
         .await
         .with_context(|| format!("shelving bundle {}", source.display()))?;
 
+    deps.change_log.mark_bundle_applied(bundle.id).await?;
+
     ensure_parent(&target)?;
     move_path(&source, &target)
         .with_context(|| format!("moving bundle {} -> {}", source.display(), target.display()))?;
 
-    deps.change_log.mark_bundle_applied(bundle.id).await?;
     Ok(())
 }
 
@@ -247,8 +270,10 @@ async fn apply_file_set_bundle(
     deps: &ExecutorDeps<'_>,
     dry_run: bool,
 ) -> Result<()> {
-    // Pre-flight: every source must exist and no target may be occupied, so the
+    // Pre-flight: every source must exist, be unchanged since scan, and no
+    // target may be occupied (including collisions *within* the bundle), so the
     // common failure modes are caught before we touch the filesystem.
+    let mut seen_targets: HashMap<&Path, &Path> = HashMap::new();
     for member in &bundle.members {
         if !member.original_path.exists() {
             return Err(anyhow!(
@@ -256,16 +281,36 @@ async fn apply_file_set_bundle(
                 member.original_path.display()
             ));
         }
+        verify_unchanged(&member.original_path, member.content_hash.as_deref())?;
         if member.proposed_path.exists() {
             return Err(anyhow!(
                 "refusing to overwrite existing target: {}",
                 member.proposed_path.display()
             ));
         }
+        if let Some(other) = seen_targets.insert(&member.proposed_path, &member.original_path) {
+            return Err(anyhow!(
+                "two bundle members target the same path {}: {} and {}",
+                member.proposed_path.display(),
+                other.display(),
+                member.original_path.display(),
+            ));
+        }
     }
     if dry_run {
         return Ok(());
     }
+
+    // Write-ahead journal for crash consistency: mark the bundle applied BEFORE
+    // moving any member. A hard kill mid-loop then leaves the bundle marked
+    // applied with only some members shelved+moved; rollback enumerates the
+    // bundle (because it is applied), restores the moved members from their
+    // shelf records, and skips members that were never shelved (still at their
+    // origin). Without this write-ahead mark, a crash before the final
+    // mark_bundle_applied would strand moved members that rollback could never
+    // reach. Caught (non-crash) failures still reverse in-process below and
+    // undo the mark, preserving apply-time atomicity for the common case.
+    deps.change_log.mark_bundle_applied(bundle.id).await?;
 
     // Completed (dst, src) moves, for reverse-on-failure rollback (LIFO).
     let mut moved: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
@@ -276,18 +321,19 @@ async fn apply_file_set_bundle(
         let indexed = indexed_stub(&src, member.file_id.clone())?;
         if let Err(e) = deps.backup_store.shelve(&indexed, member.id).await {
             reverse_moves(&moved);
+            let _ = deps.change_log.mark_bundle_unshelved(bundle.id).await;
             return Err(e).with_context(|| format!("shelving {}", src.display()));
         }
 
         if let Err(e) = ensure_parent(&dst).and_then(|()| move_path(&src, &dst)) {
             reverse_moves(&moved);
+            let _ = deps.change_log.mark_bundle_unshelved(bundle.id).await;
             return Err(e)
                 .with_context(|| format!("moving {} -> {}", src.display(), dst.display()));
         }
         moved.push((dst, src));
     }
 
-    deps.change_log.mark_bundle_applied(bundle.id).await?;
     Ok(())
 }
 
@@ -445,6 +491,91 @@ fn verify_tree(src: &Path, dst: &Path) -> anyhow::Result<()> {
 fn blake3_of(path: &Path) -> anyhow::Result<String> {
     let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
     Ok(blake3::hash(&bytes).to_hex().to_string())
+}
+
+/// Streaming BLAKE3 of a file, hex-encoded. Reads in fixed-size chunks so a
+/// multi-GB file never lands in memory at once. Produces the same digest as
+/// [`blake3_of`] (BLAKE3 is chunking-independent).
+fn blake3_stream(path: &Path) -> anyhow::Result<String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .with_context(|| format!("read {}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// TOCTOU guard for apply: re-hash `source` and confirm it still matches the
+/// digest captured when the proposal was built. A file edited or replaced in
+/// the review gap is refused rather than moved under a stale classification.
+/// `expected == None` (hash couldn't be computed at scan time) skips the check.
+fn verify_unchanged(source: &Path, expected: Option<&str>) -> anyhow::Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    // Stream the re-hash so verifying a multi-GB file doesn't slurp it into RAM.
+    let actual = blake3_stream(source).with_context(|| {
+        format!(
+            "re-hashing {} for apply-time verification",
+            source.display()
+        )
+    })?;
+    if actual != expected {
+        return Err(anyhow!(
+            "source changed since it was reviewed (content hash mismatch): {} — \
+             re-scan before applying",
+            source.display(),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse an apply where two approved decisions resolve to the same target
+/// path. Applying them in sequence would clobber whichever landed first; this
+/// catches it before any filesystem mutation. Only `Approve`/`Override`
+/// contribute a target — `Reject` moves nothing.
+fn check_no_duplicate_targets(
+    decisions: &[ReviewDecision],
+    by_id: &HashMap<Uuid, &ChangeProposal>,
+) -> Result<()> {
+    let mut seen: HashMap<&Path, Uuid> = HashMap::new();
+    for decision in decisions {
+        let (id, target): (Uuid, &Path) = match decision {
+            ReviewDecision::Approve(id) => {
+                let Some(p) = by_id.get(id) else { continue };
+                (*id, p.proposed_path.as_path())
+            }
+            ReviewDecision::Override {
+                proposal_id,
+                new_target,
+            } => {
+                // Mirror the apply loop, which skips Overrides whose id doesn't
+                // match a proposal — such a decision moves nothing, so it can't
+                // collide with anything.
+                if !by_id.contains_key(proposal_id) {
+                    continue;
+                }
+                (*proposal_id, new_target.as_path())
+            }
+            ReviewDecision::Reject(_) => continue,
+        };
+        if let Some(other) = seen.insert(target, id) {
+            return Err(anyhow!(
+                "two approved changes target the same path {} (proposals {other} and {id}); \
+                 refusing to apply to avoid overwriting one with the other",
+                target.display(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn ensure_parent(target: &Path) -> anyhow::Result<()> {
@@ -642,6 +773,7 @@ mod tests {
                 shelved_at: chrono::Utc::now(),
                 unshelved_at: None,
                 status: tidyup_domain::BackupStatus::Shelved,
+                content_hash: None,
             })
         }
         async fn shelve_bundle(
@@ -658,6 +790,7 @@ mod tests {
                 shelved_at: chrono::Utc::now(),
                 unshelved_at: None,
                 status: tidyup_domain::BackupStatus::Shelved,
+                content_hash: None,
             })
         }
         async fn restore(&self, _record: &tidyup_domain::BackupRecord) -> CoreResult<()> {
@@ -668,6 +801,13 @@ mod tests {
             _change_id: Uuid,
         ) -> CoreResult<Option<tidyup_domain::BackupRecord>> {
             Ok(None)
+        }
+        async fn precheck_restore(
+            &self,
+            _record: &tidyup_domain::BackupRecord,
+            _destination: &Path,
+        ) -> CoreResult<tidyup_domain::RestorePrecheck> {
+            Ok(tidyup_domain::RestorePrecheck::Ready)
         }
         async fn prune_older_than_days(&self, _days: u32) -> CoreResult<usize> {
             Ok(0)
@@ -695,6 +835,7 @@ mod tests {
             bundle_id: None,
             classification_confidence: Some(0.95),
             rename_mismatch_score: None,
+            content_hash: None,
         }
     }
 
@@ -795,6 +936,127 @@ mod tests {
         assert_eq!(report.skipped, 1);
         assert!(src.exists());
         assert!(!dst.exists());
+    }
+
+    #[tokio::test]
+    async fn apply_aborts_when_source_changed_since_scan() {
+        // Proposal carries the scan-time hash of "before"; the file is edited to
+        // "after edit" before apply. The TOCTOU guard must refuse the move.
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("doc.txt");
+        std::fs::write(&src, b"before").unwrap();
+        let dst = dir.path().join("out/doc.txt");
+
+        let mut proposal = sample_proposal(src.clone(), &dst);
+        proposal.content_hash = Some(blake3::hash(b"before").to_hex().to_string());
+        // The user edits the file after review.
+        std::fs::write(&src, b"after edit").unwrap();
+
+        let deps = ExecutorDeps {
+            change_log: &RecordingLog::new(),
+            backup_store: &NoopBackup::new(),
+            progress: &NullProgress,
+        };
+        let decisions = vec![ReviewDecision::Approve(proposal.id)];
+        let report = apply_loose_decisions(&[proposal], &decisions, &deps, false)
+            .await
+            .unwrap();
+
+        assert_eq!(report.failed, 1, "changed source must fail apply");
+        assert_eq!(report.applied, 0);
+        assert!(src.exists(), "the edited source is left in place");
+        assert!(!dst.exists(), "nothing moved");
+        assert_eq!(std::fs::read(&src).unwrap(), b"after edit");
+    }
+
+    #[tokio::test]
+    async fn apply_proceeds_when_source_unchanged() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("doc.txt");
+        std::fs::write(&src, b"stable").unwrap();
+        let dst = dir.path().join("out/doc.txt");
+
+        let mut proposal = sample_proposal(src.clone(), &dst);
+        proposal.content_hash = Some(blake3::hash(b"stable").to_hex().to_string());
+
+        let deps = ExecutorDeps {
+            change_log: &RecordingLog::new(),
+            backup_store: &NoopBackup::new(),
+            progress: &NullProgress,
+        };
+        let decisions = vec![ReviewDecision::Approve(proposal.id)];
+        let report = apply_loose_decisions(&[proposal], &decisions, &deps, false)
+            .await
+            .unwrap();
+
+        assert_eq!(report.applied, 1, "unchanged source applies normally");
+        assert!(dst.exists());
+    }
+
+    #[tokio::test]
+    async fn apply_refuses_duplicate_destinations() {
+        // Two approved proposals resolve to the SAME target — refuse the whole
+        // apply before moving either, so neither clobbers the other.
+        let dir = TempDir::new().unwrap();
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        std::fs::write(&a, b"aaa").unwrap();
+        std::fs::write(&b, b"bbb").unwrap();
+        let shared_dst = dir.path().join("out/merged.txt");
+
+        let pa = sample_proposal(a.clone(), &shared_dst);
+        let pb = sample_proposal(b.clone(), &shared_dst);
+        let deps = ExecutorDeps {
+            change_log: &RecordingLog::new(),
+            backup_store: &NoopBackup::new(),
+            progress: &NullProgress,
+        };
+        let decisions = vec![
+            ReviewDecision::Approve(pa.id),
+            ReviewDecision::Approve(pb.id),
+        ];
+        let err = apply_loose_decisions(&[pa, pb], &decisions, &deps, false)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("same path"),
+            "expected duplicate-destination error, got: {err}"
+        );
+        // Nothing moved — both sources remain.
+        assert!(a.exists() && b.exists());
+        assert!(!shared_dst.exists());
+    }
+
+    #[tokio::test]
+    async fn override_target_collision_is_detected() {
+        // A default target and an Override that collide are also caught.
+        let dir = TempDir::new().unwrap();
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        std::fs::write(&a, b"aaa").unwrap();
+        std::fs::write(&b, b"bbb").unwrap();
+        let dst_a = dir.path().join("out/a.txt");
+        let dst_b = dir.path().join("out/b.txt");
+
+        let pa = sample_proposal(a.clone(), &dst_a);
+        let pb = sample_proposal(b.clone(), &dst_b);
+        let deps = ExecutorDeps {
+            change_log: &RecordingLog::new(),
+            backup_store: &NoopBackup::new(),
+            progress: &NullProgress,
+        };
+        // Override pb onto pa's target.
+        let decisions = vec![
+            ReviewDecision::Approve(pa.id),
+            ReviewDecision::Override {
+                proposal_id: pb.id,
+                new_target: dst_a.clone(),
+            },
+        ];
+        let err = apply_loose_decisions(&[pa, pb], &decisions, &deps, false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("same path"), "got: {err}");
     }
 
     #[tokio::test]
@@ -1029,6 +1291,118 @@ mod tests {
         assert!(src1.exists() && src2.exists(), "no member may move");
         assert!(!dst1.exists(), "first target must stay untouched");
         assert_eq!(std::fs::read(&dst2).unwrap(), b"existing");
+    }
+
+    #[tokio::test]
+    async fn apply_file_set_bundle_reverses_completed_moves_on_mid_bundle_failure() {
+        // Member 1 moves cleanly; member 2's move fails mid-bundle (its target
+        // parent is occupied by a regular file, so create_dir_all errors). The
+        // executor must reverse the completed move so no partial bundle state
+        // survives — member 1 is back at its origin.
+        let dir = TempDir::new().unwrap();
+        let src1 = dir.path().join("IMG_001.jpg");
+        let src2 = dir.path().join("IMG_002.jpg");
+        std::fs::write(&src1, b"one").unwrap();
+        std::fs::write(&src2, b"two").unwrap();
+        let dst1 = dir.path().join("out/IMG_001.jpg");
+        // src2's destination sits under a path that is a FILE, not a dir.
+        let blocker = dir.path().join("blocked");
+        std::fs::write(&blocker, b"i am a file").unwrap();
+        let dst2 = blocker.join("sub/IMG_002.jpg");
+
+        let members = vec![
+            sample_proposal(src1.clone(), &dst1),
+            sample_proposal(src2.clone(), &dst2),
+        ];
+        let bundle = file_set_bundle(members, dir.path().join("out"));
+        let shelf = NoopBackup::new();
+        let deps = ExecutorDeps {
+            change_log: &RecordingLog::new(),
+            backup_store: &shelf,
+            progress: &NullProgress,
+        };
+
+        let report = apply_bundles(std::slice::from_ref(&bundle), &[bundle.id], &deps, false)
+            .await
+            .unwrap();
+
+        assert_eq!(report.bundles_failed, 1, "the bundle apply fails");
+        assert_eq!(report.bundles_applied, 0);
+        // All-or-nothing: member 1's completed move was reversed.
+        assert!(src1.exists(), "member 1 must be restored to its origin");
+        assert!(!dst1.exists(), "member 1's destination must be undone");
+        assert!(src2.exists(), "member 2 never moved");
+        assert_eq!(std::fs::read(&src1).unwrap(), b"one");
+        // Both were shelved before their moves, so rollback could also recover.
+        let shelved = shelf.shelved.lock().unwrap().clone();
+        assert!(shelved.contains(&bundle.members[0].id));
+    }
+
+    #[tokio::test]
+    async fn apply_file_set_bundle_refuses_two_members_targeting_same_path() {
+        // Within-bundle duplicate-target guard: two members resolve to the same
+        // destination. Pre-flight must refuse before moving anything.
+        let dir = TempDir::new().unwrap();
+        let src1 = dir.path().join("a.jpg");
+        let src2 = dir.path().join("b.jpg");
+        std::fs::write(&src1, b"a").unwrap();
+        std::fs::write(&src2, b"b").unwrap();
+        let shared = dir.path().join("out/dup.jpg");
+
+        let members = vec![
+            sample_proposal(src1.clone(), &shared),
+            sample_proposal(src2.clone(), &shared),
+        ];
+        let bundle = file_set_bundle(members, dir.path().join("out"));
+        let deps = ExecutorDeps {
+            change_log: &RecordingLog::new(),
+            backup_store: &NoopBackup::new(),
+            progress: &NullProgress,
+        };
+        let report = apply_bundles(std::slice::from_ref(&bundle), &[bundle.id], &deps, false)
+            .await
+            .unwrap();
+
+        assert_eq!(report.bundles_failed, 1);
+        assert_eq!(report.bundles_applied, 0);
+        // Nothing moved — pre-flight caught it before any filesystem mutation.
+        assert!(src1.exists() && src2.exists());
+        assert!(!shared.exists());
+    }
+
+    #[tokio::test]
+    async fn apply_file_set_bundle_aborts_when_a_member_changed_since_scan() {
+        // Member-level TOCTOU: one member carries a scan-time hash; its file is
+        // edited before apply. Pre-flight must refuse the whole bundle.
+        let dir = TempDir::new().unwrap();
+        let src1 = dir.path().join("a.jpg");
+        let src2 = dir.path().join("b.jpg");
+        std::fs::write(&src1, b"a-before").unwrap();
+        std::fs::write(&src2, b"b").unwrap();
+        let dst1 = dir.path().join("out/a.jpg");
+        let dst2 = dir.path().join("out/b.jpg");
+
+        let mut m1 = sample_proposal(src1.clone(), &dst1);
+        m1.content_hash = Some(blake3::hash(b"a-before").to_hex().to_string());
+        let m2 = sample_proposal(src2.clone(), &dst2);
+        // The user edits member 1 after review.
+        std::fs::write(&src1, b"a-EDITED").unwrap();
+
+        let bundle = file_set_bundle(vec![m1, m2], dir.path().join("out"));
+        let deps = ExecutorDeps {
+            change_log: &RecordingLog::new(),
+            backup_store: &NoopBackup::new(),
+            progress: &NullProgress,
+        };
+        let report = apply_bundles(std::slice::from_ref(&bundle), &[bundle.id], &deps, false)
+            .await
+            .unwrap();
+
+        assert_eq!(report.bundles_failed, 1, "changed member fails the bundle");
+        assert_eq!(report.bundles_applied, 0);
+        // All-or-nothing: neither member moved.
+        assert!(src1.exists() && src2.exists());
+        assert!(!dst1.exists() && !dst2.exists());
     }
 
     #[tokio::test]
