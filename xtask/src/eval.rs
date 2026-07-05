@@ -151,11 +151,26 @@ struct Report {
 /// Propagates corpus-loading, model-loading, or classification failures.
 #[allow(unreachable_pub)]
 pub fn run(json: bool, no_model: bool, calibrate: bool) -> Result<()> {
+    let started = std::time::Instant::now();
     let dir = corpus_dir();
     let entries = load_manifest(&dir)?;
     let use_model = !no_model && verify_default_model().is_ok();
+    // Per-phase timing to stderr (keeps --json stdout clean) so a slow or hung
+    // run is diagnosable instead of just timing out opaquely.
+    eprintln!(
+        "[eval] {} corpus entries; model={} ({:?} elapsed)",
+        entries.len(),
+        if use_model { "on" } else { "off" },
+        started.elapsed(),
+    );
 
+    let classify_start = std::time::Instant::now();
     let outcomes = classify_corpus(&dir, &entries, use_model)?;
+    eprintln!(
+        "[eval] classification done in {:?} (total {:?})",
+        classify_start.elapsed(),
+        started.elapsed(),
+    );
     let mut report = summarize(&outcomes);
     if calibrate {
         report.calibration = Some(compute_calibration(&outcomes));

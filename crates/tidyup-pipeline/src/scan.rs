@@ -370,7 +370,10 @@ async fn classify_file(
         return Ok(None);
     };
 
-    let embedding = embeddings.embed_text(text).await?;
+    // Embed the canonical Tier-2 query (filename + body) — the same construction
+    // the offline eval uses, so the eval measures this shipped path.
+    let query = tidyup_domain::classification_query(text, &filename);
+    let embedding = embeddings.embed_text(&query).await?;
     let (best_idx, best_score, gap) = best_match(&embedding, candidates);
     if best_idx.is_none() {
         return Ok(None);
@@ -414,12 +417,18 @@ async fn classify_file(
     let metadata_json = extracted
         .as_ref()
         .map_or(serde_json::Value::Null, |e| e.metadata.clone());
+    // Rename gate is driven by Tier 2's confidence (`best_score`), NOT the
+    // post-Tier-3 rerank score (`chosen_score`). Tier 3 only fires when Tier 2
+    // was uncertain, and it can only raise the score — feeding `chosen_score`
+    // here would let a Tier-3 reroute clear the rename threshold, producing a
+    // rename off the back of an LLM reroute. Gating on Tier 2 keeps the
+    // invariant "Tier 3 reroutes never produce renames" (see CLAUDE.md).
     let rename = gate_rename(
         path,
         &metadata_json,
         &keywords,
         year,
-        chosen_score,
+        best_score,
         embeddings,
         Some(text),
         &filename,
@@ -449,7 +458,8 @@ async fn classify_file(
         year,
         temporal: candidate.temporal,
         rename: rename.proposal,
-        classification_confidence: Some(chosen_score),
+        // The Tier-2 sub-score that gated the rename (not the Tier-3 rerank).
+        classification_confidence: Some(best_score),
         rename_mismatch_score: rename.mismatch_score,
     }))
 }
@@ -742,7 +752,7 @@ fn year_from_path_and_text(path: &Path, text: Option<&str>) -> Option<i32> {
     if let Some(y) = find_year(filename) {
         return Some(y);
     }
-    text.and_then(|t| find_year(&t[..t.len().min(1000)]))
+    text.and_then(|t| find_year(crate::text_util::char_prefix(t, 1000)))
 }
 
 fn find_year(s: &str) -> Option<i32> {
@@ -1290,6 +1300,22 @@ mod tests {
     }
 
     #[test]
+    fn year_extraction_does_not_panic_on_multibyte_text() {
+        // The 1000-byte content truncation must land on a char boundary. A
+        // string of 3-byte codepoints puts byte 1000 mid-character, which a
+        // naive `&text[..1000]` would panic on. Also exercise a non-ASCII path.
+        let filler = "字".repeat(400); // 1200 bytes; byte 1000 lands mid-codepoint
+                                       // Year is within the first 1000 bytes; the multibyte filler pushes the
+                                       // truncation boundary into the middle of a codepoint.
+        let text = format!("tax year 2021 {filler}");
+        let path = PathBuf::from("/inbox/écritureΩ/문서.txt");
+        // Must not panic; the in-window year is found despite the multibyte body.
+        assert_eq!(year_from_path_and_text(&path, Some(&text)), Some(2021));
+        // A purely multibyte body with no year returns None, still no panic.
+        assert_eq!(year_from_path_and_text(&path, Some(&filler)), None);
+    }
+
+    #[test]
     fn bundle_taxonomy_maps_each_kind() {
         assert_eq!(bundle_taxonomy(&BundleKind::RustCrate), "Code/Projects/");
         assert_eq!(bundle_taxonomy(&BundleKind::NodeProject), "Code/Projects/");
@@ -1431,6 +1457,71 @@ mod tests {
             p.proposed_path.to_string_lossy().contains("Finance"),
             "expected Finance route, got {:?}",
             p.proposed_path,
+        );
+    }
+
+    #[tokio::test]
+    async fn tier3_reroute_gates_rename_on_tier2_confidence_not_rerank() {
+        // Regression: the rename gate must be driven by Tier 2's confidence, not
+        // the post-Tier-3 rerank score. Tier 3 only fires when Tier 2 was
+        // uncertain and can only raise the routing score — so a rerouted file
+        // must never earn a rename. With the pre-fix wiring (feeding the boosted
+        // `chosen_score` into the gate and reporting it as
+        // `classification_confidence`), the reported gate score equalled the
+        // routing confidence; after the fix it stays the (lower) Tier-2 score.
+        let td = TempDir::new().unwrap();
+        fs::write(td.path().join("anonymous.dat"), b"x x x x x x").unwrap();
+
+        let eb = BucketEmbeddings;
+        let candidates = sample_candidates(&eb).await;
+        let ex: Vec<Arc<dyn ContentExtractor>> = vec![Arc::new(PlainExtractor)];
+        let cfg = ClassifierConfig {
+            embedding_threshold: 0.99,
+            ambiguity_gap: 0.50,
+            enable_llm_fallback: true,
+            ..ClassifierConfig::default()
+        };
+        let llm = StubTextBackend {
+            category: "",
+            tags: vec![],
+            summary: "tax return W-2 1099 1040 IRS refund withholding",
+        };
+
+        let out = run_scan(
+            td.path(),
+            td.path(),
+            &candidates,
+            &eb,
+            &MultimodalContext::default(),
+            Some(&llm),
+            &ex,
+            &cfg,
+            &NullProgress,
+        )
+        .await
+        .unwrap();
+
+        let p = &out.proposals[0];
+        assert!(
+            p.reasoning.contains("tier3 llm-rerank"),
+            "precondition: Tier 3 must have rerouted, got {}",
+            p.reasoning,
+        );
+        // The rename-gate score is Tier 2's, strictly below the boosted routing
+        // confidence — this is the crux of the fix.
+        let gate_score = p.classification_confidence.unwrap();
+        assert!(
+            gate_score < p.confidence,
+            "rename gate score {gate_score} must be the (lower) Tier-2 score, \
+             not the boosted routing confidence {}",
+            p.confidence,
+        );
+        // A Tier-3 reroute never produces a rename (Tier 2 was uncertain, so the
+        // gate's classification-confidence threshold can't be met).
+        assert_eq!(
+            p.change_type,
+            ChangeType::Move,
+            "Tier-3 reroute must not produce a rename"
         );
     }
 

@@ -79,15 +79,15 @@ This is a portfolio project and a personal tool. It is also a statement: useful 
 
 ## What it does
 
-- **Indexes a directory** into a local SQLite database with BLAKE3 content hashing and dedup. Identical contents are classified once, regardless of how many copies exist.
+- **Hashes file contents with BLAKE3** and logs every proposal, move, and backup to a local SQLite database, so each run is reviewable and reversible. (Content-addressed dedup — classifying identical contents once no matter how many copies exist — is planned, not yet wired: each loose file is currently classified independently.)
 - **Detects logical groupings first.** Coding projects, photo bursts, music albums, Jupyter notebook sets, document series — tidyup recognizes these as bundles via structural markers (`.git/`, `Cargo.toml`, `package.json`, consistent EXIF timestamps, matching ID3 album tags, etc.) and moves them as atomic units. A coding project is never shredded; either the whole tree relocates or nothing does.
 - **Classifies each loose file by its contents** via a three-tier cascade, cheapest first:
   1. **Heuristics** (~1ms) — extension, MIME, keyword rules.
   2. **Embeddings** (~50ms, default) — cosine similarity against learned target-folder profiles via `bge-small-en-v1.5` on ONNX Runtime. Deterministic, auditable, offline.
   3. **Local LLM fallback** (1–10s, optional) — available only with `--features llm-fallback`, off by default. When Tier 2 lands in the review zone, the LLM classifies the content; its `summary + category + tags` is re-embedded and re-ranked against the same candidate list. The LLM-reranked top is adopted only if it scores higher than Tier 2's. Renames stay extractive — the LLM's `suggested_name` is deliberately ignored. Default builds exclude this tier entirely; low-confidence files surface directly to review.
 - **Proposes a destination folder** — with a plain-English reason.
-- **Proposes a rename** when filename and contents disagree — using two tunable signals (classification confidence × filename-content mismatch). Renames never auto-apply even with `--yes`; they always go through explicit review.
-- **Shows you a diff-style review UI** — approve, edit, or reject per file or per bundle.
+- **Proposes a rename** when filename and contents disagree — using two tunable signals (classification confidence × filename-content mismatch). Renames never auto-apply: even `--yes` auto-rejects them, so approving a rename requires an interactive review run.
+- **Shows you a diff-style review UI** — approve or reject per file or per bundle.
 - **Backs up originals before moving** — restore anything, anytime.
 
 Two modes:
@@ -192,7 +192,7 @@ Nothing moves without your approval — every run proposes changes you review fi
 # See what tidyup would do to a messy folder against the built-in taxonomy — no changes made.
 tidyup scan ~/Downloads --dry-run
 
-# Drop --dry-run to generate proposals and review them interactively (approve / edit / reject).
+# Drop --dry-run to generate proposals and review them interactively (approve / reject).
 tidyup scan ~/Downloads
 
 # Sort a source folder into an existing target hierarchy whose structure tidyup learns.
@@ -211,7 +211,7 @@ tidyup prune --days 30
 tidyup config
 ```
 
-Global flags: `--dry-run` (propose only), `--yes` (auto-approve *moves* above the confidence threshold — renames still always surface for review), and `--json` (machine-readable events for scripting). `--llm-fallback` / `--remote` activate the optional Tier 3 backends (see [Privacy guarantees](#privacy-guarantees)). The loop is always **dry-run → review → apply → reversible**.
+Flags: `--yes`, `--json`, `--llm-fallback`, and `--remote` are **global** (accepted in any position); `--dry-run` (propose only) is a per-command flag on `scan` and `migrate`. `--yes` auto-approves *moves* above the confidence threshold but never renames — it auto-rejects them, so approving a rename needs an interactive run. `--json` emits machine-readable events for scripting; `--llm-fallback` / `--remote` activate the optional Tier 3 backends (see [Privacy guarantees](#privacy-guarantees)). The loop is always **dry-run → review → apply → reversible**.
 
 ---
 
@@ -229,7 +229,8 @@ tiers = ["heuristics", "embeddings"]   # tier cascade order; "llm" is added only
 min_confidence = 0.75                  # fallback auto-classify threshold for the composite score
 
 [inference]
-backends = ["embeddings-ort"]          # ordered backend IDs; "embeddings-ort" is the always-on default
+backends = ["embeddings-ort"]          # reserved: parsed for forward-compat but not yet consulted; the
+                                       # context builder selects Tier 3 via llm_fallback / [inference.remote]
 llm_fallback = false                   # gate (b) for Tier 3 LLM fallback; still needs the feature + flag
 
 # [inference.remote]                    # only consulted under --features remote + --remote / TIDYUP_REMOTE=1

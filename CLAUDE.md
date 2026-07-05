@@ -105,7 +105,7 @@ Two patterns are architectural contracts, not suggestions:
 
 1. **Frontend seam.** `tidyup-app` services take `&dyn ProgressReporter` and `&dyn ReviewHandler`. Never embed a frontend impl in a service. Two live implementations already exercise this seam — `tidyup-cli` (indicatif + interactive prompts) and `tidyup-ui` (Dioxus signal-backed progress + oneshot-channel review). Adding another frontend (web, TUI, MCP) = implementing two traits; it must not require a service-layer refactor. Note that `SyncStorage`-backed signals are the UI-side requirement to satisfy `Send + Sync` on those trait objects.
 
-2. **Inference backend registry.** Backends register by capability at runtime, driven by `InferenceConfig.backends` (ordered list of IDs: `"embeddings-ort"` (default), `"mistralrs"`, `"remote-openai"`, `"remote-anthropic"`, `"remote-ollama"`). Runtime *selection* is config-driven — not a cargo feature flag. Adding a backend: new `tidyup-inference-*` crate + implement `TextBackend`/`VisionBackend`/`EmbeddingBackend` + register. No pipeline/app changes.
+2. **Inference backend registry.** Backends are *intended* to register by capability at runtime, driven by `InferenceConfig.backends` (ordered list of IDs: `"embeddings-ort"` (default), `"mistralrs"`, `"remote-openai"`, `"remote-anthropic"`, `"remote-ollama"`). **Reserved, not yet wired:** the `backends` list is read by serde for forward-compat but the context builder does not consult it — it selects Tier 3 directly from the `llm_fallback` bool / `[inference.remote]` section (see `ARCHITECTURE.md`). Runtime *selection* is config-driven — not a cargo feature flag. Adding a backend: new `tidyup-inference-*` crate + implement `TextBackend`/`VisionBackend`/`EmbeddingBackend` + register. No pipeline/app changes.
 
 Storage follows the same shape (`FileIndex`/`ChangeLog`/`BackupStore`/`RunLog` are traits, sqlite is the default impl) but we don't expect alternates pre-v0.1.
 
@@ -122,7 +122,7 @@ Verification: `cargo tree -p tidyup-cli -e normal | grep -E 'reqwest|hyper|rustl
 **Remote inference (`--features remote`)**
 
 1. *Compile-time:* build with `--features remote` to include `tidyup-inference-remote` in the dependency graph.
-2. *Runtime:* `[inference] backends = ["remote-..."]` in config TOML, plus an explicit `--remote` flag or `TIDYUP_REMOTE=1` env var per invocation.
+2. *Runtime:* an `[inference.remote]` section in config TOML, plus an explicit `--remote` flag or `TIDYUP_REMOTE=1` env var per invocation. (Only the OpenAI-compatible endpoint is wired from config today; the `Anthropic`/`Ollama` `RemoteEndpoint` variants exist in `tidyup-inference-remote` but aren't yet selectable — see `README.md`.)
 
 **LLM fallback (`--features llm-fallback`)**
 
@@ -169,7 +169,7 @@ Both produce `ChangeProposal`s and `BundleProposal`s that flow through the same 
 
 2. **Migration mode** (`tidyup-pipeline::migration`) — classify against an *existing* target hierarchy. Same tier cascade: heuristic+date routing, then batch embeddings against pre-built `FolderProfile`s, with optional Tier 3 LLM fallback under the same feature gate. The profiler builds each folder's text `content_centroid` from its documents; when the SigLIP/CLAP bundles are present it also builds `image_centroid`/`audio_centroid`s, and source files route against the centroid in their own latent space. Review is the primary safety net for low-confidence cases; `--llm-fallback` is the remedy for cold-start (empty target hierarchy) and pathological-extraction workflows.
 
-**Hash-based dedup** is a first-class pipeline concept, not an optimization. `FileIndex` is keyed by `ContentHash`; classification happens once per unique content hash and applies to every path sharing it. Real-world dedup on a home directory is 15–30% — worth enforcing in the schema, not bolting on later.
+**Hash-based dedup** is a *planned* pipeline concept, not yet wired. The `files` table stores a BLAKE3 `content_hash` (indexed, non-unique) but is keyed by `path`(unique)/`id`, and `FileIndex` exposes no by-hash lookup. The scan/migration pipelines currently classify each loose file independently and do **not** populate or read `FileIndex` (`index_directory` is exercised only in tests). The per-proposal `ChangeProposal.content_hash` exists solely for the apply-time TOCTOU guard. Real-world dedup on a home directory is 15–30%, so classify-once-per-unique-hash is worth building — but don't claim it works until the pipeline actually groups by hash.
 
 ## Safety model — invariants
 
@@ -198,7 +198,7 @@ Both produce `ChangeProposal`s and `BundleProposal`s that flow through the same 
 - **Models must load sequentially.** Qwen3 + embedding model concurrent load OOMs on 8GB machines. Onboarding flows await models in a single-threaded chain, not `tokio::join!`.
 - **Dev profile runs deps at `opt-level=2`, main crate at 0.** Debug-mode inference is otherwise unusable.
 - **Taxonomy embedding cache invalidates by hash of taxonomy text**, not by version number.
-- **`ProfileCache` is keyed by target root** and rebuilds incrementally via `ScanDiff` against `FolderMetadata.content_hash`. Not by timestamp.
+- **`ProfileCache` carries a `target_root` field** but is currently rebuilt in full on every migration run — not persisted to disk, not looked up by root, not incrementally rebuilt. `ScanDiff` / `diff_scans` (comparing BLAKE3 `FolderMetadata.content_hash`, not timestamps) exist and are unit-tested but are not yet called in production. Incremental rebuild is future work — don't claim it's wired.
 
 ## Tier 3 LLM fallback
 

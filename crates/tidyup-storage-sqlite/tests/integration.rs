@@ -9,10 +9,10 @@ use std::path::PathBuf;
 
 use chrono::Utc;
 use tempfile::TempDir;
-use tidyup_core::storage::{BackupStore, ChangeLog, FileIndex};
+use tidyup_core::storage::{BackupStore, ChangeLog, FileIndex, RunLog};
 use tidyup_domain::{
     BackupStatus, BundleKind, BundleProposal, ChangeProposal, ChangeStatus, ChangeType,
-    ContentHash, FileId, IndexedFile,
+    ContentHash, FileId, IndexedFile, RunMode, RunRecord,
 };
 use tidyup_storage_sqlite::SqliteStore;
 use uuid::Uuid;
@@ -117,6 +117,59 @@ async fn proposal_content_hash_round_trips_through_pending() {
         Some("af1349b9f5f9a1a6a0404dea36dcc949"),
         "scan-time content hash must survive a persist + reload"
     );
+}
+
+#[tokio::test]
+async fn mark_rejected_removes_proposal_from_pending() {
+    let dir = TempDir::new().unwrap();
+    let store = new_store(&dir);
+
+    let p = sample_proposal("/src/a.pdf", "/docs/a.pdf", None);
+    store.record_proposal(&p, None).await.unwrap();
+    assert_eq!(store.pending().await.unwrap().len(), 1, "starts pending");
+
+    store.mark_rejected(p.id).await.unwrap();
+    assert!(
+        store.pending().await.unwrap().is_empty(),
+        "a rejected proposal must leave the pending set"
+    );
+
+    // Idempotent + status-specific: re-rejecting is a no-op, and it only
+    // affects still-Pending rows (never re-visits a persisted row).
+    store.mark_rejected(p.id).await.unwrap();
+    assert!(store.pending().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn mark_rejected_does_not_override_applied() {
+    let dir = TempDir::new().unwrap();
+    let store = new_store(&dir);
+
+    // Tie the proposal to a run so we can observe its Applied state directly via
+    // applied_proposals_for_run — pending() emptiness alone can't distinguish
+    // Applied from a wrongly-flipped Rejected, so it wouldn't catch a dropped
+    // `WHERE status = 'Pending'` guard.
+    let run = RunRecord::begin(RunMode::Scan, "/src".into(), None);
+    store.record_run(&run).await.unwrap();
+    let p = sample_proposal("/src/b.pdf", "/docs/b.pdf", None);
+    store.record_proposal(&p, Some(run.id)).await.unwrap();
+    store.mark_applied(p.id).await.unwrap();
+
+    // Rejecting an already-applied proposal must NOT un-apply it (the guard).
+    store.mark_rejected(p.id).await.unwrap();
+
+    // It stays Applied: rollback (applied_proposals_for_run) still finds it, and
+    // it never reappears as pending. If the guard were dropped, the row would
+    // flip Applied→Rejected and vanish from applied_proposals_for_run, so
+    // rollback would silently skip restoring the move.
+    let applied = store.applied_proposals_for_run(run.id).await.unwrap();
+    assert_eq!(
+        applied.len(),
+        1,
+        "applied proposal must remain rollback-able"
+    );
+    assert_eq!(applied[0].id, p.id);
+    assert!(store.pending().await.unwrap().is_empty());
 }
 
 #[tokio::test]

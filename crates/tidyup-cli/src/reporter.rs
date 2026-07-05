@@ -206,10 +206,53 @@ impl ProgressReporter for CliReporter {
 
 fn shorten(s: &str) -> String {
     const MAX: usize = 60;
-    if s.len() > MAX {
-        let tail_len = MAX.saturating_sub(3);
-        format!("…{}", &s[s.len() - tail_len..])
-    } else {
-        s.to_string()
+    if s.len() <= MAX {
+        return s.to_string();
+    }
+    // Keep the last ~`tail_len` bytes, but start on a char boundary so a
+    // multi-byte codepoint (accented Latin, CJK, emoji) in a path never causes
+    // a byte-slice panic. Rounding the start *up* keeps the suffix valid and
+    // no longer than the budget.
+    let tail_len = MAX.saturating_sub(3);
+    let mut start = s.len() - tail_len;
+    while !s.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("…{}", &s[start..])
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shorten_leaves_short_strings_untouched() {
+        assert_eq!(shorten("short/path.txt"), "short/path.txt");
+    }
+
+    #[test]
+    fn shorten_does_not_panic_when_tail_cut_splits_a_codepoint() {
+        // The tail keeps the last MAX-3 = 57 bytes, so the cut is at
+        // `len - 57`. With an all-2-byte string this index is odd → inside a
+        // codepoint, which the pre-fix `&s[len-57..]` would panic on. This
+        // string reproduces exactly that mid-codepoint cut.
+        let long = "é".repeat(50); // 100 bytes; len-57 = 43 (odd) → mid-codepoint
+        assert!(long.len() > 60);
+        let out = shorten(&long); // must not panic
+        assert!(out.starts_with('…'));
+        // The suffix is a valid, real tail of the original.
+        assert!(long.ends_with(out.trim_start_matches('…')));
+        // And it never exceeds the byte budget.
+        assert!(out.trim_start_matches('…').len() <= 57);
+    }
+
+    #[test]
+    fn shorten_emoji_tail_cut_is_boundary_safe() {
+        // 4-byte codepoints straddling the len-57 cut point.
+        let long = "🎉".repeat(30); // 120 bytes; len-57 = 63, 63 % 4 != 0 → mid-codepoint
+        let out = shorten(&long); // must not panic
+        assert!(out.starts_with('…'));
+        assert!(long.ends_with(out.trim_start_matches('…')));
     }
 }

@@ -180,6 +180,9 @@ impl ScanService {
         };
 
         let text_backend = self.ctx.text.as_deref();
+        // The classifier config (rename thresholds + Tier-3 activation) is
+        // materialised from the loaded TidyupConfig at context-build time; see
+        // `classifier_config_for`.
         let outcome = run_scan(
             &request.root,
             &output_root,
@@ -188,7 +191,7 @@ impl ScanService {
             &multimodal,
             text_backend,
             &self.ctx.extractors,
-            &tidyup_domain::ClassifierConfig::default(),
+            &self.ctx.classifier,
             progress,
         )
         .await?;

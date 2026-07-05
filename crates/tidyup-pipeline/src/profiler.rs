@@ -19,12 +19,14 @@
 //!   names: year/quarter/month buckets, workflow-status folders, or plain
 //!   semantic groupings.
 //!
-//! # Caching
+//! # Caching (planned)
 //!
-//! The profile cache invalidates by `FolderMetadata.content_hash`, not by
-//! timestamp — consistent with the rule in `CLAUDE.md`. A
-//! [`ScanDiff`](tidyup_domain::migration::ScanDiff) computed against a prior
-//! scan tells callers which profiles need rebuilding.
+//! `diff_scans` computes a [`ScanDiff`](tidyup_domain::migration::ScanDiff)
+//! by comparing `FolderMetadata.content_hash` (BLAKE3), not timestamps — so an
+//! incremental profiler could rebuild only changed folders. That machinery is
+//! implemented and unit-tested but **not yet wired**: the migration service
+//! currently rebuilds every profile on each run. Incremental caching is future
+//! work (see `CLAUDE.md`).
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -755,7 +757,7 @@ async fn content_centroid(
             continue;
         }
         // Cap per-file text so one huge document doesn't dominate the embedding.
-        let snippet = &trimmed[..trimmed.len().min(4000)];
+        let snippet = crate::text_util::char_prefix(trimmed, 4000);
         match embeddings.embed_text(snippet).await {
             Ok(vec) => acc.add(&vec, path),
             Err(e) => {

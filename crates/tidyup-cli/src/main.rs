@@ -50,16 +50,23 @@ struct Cli {
     /// at build time, `[inference] llm_fallback = true` in config, and this
     /// flag (or `TIDYUP_LLM_FALLBACK=1`) at invocation. Default builds and
     /// default invocations remain LLM-silent.
-    #[arg(long, global = true, env = "TIDYUP_LLM_FALLBACK")]
+    ///
+    /// The `TIDYUP_LLM_FALLBACK` env var is read in `commands::dispatch` with a
+    /// boolish parser (`1`/`true`/`yes`/`on`) rather than via clap's `env`, so
+    /// the documented `TIDYUP_LLM_FALLBACK=1` works and a global flag with an
+    /// optional value can't swallow a following positional argument.
+    #[arg(long, global = true)]
     llm_fallback: bool,
 
-    /// Activate the remote Tier 3 backend (`OpenAI`-compatible / Anthropic /
-    /// Ollama).
+    /// Activate the remote Tier 3 backend (`OpenAI`-compatible endpoint).
     ///
     /// Power-user opt-in. Triple-gated: requires `--features remote` at
     /// build time, an `[inference.remote]` section in config, and this flag
-    /// (or `TIDYUP_REMOTE=1`) at invocation.
-    #[arg(long, global = true, env = "TIDYUP_REMOTE")]
+    /// (or `TIDYUP_REMOTE=1`) at invocation. The env var is parsed boolishly
+    /// in `commands::dispatch` (see `--llm-fallback`). Only the OpenAI-compatible
+    /// endpoint is selectable from config today; Anthropic/Ollama adapters exist
+    /// in `tidyup-inference-remote` but aren't yet wired.
+    #[arg(long, global = true)]
     remote: bool,
 }
 

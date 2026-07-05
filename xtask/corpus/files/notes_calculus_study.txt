@@ -1,0 +1,4 @@
+Calculus study notes: derivatives and integrals. The derivative measures the
+instantaneous rate of change; remember the power, product, and chain rules. The
+definite integral computes area under a curve; the fundamental theorem links the
+two. Practice problems on limits and continuity assigned for homework this week.

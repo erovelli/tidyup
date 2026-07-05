@@ -7,10 +7,11 @@
 //!
 //! The default build links neither `tidyup-inference-mistralrs` nor
 //! `tidyup-inference-remote`. When those features are compiled in, *inclusion*
-//! does not imply *activation* — config-level `llm_fallback = true` /
-//! `backends = ["remote-..."]` must still be joined with a per-invocation flag
-//! (`--llm-fallback` / `--remote` or the matching env vars). See
-//! `CLAUDE.md` → "Privacy model".
+//! does not imply *activation* — the config gate (`llm_fallback = true` for the
+//! LLM backend, an `[inference.remote]` section for the remote backend) must
+//! still be joined with a per-invocation flag (`--llm-fallback` / `--remote` or
+//! the matching env vars). The `[inference] backends` list is parsed for
+//! forward-compat but not consulted here. See `CLAUDE.md` → "Privacy model".
 //!
 //! [`InferenceActivation`] captures the per-invocation gate. The CLI parses
 //! flags + env vars and builds it before calling [`build`]. With the default
@@ -101,6 +102,12 @@ pub(crate) async fn build(
 
     let extractors = default_extractors();
 
+    // Materialise the classifier config from the loaded TidyupConfig: rename
+    // thresholds from `[rename]`, and Tier-3 activation tied to whether a text
+    // backend was wired (the three-gate model produces `Some` only under full
+    // activation).
+    let classifier = tidyup_app::classifier_config_for(config, text.is_some());
+
     Ok(Arc::new(ServiceContext {
         file_index: Arc::new(store.clone()),
         change_log: Arc::new(store.clone()),
@@ -112,6 +119,7 @@ pub(crate) async fn build(
         image_embeddings,
         audio_embeddings,
         extractors,
+        classifier,
     }))
 }
 
@@ -401,4 +409,71 @@ pub(crate) async fn build_audio_scan_candidates(
         });
     }
     Ok(out)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// The privacy-preserving default: no activation → no text backend, so
+    /// Tier 3 is never invoked.
+    #[tokio::test]
+    async fn no_activation_yields_no_text_backend() {
+        let cfg = TidyupConfig::default();
+        // `Option<Arc<dyn TextBackend>>` isn't Debug, so avoid unwrap/expect.
+        let Ok(text) = build_text_backend(&cfg, InferenceActivation::default()).await else {
+            panic!("no-activation build must succeed");
+        };
+        assert!(
+            text.is_none(),
+            "default activation must leave the text backend None"
+        );
+    }
+
+    /// Three-gate rejection (compile gate): on a build WITHOUT the
+    /// `llm-fallback` feature, requesting activation is a hard error with a
+    /// rebuild hint — never a silent no-op.
+    #[cfg(not(feature = "llm-fallback"))]
+    #[tokio::test]
+    async fn llm_activation_without_feature_is_rejected() {
+        let cfg = TidyupConfig::default();
+        let Err(err) = build_text_backend(
+            &cfg,
+            InferenceActivation {
+                llm_fallback: true,
+                remote: false,
+            },
+        )
+        .await
+        else {
+            panic!("activating llm-fallback without the feature must error");
+        };
+        assert!(
+            err.to_string().contains("llm-fallback"),
+            "error must name the missing feature: {err}"
+        );
+    }
+
+    /// Same compile-gate rejection for `--remote` on a non-remote build.
+    #[cfg(not(feature = "remote"))]
+    #[tokio::test]
+    async fn remote_activation_without_feature_is_rejected() {
+        let cfg = TidyupConfig::default();
+        let Err(err) = build_text_backend(
+            &cfg,
+            InferenceActivation {
+                llm_fallback: false,
+                remote: true,
+            },
+        )
+        .await
+        else {
+            panic!("activating remote without the feature must error");
+        };
+        assert!(
+            err.to_string().contains("remote"),
+            "error must name the missing feature: {err}"
+        );
+    }
 }

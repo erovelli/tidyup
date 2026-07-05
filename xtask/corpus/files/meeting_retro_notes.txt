@@ -1,0 +1,4 @@
+Retrospective notes. What went well: on-time release, good incident response.
+What could improve: too many context switches, unclear ticket ownership.
+Action items agreed: introduce a review rotation, cap work in progress, add a
+weekly triage meeting. Facilitator to track follow-ups before the next retro.

@@ -1,0 +1,4 @@
+Professional resume. Summary: Senior software engineer with 8 years building
+distributed systems. Experience: Staff Engineer at Acme, led a team of 6,
+shipped a payments platform handling 2M transactions daily. Skills: Rust, Go,
+Kubernetes, PostgreSQL. Education: B.S. Computer Science. References available.

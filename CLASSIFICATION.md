@@ -35,7 +35,7 @@ All of this must run **locally, deterministically, reversibly, and fast enough f
 tidyup classifies via a three-tier cascade, each tier cheaper than the last, short-circuiting on confidence. The default-binary spine is non-LLM: deterministic heuristics plus embedding similarity carry the classification load. The LLM is an optional escape hatch, never a default.
 
 1. **Tier 1 — Heuristics (~1 ms).** Extension, MIME, marker-file matching, simple keyword rules. Handles the obvious cases (`.gitignore`, `Cargo.toml`, `*.env`, MIME-obvious media types) for free. Files with unambiguous category by extension never reach Tier 2.
-2. **Tier 2 — Embedding similarity (~50 ms).** Content embedded to a vector; scored against target folder profiles. The UES spine. Default Tier 2.
+2. **Tier 2 — Embedding similarity (~50 ms).** The extracted body is embedded to a vector and matched by cosine similarity — in **scan** mode against a fixed taxonomy, in **migration** mode against the target folders' content centroids. In scan mode the query is built by the single canonical `tidyup_domain::classification_query` (the filename prepended to the body), shared with the offline golden-corpus `eval` so the eval measures the shipped scan construction. Migration mode embeds the raw body only — the source *filename* is not part of the migration Tier-2 query (a folder's own `name_embedding` contributes a separate metadata term, but that is the target folder's name, not the source filename; see the migration section). The UES spine. Default Tier 2.
 3. **Tier 3 — Local LLM fallback (optional, opt-in, ~1–10 s).** Feature-gated under `--features llm-fallback`, off by default. When compiled in and enabled per-invocation, files that fall below Tier 2 confidence thresholds can be routed to a local LLM for a second opinion. Default builds exclude this tier entirely.
 
 **Non-LLM AI on the default path.** The default binary ships Tier 1 and Tier 2 only. Classification is deterministic, auditable, bit-reproducible, and runs in ~50 ms per file on CPU. Tier 3 sits symmetrically with remote inference under the same **three-gate** pattern (compile-time feature + runtime config + per-invocation flag).
@@ -279,7 +279,7 @@ None of these break a spec invariant. They shift judgment to the human review st
 - `cargo build --features llm-fallback` includes the crate.
 - Runtime activation requires explicit config (`[inference] llm_fallback = true`) **and** a per-invocation flag (`--llm-fallback` / `TIDYUP_LLM_FALLBACK=1`). The CLI rejects activation without the matching cargo feature compiled in.
 - Never recommended in first-run UX or default docs.
-- `cargo-deny` ban on `mistralrs`/`candle` outside the `llm-fallback` feature (same pattern as the existing `remote` rule).
+- `cargo xtask check-privacy` asserts `mistralrs`/`candle-core`/`hf-hub` are absent from the default `tidyup-cli`/`tidyup-ui` dep graph (the same check that guards the `reqwest`/`hyper`/`rustls` network surface). `cargo-deny` covers licenses/advisories/sources — it does **not** enforce these feature-gated crate bans (`deny.toml [bans].deny` is empty).
 
 ### What Tier 3 actually does (current implementation)
 
@@ -293,7 +293,7 @@ When Tier 2 lands in the **review zone** (`needs_review = true` — below `embed
 
 The cost (1–10 s of inference) is paid only on hard cases — Tier 2 hits that already cleared their thresholds skip Tier 3 entirely. The verdict's `reasoning` field records `tier3 llm-rerank: …` so post-hoc auditing can tell which tier resolved each file. In migration mode the result also carries `Tier::Llm` in `ClassificationResult.resolved_at`.
 
-`tidyup-inference-remote` plugs into the same seam: it implements `TextBackend`, so `--remote` swaps the local mistralrs engine for a remote OpenAI-compatible / Anthropic / Ollama endpoint without any pipeline changes.
+`tidyup-inference-remote` plugs into the same seam: it implements `TextBackend`, so `--remote` swaps the local mistralrs engine for a remote endpoint without any pipeline changes. The crate ships OpenAI-compatible, Anthropic, and Ollama `RemoteEndpoint` adapters, but **only the OpenAI-compatible path is selectable from CLI config today** (`RemoteBackendConfig` has no provider discriminator); the Anthropic/Ollama variants exist but aren't yet wired from config. An Ollama server is still reachable via its OpenAI-compatible `/v1` endpoint.
 
 ## Architectural implications
 

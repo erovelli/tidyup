@@ -8,9 +8,9 @@
 //! # Cache
 //!
 //! Taxonomy embeddings are cached to disk to avoid the ~1 s cost of embedding
-//! all ~70 descriptions on every startup. Invalidation is by BLAKE3 hash of
-//! model id + all descriptions — any change in either (new model, tweaked
-//! copy, added entry) forces a rebuild.
+//! all ~70 descriptions on every startup. Invalidation keys on the BLAKE3 hash
+//! of all descriptions plus a `model_id` equality check — any change in either
+//! (new model, tweaked copy, added entry) forces a rebuild.
 
 use std::path::Path;
 

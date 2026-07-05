@@ -169,9 +169,16 @@ impl Default for RenameConfig {
 ///
 /// v0.1 ships with the compiled-in marker set (`.git`, `Cargo.toml`, `package.json`,
 /// `pyproject.toml`, `*.xcodeproj`, `settings.gradle`/`build.gradle`, `.ipynb`
-/// neighbours). `extra_markers` lets users declare additional *filename* markers
-/// without a rebuild; `soft_bundle_enabled` gates the metadata-clustering paths
-/// (EXIF bursts, ID3 albums, filename regex families) once those land in Phase 4.
+/// neighbours). `extra_markers` is intended to let users declare additional
+/// *filename* markers without a rebuild; `soft_bundle_enabled`/`enabled` gate the
+/// marker- and metadata-clustering passes (EXIF bursts, ID3 albums, filename
+/// families).
+///
+/// **Not yet wired.** These fields are parsed and round-trip through the config
+/// but the scan/migration pipelines don't yet consume them — bundle detection
+/// currently always runs with the compiled-in marker set. Threading this section
+/// into `scanner::scan` + `clustering::cluster_loose` is tracked as follow-up
+/// (see the roadmap); `[rename]` and `[classifier]` config *are* consumed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BundleDetectionConfig {
@@ -213,7 +220,7 @@ pub fn load_from(path: &Path) -> Result<TidyupConfig> {
 ///
 /// If the resolved file doesn't exist, defaults are returned (this is the first-run case).
 pub fn load() -> Result<TidyupConfig> {
-    let path = config_path_from_env().map_or_else(platform_config_path, Ok)?;
+    let path = resolved_config_path()?;
     let mut config = if path.exists() {
         load_from(&path)?
     } else {
@@ -221,6 +228,26 @@ pub fn load() -> Result<TidyupConfig> {
     };
     apply_env_overrides(&mut config);
     Ok(config)
+}
+
+/// The config file path [`load`] will actually read.
+///
+/// `TIDYUP_CONFIG_PATH` if set, else [`platform_config_path`]. Callers that
+/// *display* the config path (e.g. `tidyup config`) must use this, not
+/// `platform_config_path` directly, so the shown path matches the file `load`
+/// reads under an env override.
+///
+/// # Errors
+/// Propagates [`platform_config_path`] failure when no env override is set.
+pub fn resolved_config_path() -> Result<PathBuf> {
+    resolve_config_path(config_path_from_env())
+}
+
+/// Pure resolver behind [`resolved_config_path`]: an explicit override wins,
+/// otherwise fall back to the platform path. Split out so the precedence is
+/// unit-testable without mutating process environment.
+fn resolve_config_path(env_override: Option<PathBuf>) -> Result<PathBuf> {
+    env_override.map_or_else(platform_config_path, Ok)
 }
 
 /// Persist `config` as pretty-printed TOML, creating parent directories if needed.
@@ -327,6 +354,19 @@ mod tests {
         let serialised = toml::to_string_pretty(&cfg).unwrap();
         let back: TidyupConfig = toml::from_str(&serialised).unwrap();
         assert_eq!(cfg, back);
+    }
+
+    #[test]
+    fn resolve_config_path_prefers_env_override() {
+        // An explicit override is returned verbatim — this is the path
+        // `tidyup config` must display so it matches what `load` reads.
+        let override_path = PathBuf::from("/custom/tidyup.toml");
+        assert_eq!(
+            resolve_config_path(Some(override_path.clone())).unwrap(),
+            override_path,
+        );
+        // With no override, resolution matches the bare platform path.
+        assert_eq!(resolve_config_path(None).ok(), platform_config_path().ok());
     }
 
     #[test]

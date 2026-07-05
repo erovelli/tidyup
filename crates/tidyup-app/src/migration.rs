@@ -151,6 +151,8 @@ impl MigrationService {
             .await;
 
         let text_backend = self.ctx.text.as_deref();
+        // Classifier config (rename thresholds + Tier-3 activation) is
+        // materialised from the loaded TidyupConfig at context-build time.
         let outcome = run_migration(
             &request.source,
             &profile_cache,
@@ -158,7 +160,7 @@ impl MigrationService {
             text_backend,
             multimodal,
             &self.ctx.extractors,
-            &tidyup_domain::ClassifierConfig::default(),
+            &self.ctx.classifier,
             progress,
         )
         .await?;

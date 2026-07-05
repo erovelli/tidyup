@@ -8304,6 +8304,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chrono",
  "clap",
  "console 0.16.3",
  "indicatif 0.18.4",

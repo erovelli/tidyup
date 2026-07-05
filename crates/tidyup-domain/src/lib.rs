@@ -20,9 +20,8 @@ pub use bundle::{BundleError, BundleKind, BundleProposal};
 pub use change::{ChangeProposal, ChangeStatus, ChangeType, ParseError};
 pub use file::{ContentHash, FileId, IndexedFile};
 pub use migration::{
-    Calibration, Candidate, ClassificationResult, ClassifierConfig, DatePattern, ExecutedMove,
-    FolderMetadata, FolderNode, FolderProfile, MigrationPlan, MigrationRun, MoveStatus,
-    OrganizationType, PlanStats, ProfileCache, ProposedMove, RenameConfig, RunStatus, ScanDiff,
+    Calibration, Candidate, ClassificationResult, ClassifierConfig, DatePattern, FolderMetadata,
+    FolderNode, FolderProfile, OrganizationType, ProfileCache, RenameConfig, ScanDiff,
     ScoreBreakdown, ScoreWeights, TargetScan, Tier,
 };
 pub use run::{RunMode, RunRecord, RunState};
@@ -40,6 +39,28 @@ pub enum Phase {
     Rollback,
 }
 
+/// Build the text that Tier-2 embeds to classify a file, from its extracted
+/// body and filename.
+///
+/// This is the **single** canonical construction shared by the shipped scan
+/// pipeline and the offline eval harness, so the eval measures the same query
+/// the product embeds (previously they diverged — the product embedded the raw
+/// body while the eval embedded `filename + first-500-chars`, so the eval
+/// measured a different system). The model token-truncates internally, so no
+/// char cap is applied here. Prepending the filename gives Tier 2 the same
+/// naming signal Tier 1 keys on. An empty body falls back to the filename alone.
+#[must_use]
+pub fn classification_query(body: &str, filename: &str) -> String {
+    let body = body.trim();
+    if body.is_empty() {
+        filename.to_string()
+    } else if filename.is_empty() {
+        body.to_string()
+    } else {
+        format!("{filename} {body}")
+    }
+}
+
 /// User's decision on a single proposal during review.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReviewDecision {
@@ -49,4 +70,33 @@ pub enum ReviewDecision {
         proposal_id: Uuid,
         new_target: PathBuf,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classification_query;
+
+    #[test]
+    fn query_prepends_filename_to_body() {
+        assert_eq!(
+            classification_query("tax return", "scan.pdf"),
+            "scan.pdf tax return"
+        );
+    }
+
+    #[test]
+    fn query_falls_back_to_filename_when_body_empty() {
+        assert_eq!(classification_query("", "photo.jpg"), "photo.jpg");
+        assert_eq!(classification_query("   ", "photo.jpg"), "photo.jpg");
+    }
+
+    #[test]
+    fn query_is_body_when_filename_empty() {
+        assert_eq!(classification_query("body text", ""), "body text");
+    }
+
+    #[test]
+    fn query_trims_body() {
+        assert_eq!(classification_query("  hi  ", "a.txt"), "a.txt hi");
+    }
 }

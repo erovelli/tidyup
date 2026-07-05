@@ -18,25 +18,45 @@ use crate::reporter::CliReporter;
 use crate::review::{AutoApproveHandler, InteractiveHandler};
 use crate::{Cli, Command};
 
-/// Confidence threshold for auto-approving loose proposals when the user
-/// passes `--yes`. Tuned to bias toward safe auto-application of Tier-1
-/// matches while surfacing Tier-2 ambiguity to review in interactive mode.
-const YES_MIN_CONFIDENCE: f32 = 0.75;
 /// Confidence threshold for auto-applying bundles under `--yes`.
 const YES_BUNDLE_MIN_CONFIDENCE: f32 = 0.85;
+
+/// Interpret an environment variable as a boolean activation gate.
+///
+/// The documented activation forms are `TIDYUP_LLM_FALLBACK=1` /
+/// `TIDYUP_REMOTE=1`. clap's derived `bool`+`env` only accepts `true`/`false`,
+/// so we parse the env var here instead: any of `1`/`true`/`yes`/`on`
+/// (case-insensitive) activates; unset or anything else does not. An explicitly
+/// falsey value (`0`/`false`/`no`/`off`) is honoured as "off".
+fn env_activates(var: &str) -> bool {
+    parse_boolish(std::env::var(var).ok().as_deref())
+}
+
+/// Pure boolish parse (extracted from [`env_activates`] so it's testable
+/// without mutating the process environment). `None`/unrecognised → `false`.
+fn parse_boolish(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
 
 pub(crate) async fn dispatch(cli: Cli) -> Result<()> {
     let cfg = config::load().context("loading tidyup config")?;
     let yes = cli.yes;
     let json = cli.json;
-    if cli.llm_fallback && cli.remote {
+    // The flag OR its boolish env var activates. clap's `env` on a `bool` would
+    // reject the documented `=1` form, so the env vars are read here instead.
+    let llm_fallback = cli.llm_fallback || env_activates("TIDYUP_LLM_FALLBACK");
+    let remote = cli.remote || env_activates("TIDYUP_REMOTE");
+    if llm_fallback && remote {
         anyhow::bail!(
             "--llm-fallback and --remote are mutually exclusive; pick one Tier 3 backend"
         );
     }
     let activation = InferenceActivation {
-        llm_fallback: cli.llm_fallback,
-        remote: cli.remote,
+        llm_fallback,
+        remote,
     };
     match cli.command {
         Command::Migrate {
@@ -81,7 +101,7 @@ async fn run_migrate(
 ) -> Result<()> {
     let ctx = build(cfg, true, activation).await?;
     let reporter = CliReporter::new(json);
-    let reviewer = reviewer_for(yes);
+    let reviewer = reviewer_for(yes, cfg);
 
     let service = MigrationService::new(ctx);
     let report = service
@@ -129,7 +149,7 @@ async fn run_scan(
 ) -> Result<()> {
     let ctx = build(cfg, true, activation).await?;
     let reporter = CliReporter::new(json);
-    let reviewer = reviewer_for(yes);
+    let reviewer = reviewer_for(yes, cfg);
 
     // A `--taxonomy <file>` overrides the built-in taxonomy for the text tier.
     // Image/audio candidates always use the default per-modality taxonomies.
@@ -382,7 +402,10 @@ async fn run_rollback(json: bool, cfg: &config::TidyupConfig, run_id: uuid::Uuid
 
 fn run_config(cfg: &config::TidyupConfig) -> Result<()> {
     let data = describe_data_dir(cfg).unwrap_or_else(|| "<unresolved>".into());
-    let config_path = config::platform_config_path()
+    // Show the path `load` actually reads (honors `TIDYUP_CONFIG_PATH`), not
+    // the bare platform path — otherwise `tidyup config` prints one file while
+    // loading another under an env override.
+    let config_path = config::resolved_config_path()
         .map_or_else(|_| "<unresolved>".into(), |p| p.display().to_string());
     println!("tidyup config");
     println!("  config file: {config_path}");
@@ -394,10 +417,13 @@ fn run_config(cfg: &config::TidyupConfig) -> Result<()> {
     Ok(())
 }
 
-fn reviewer_for(yes: bool) -> Box<dyn tidyup_core::ReviewHandler> {
+/// Build the review handler. Under `--yes`, the auto-approve confidence
+/// threshold comes from `[classifier] min_confidence` in config (default 0.75),
+/// so users can tune how aggressively moves auto-apply without a rebuild.
+fn reviewer_for(yes: bool, cfg: &config::TidyupConfig) -> Box<dyn tidyup_core::ReviewHandler> {
     if yes {
         Box::new(AutoApproveHandler {
-            min_confidence: YES_MIN_CONFIDENCE,
+            min_confidence: cfg.classifier.min_confidence,
         })
     } else {
         Box::new(InteractiveHandler)
@@ -454,5 +480,74 @@ fn emit_summary(
     }
     if applied > 0 {
         println!("Undo with: tidyup rollback {run_id}");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_boolish_accepts_documented_truthy_values() {
+        for v in ["1", "true", "TRUE", "yes", "on", " 1 ", "On"] {
+            assert!(parse_boolish(Some(v)), "{v:?} should activate");
+        }
+    }
+
+    #[test]
+    fn parse_boolish_rejects_falsey_and_unset() {
+        for v in ["0", "false", "no", "off", "", "maybe", "2"] {
+            assert!(!parse_boolish(Some(v)), "{v:?} should not activate");
+        }
+        assert!(!parse_boolish(None), "unset must not activate");
+    }
+
+    #[tokio::test]
+    async fn yes_threshold_comes_from_classifier_min_confidence() {
+        // The --yes auto-approve threshold is [classifier] min_confidence, not a
+        // hardcoded constant — a tuned config changes how aggressively --yes
+        // auto-applies. Build the handler via reviewer_for and observe behavior.
+        use tidyup_domain::{ChangeProposal, ChangeStatus, ChangeType, ReviewDecision};
+
+        fn proposal_with_conf(conf: f32) -> ChangeProposal {
+            ChangeProposal {
+                id: uuid::Uuid::new_v4(),
+                file_id: None,
+                change_type: ChangeType::Move,
+                original_path: "/s/x.txt".into(),
+                proposed_path: "/d/x.txt".into(),
+                proposed_name: "x.txt".to_string(),
+                confidence: conf,
+                reasoning: "t".to_string(),
+                needs_review: false,
+                status: ChangeStatus::Pending,
+                created_at: chrono::Utc::now(),
+                applied_at: None,
+                bundle_id: None,
+                classification_confidence: Some(conf),
+                rename_mismatch_score: None,
+                content_hash: None,
+            }
+        }
+
+        let p = proposal_with_conf(0.80);
+
+        let mut cfg = config::TidyupConfig::default();
+        cfg.classifier.min_confidence = 0.90; // strict
+        let strict = reviewer_for(true, &cfg);
+        let decisions = strict.review(vec![p.clone()]).await.unwrap();
+        assert!(
+            matches!(decisions[0], ReviewDecision::Reject(_)),
+            "0.80 must be rejected under a 0.90 --yes threshold"
+        );
+
+        cfg.classifier.min_confidence = 0.50; // lenient
+        let lenient = reviewer_for(true, &cfg);
+        let decisions = lenient.review(vec![p]).await.unwrap();
+        assert!(
+            matches!(decisions[0], ReviewDecision::Approve(_)),
+            "0.80 must be approved under a 0.50 --yes threshold"
+        );
     }
 }

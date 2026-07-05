@@ -24,6 +24,9 @@ on:
 
 permissions:
   contents: read
+  # Needed by the on-failure step to open/update a tracking issue so a broken
+  # nightly is loud instead of silently cancelled.
+  issues: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -92,10 +95,10 @@ jobs:
           PY
 
       - name: Held-out routing accuracy + baselines (eval-routing)
-        # Gate: content routing must beat the filename baseline on top-1 (the
-        # falsifiable premise). 0.0 = "strictly better"; tighten as the real
-        # number stabilizes.
-        run: cargo run -p xtask -- eval-routing corpus20ng --json --fail-under 0.0 | tee routing.json
+        # Gate: content routing must beat the filename baseline on top-1 by at
+        # least the documented margin (see CLAUDE.md). 0.05 = "meaningfully
+        # better, not noise". Tighten further as the real number stabilizes.
+        run: cargo run -p xtask -- eval-routing corpus20ng --json --fail-under 0.05 | tee routing.json
 
       - name: Upload reports
         if: always()
@@ -106,3 +109,41 @@ jobs:
             eval.json
             routing.json
           if-no-files-found: ignore
+
+      # Make a broken nightly LOUD: open a tracking issue (or bump an existing
+      # one) on any failure. Without this, a cancelled/failed nightly is silent
+      # — which is exactly how the routing eval went unmeasured for months.
+      - name: Open/refresh a failure tracking issue
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = 'nightly model-eval is failing';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = [
+              `The nightly \`model-eval\` lane failed on ${new Date().toISOString()}.`,
+              '',
+              `Run: ${runUrl}`,
+              '',
+              'This lane is the only CI that exercises the real embedding path and the',
+              'falsifiable "content beats filename" routing gate. A failure means either',
+              'a real regression, a broken premise (content no longer beats the filename',
+              'baseline by the 0.05 margin), or infra drift (onnxruntime / corpus fetch).',
+              'Please triage promptly — a silently-failing nightly is how this went',
+              'unmeasured before.',
+            ].join('\n');
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', labels: 'model-eval',
+            });
+            if (existing.data.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: existing.data[0].number, body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner, repo: context.repo.repo,
+                title, body, labels: ['model-eval'],
+              });
+            }

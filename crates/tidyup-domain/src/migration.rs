@@ -155,7 +155,10 @@ pub enum DatePattern {
     Week,
 }
 
-/// On-disk cache of all folder profiles for a target root.
+/// All folder profiles for a target root, built per migration run.
+///
+/// Serializable for a future on-disk cache, but not currently persisted or
+/// reloaded — every run rebuilds it in full (see `CLAUDE.md`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileCache {
     /// Target root this cache belongs to.
@@ -170,7 +173,8 @@ pub struct ProfileCache {
     pub last_scan: TargetScan,
     /// Cache creation timestamp.
     pub created_at: SystemTime,
-    /// Last incremental update timestamp.
+    /// Timestamp of the most recent (currently always full) profile build.
+    /// Reserved for incremental rebuilds, which are not yet wired.
     pub last_updated: SystemTime,
 }
 
@@ -223,101 +227,6 @@ pub enum Tier {
 }
 
 // ---------------------------------------------------------------------------
-// Migration plan types
-// ---------------------------------------------------------------------------
-
-/// Complete set of proposed file moves from source to target.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MigrationPlan {
-    /// Unique run identifier.
-    pub run_id: String,
-    /// Source root.
-    pub source_root: PathBuf,
-    /// Target root.
-    pub target_root: PathBuf,
-    /// Timestamp of plan creation.
-    pub created_at: SystemTime,
-    /// All proposed moves.
-    pub moves: Vec<ProposedMove>,
-    /// Files that could not be classified.
-    pub unclassified: Vec<PathBuf>,
-    /// Summary statistics.
-    pub stats: PlanStats,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProposedMove {
-    /// Source file path.
-    pub source: PathBuf,
-    /// Proposed destination path (full path including filename).
-    pub destination: PathBuf,
-    /// New filename, if renaming was applied.
-    pub renamed_to: Option<String>,
-    /// Classification tier and confidence.
-    pub tier: Tier,
-    pub confidence: f32,
-    /// Runner-up destination if any.
-    pub runner_up: Option<(PathBuf, f32)>,
-    /// User approval status.
-    pub status: MoveStatus,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MoveStatus {
-    Pending,
-    Approved,
-    Rejected,
-    ManualOverride { new_destination: PathBuf },
-    Completed,
-    Failed { error: String },
-    RolledBack,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct PlanStats {
-    pub total_files: u32,
-    pub tier1_resolved: u32,
-    pub tier2_resolved: u32,
-    pub tier3_resolved: u32,
-    pub unclassified: u32,
-    pub needs_review: u32,
-    pub avg_confidence: f32,
-}
-
-// ---------------------------------------------------------------------------
-// Migration execution types
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MigrationRun {
-    pub run_id: String,
-    pub source_root: PathBuf,
-    pub target_root: PathBuf,
-    pub started_at: SystemTime,
-    pub completed_at: Option<SystemTime>,
-    pub status: RunStatus,
-    pub executed_moves: Vec<ExecutedMove>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecutedMove {
-    pub source: PathBuf,
-    pub destination: PathBuf,
-    pub file_size: u64,
-    pub moved_at: SystemTime,
-    pub rolled_back: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum RunStatus {
-    InProgress,
-    Completed,
-    PartiallyCompleted { completed: u32, failed: u32 },
-    RolledBack,
-    PartiallyRolledBack,
-}
-
-// ---------------------------------------------------------------------------
 // Classifier config
 // ---------------------------------------------------------------------------
 
@@ -329,10 +238,11 @@ pub struct ClassifierConfig {
     pub embedding_threshold: f32,
     /// Tier 2 ambiguity gap threshold.
     pub ambiguity_gap: f32,
-    /// Whether to invoke Tier 3 for ambiguous files.
+    /// Whether to invoke Tier 3 (LLM) for ambiguous files. Defaults to `false`
+    /// (privacy-preserving): activation is materialised from the layered config
+    /// only under the three-gate model (cargo feature + config bool +
+    /// per-invocation flag), never from this default alone.
     pub enable_llm_fallback: bool,
-    /// Whether to invoke Tier 3 for vague filenames.
-    pub enable_llm_renaming: bool,
     /// Composite score weights.
     pub weights: ScoreWeights,
     /// Rename proposal thresholds.
@@ -367,8 +277,11 @@ impl Default for ClassifierConfig {
             heuristic_threshold: 0.60,
             embedding_threshold: 0.35,
             ambiguity_gap: 0.05,
-            enable_llm_fallback: true,
-            enable_llm_renaming: true,
+            // Privacy default: Tier 3 stays off unless the layered config +
+            // three-gate activation explicitly turns it on. A dead
+            // `enable_llm_renaming` field used to default true here — it was
+            // never read and contradicted the extractive-only rename invariant.
+            enable_llm_fallback: false,
             weights: ScoreWeights::default(),
             rename: RenameConfig::default(),
             calibration: Calibration::default(),
@@ -449,28 +362,6 @@ mod tests {
             let json = serde_json::to_string(&ot).unwrap();
             let back: OrganizationType = serde_json::from_str(&json).unwrap();
             assert_eq!(ot, back);
-        }
-    }
-
-    #[test]
-    fn move_status_serde_roundtrip() {
-        let statuses = vec![
-            MoveStatus::Pending,
-            MoveStatus::Approved,
-            MoveStatus::Rejected,
-            MoveStatus::Completed,
-            MoveStatus::Failed {
-                error: "disk full".to_string(),
-            },
-            MoveStatus::RolledBack,
-            MoveStatus::ManualOverride {
-                new_destination: PathBuf::from("/new/path"),
-            },
-        ];
-        for s in statuses {
-            let json = serde_json::to_string(&s).unwrap();
-            let back: MoveStatus = serde_json::from_str(&json).unwrap();
-            assert_eq!(s, back);
         }
     }
 

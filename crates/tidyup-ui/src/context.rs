@@ -93,6 +93,10 @@ pub(crate) async fn build(
 
     let extractors = default_extractors();
 
+    // Classifier config from the loaded TidyupConfig (rename thresholds +
+    // Tier-3 activation tied to text-backend presence).
+    let classifier = tidyup_app::classifier_config_for(config, text.is_some());
+
     Ok(Arc::new(ServiceContext {
         file_index: Arc::new(store.clone()),
         change_log: Arc::new(store.clone()),
@@ -104,6 +108,7 @@ pub(crate) async fn build(
         image_embeddings,
         audio_embeddings,
         extractors,
+        classifier,
     }))
 }
 

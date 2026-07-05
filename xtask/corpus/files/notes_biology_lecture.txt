@@ -1,0 +1,4 @@
+Biology lecture notes: cellular respiration. Glycolysis converts glucose to
+pyruvate in the cytoplasm, yielding a net two ATP. The citric acid cycle occurs
+in the mitochondrial matrix. The electron transport chain drives oxidative
+phosphorylation. Study the ATP yields and the role of NADH and FADH2 for the exam.

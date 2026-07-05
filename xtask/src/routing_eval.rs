@@ -199,13 +199,25 @@ async fn evaluate(
         bail!("no readable text files after filtering (corpus must be UTF-8 text)");
     }
 
-    // Embed everything (batched per split/field).
+    // Embed everything (chunked per split/field — see `embed`). Per-phase timing
+    // to stderr so a slow embedding pass is visible instead of an opaque hang.
+    eprintln!(
+        "[eval-routing] embedding {} train + {} test docs (content + filename)…",
+        train_docs.len(),
+        test_docs.len(),
+    );
+    let embed_start = std::time::Instant::now();
     let train_content_emb =
         embed(embeddings, train_docs.iter().map(|d| d.content.as_str())).await?;
     let train_name_emb = embed(embeddings, train_docs.iter().map(|d| d.name.as_str())).await?;
     let test_content_emb = embed(embeddings, test_docs.iter().map(|d| d.content.as_str())).await?;
     let test_name_emb = embed(embeddings, test_docs.iter().map(|d| d.name.as_str())).await?;
     let dims = train_content_emb.first().map_or(0, Vec::len);
+    eprintln!(
+        "[eval-routing] embedded {} vectors (dim {dims}) in {:?}",
+        train_docs.len() * 2 + test_docs.len() * 2,
+        embed_start.elapsed(),
+    );
 
     // Build per-label centroids (content and filename) + count tables.
     let content_centroids = centroids_by_label(&train_docs, &train_content_emb);
@@ -260,15 +272,26 @@ async fn evaluate(
     })
 }
 
-/// Embed a batch of texts, preserving order.
+/// Max texts fed to the backend in one `embed_texts` call. The ONNX backend
+/// builds a `[batch, seq_len, hidden]` tensor per call, so an unbounded batch
+/// (the whole corpus split at once) allocates gigabytes and was the cause of the
+/// nightly lane timing out at ~58/60 min. Chunking bounds peak memory and keeps
+/// each inference fast while preserving output order.
+const EMBED_BATCH: usize = 64;
+
+/// Embed a batch of texts in bounded chunks, preserving order.
 async fn embed<'a>(
     backend: &dyn EmbeddingBackend,
     texts: impl Iterator<Item = &'a str>,
 ) -> Result<Vec<Vec<f32>>> {
     let owned: Vec<&str> = texts.collect();
-    let mut out = backend.embed_texts(&owned).await.context("embed batch")?;
-    for v in &mut out {
-        l2_normalize(v);
+    let mut out = Vec::with_capacity(owned.len());
+    for chunk in owned.chunks(EMBED_BATCH) {
+        let mut embs = backend.embed_texts(chunk).await.context("embed batch")?;
+        for v in &mut embs {
+            l2_normalize(v);
+        }
+        out.extend(embs);
     }
     Ok(out)
 }
@@ -677,7 +700,8 @@ fn print_report(corpus: &Path, r: &RoutingReport) {
     clippy::unwrap_used,
     clippy::float_cmp,
     clippy::similar_names,
-    clippy::unnecessary_literal_bound
+    clippy::unnecessary_literal_bound,
+    clippy::cast_precision_loss
 )]
 mod tests {
     use super::*;
@@ -686,6 +710,68 @@ mod tests {
         LabeledFile {
             label: label.to_string(),
             path: PathBuf::from(path),
+        }
+    }
+
+    /// Stub backend: returns a 2-dim embedding `[1.0, index]` per text and
+    /// records the largest batch it was handed. The index rides in the second
+    /// component so it **survives `l2_normalize`**: normalization scales both
+    /// components by the same factor, so `v[1] / v[0]` recovers the original
+    /// index exactly — letting the test verify cross-chunk order, not just that
+    /// every input was embedded. (A 1-D `[index]` vector would collapse to 1.0
+    /// under normalization, erasing order and making the assertion vacuous.)
+    struct BatchRecordingBackend {
+        max_batch: std::sync::atomic::AtomicUsize,
+        next: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl EmbeddingBackend for BatchRecordingBackend {
+        async fn embed_text(&self, _t: &str) -> Result<Vec<f32>> {
+            unreachable!("routing eval uses embed_texts")
+        }
+        async fn embed_texts(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.max_batch.fetch_max(texts.len(), SeqCst);
+            Ok(texts
+                .iter()
+                .map(|_| vec![1.0, self.next.fetch_add(1, SeqCst) as f32])
+                .collect())
+        }
+        fn dimensions(&self) -> usize {
+            2
+        }
+        fn model_id(&self) -> &str {
+            "stub"
+        }
+    }
+
+    #[tokio::test]
+    async fn embed_chunks_bounded_and_preserves_order() {
+        let backend = BatchRecordingBackend {
+            max_batch: std::sync::atomic::AtomicUsize::new(0),
+            next: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let n = EMBED_BATCH * 2 + 5; // spans multiple chunks + a remainder
+        let texts: Vec<String> = (0..n).map(|i| format!("doc {i}")).collect();
+        let out = embed(&backend, texts.iter().map(String::as_str))
+            .await
+            .unwrap();
+
+        assert_eq!(out.len(), n, "every input is embedded");
+        assert!(
+            backend.max_batch.load(std::sync::atomic::Ordering::SeqCst) <= EMBED_BATCH,
+            "no single backend call may exceed EMBED_BATCH",
+        );
+        // The stub numbers vectors monotonically as it sees them; `v[1] / v[0]`
+        // survives l2_normalize and recovers that index. A reordering across
+        // chunk seams (the risky property of chunked reassembly) would make
+        // `recovered != i` and fail here — the previous 1-D stub could not.
+        for (i, v) in out.iter().enumerate() {
+            assert_eq!(v.len(), 2);
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let recovered = (v[1] / v[0]).round() as usize;
+            assert_eq!(recovered, i, "chunk reassembly must preserve input order");
         }
     }
 

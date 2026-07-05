@@ -17,4 +17,5 @@ pub mod naming;
 pub mod profiler;
 pub mod scan;
 pub mod scanner;
+pub mod text_util;
 pub mod yake;

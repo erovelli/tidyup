@@ -176,17 +176,12 @@ impl EmbeddingClassifier {
     }
 }
 
-/// Build the query string for classification: filename + content excerpt.
-///
-/// A 500-character excerpt keeps inference fast while giving enough context
-/// to disambiguate categories that would collide on filename alone.
+/// Build the query string for classification. Delegates to the single canonical
+/// construction in `tidyup-domain` so this eval-side classifier and the shipped
+/// scan pipeline embed identical query text (they used to diverge — see
+/// [`tidyup_domain::classification_query`]).
 fn build_query(text: &str, filename: &str) -> String {
-    if text.is_empty() {
-        filename.to_string()
-    } else {
-        let cut = text.char_indices().nth(500).map_or(text.len(), |(i, _)| i);
-        format!("{filename} {}", &text[..cut])
-    }
+    tidyup_domain::classification_query(text, filename)
 }
 
 /// Highest cosine-similarity index + score from a slice of category vectors.
@@ -249,11 +244,25 @@ mod tests {
     }
 
     #[test]
-    fn build_query_truncates_text() {
+    fn build_query_prepends_filename_to_body() {
+        // Canonical construction is `filename + body` (no char cap — the model
+        // token-truncates). This matches the shipped scan pipeline exactly.
         let text = "a".repeat(1000);
         let q = build_query(&text, "file.pdf");
         assert!(q.starts_with("file.pdf "));
-        assert!(q.len() < 600);
+        assert_eq!(q, format!("file.pdf {text}"));
+    }
+
+    #[test]
+    fn build_query_matches_domain_canonical() {
+        // Guard the unification: the eval-side build_query must be exactly the
+        // shared domain function the shipped pipeline also uses.
+        for (body, name) in [("hello world", "a.txt"), ("", "b.pdf"), ("body", "")] {
+            assert_eq!(
+                build_query(body, name),
+                tidyup_domain::classification_query(body, name),
+            );
+        }
     }
 
     #[test]

@@ -124,3 +124,118 @@ tier1 = false
 file = "files/flight_confirmation.txt"
 expected = "Travel/Flights/"
 tier1 = false
+
+# ── Tier 2 expansion (WP-4): more content-dependent samples per label so the
+#    golden eval's per-label metrics rest on more than one or two files.
+#    NOTE: `cargo xtask eval` is a developer + calibration tool (see eval.rs) —
+#    its accuracy is REPORTED (and uploaded as a nightly artifact), not gated,
+#    because the thresholds are uncalibrated pre-alpha. The falsifiable Tier-2
+#    regression GATE is `eval-routing` over a real held-out corpus (20NG),
+#    which fails the nightly lane when content stops beating the filename
+#    baseline. These fixtures widen coverage; they are not themselves a gate.
+#    Target ≥10 per content-dependent label; this batch brings each to ~4.
+
+[[entry]]
+file = "files/tax_1099_int.txt"
+expected = "Finance/Taxes/"
+tier1 = false
+
+[[entry]]
+file = "files/tax_w2_summary.txt"
+expected = "Finance/Taxes/"
+tier1 = false
+
+[[entry]]
+file = "files/tax_deductions_worksheet.txt"
+expected = "Finance/Taxes/"
+tier1 = false
+
+[[entry]]
+file = "files/insurance_auto_policy.txt"
+expected = "Finance/Insurance/"
+tier1 = false
+
+[[entry]]
+file = "files/insurance_home_policy.txt"
+expected = "Finance/Insurance/"
+tier1 = false
+
+[[entry]]
+file = "files/insurance_health_policy.txt"
+expected = "Finance/Insurance/"
+tier1 = false
+
+[[entry]]
+file = "files/recipe_banana_bread.txt"
+expected = "Recipes/"
+tier1 = false
+
+[[entry]]
+file = "files/recipe_marinara.txt"
+expected = "Recipes/"
+tier1 = false
+
+[[entry]]
+file = "files/recipe_chicken_curry.txt"
+expected = "Recipes/"
+tier1 = false
+
+[[entry]]
+file = "files/career_resume.txt"
+expected = "Work/Career/"
+tier1 = false
+
+[[entry]]
+file = "files/career_cover_letter.txt"
+expected = "Work/Career/"
+tier1 = false
+
+[[entry]]
+file = "files/career_reference_letter.txt"
+expected = "Work/Career/"
+tier1 = false
+
+[[entry]]
+file = "files/meeting_standup_notes.txt"
+expected = "Work/Meetings/"
+tier1 = false
+
+[[entry]]
+file = "files/meeting_planning_agenda.txt"
+expected = "Work/Meetings/"
+tier1 = false
+
+[[entry]]
+file = "files/meeting_retro_notes.txt"
+expected = "Work/Meetings/"
+tier1 = false
+
+[[entry]]
+file = "files/notes_biology_lecture.txt"
+expected = "School/Notes/"
+tier1 = false
+
+[[entry]]
+file = "files/notes_history_lecture.txt"
+expected = "School/Notes/"
+tier1 = false
+
+[[entry]]
+file = "files/notes_calculus_study.txt"
+expected = "School/Notes/"
+tier1 = false
+
+[[entry]]
+file = "files/flight_itinerary_sfo.txt"
+expected = "Travel/Flights/"
+tier1 = false
+
+[[entry]]
+file = "files/flight_boarding_pass.txt"
+expected = "Travel/Flights/"
+tier1 = false
+
+[[entry]]
+file = "files/flight_reservation_change.txt"
+expected = "Travel/Flights/"
+tier1 = false

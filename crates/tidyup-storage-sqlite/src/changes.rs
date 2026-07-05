@@ -188,6 +188,32 @@ impl ChangeLog for SqliteStore {
         Ok(())
     }
 
+    async fn mark_rejected(&self, proposal_id: Uuid) -> tidyup_core::Result<()> {
+        let conn = self.conn();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            {
+                let guard = conn.lock().map_err(|e| anyhow!("lock poisoned: {e}"))?;
+                // Only transition still-pending loose proposals — never override
+                // an Applied/Unshelved row (a rejection can't un-apply a move).
+                guard
+                    .execute(
+                        "UPDATE change_proposals SET status = ?1 \
+                         WHERE id = ?2 AND status = ?3",
+                        params![
+                            ChangeStatus::Rejected.as_str(),
+                            proposal_id.to_string(),
+                            ChangeStatus::Pending.as_str(),
+                        ],
+                    )
+                    .context("marking proposal rejected")?;
+            }
+            Ok(())
+        })
+        .await
+        .context("join mark_rejected task")??;
+        Ok(())
+    }
+
     async fn mark_unshelved(&self, proposal_id: Uuid) -> tidyup_core::Result<()> {
         let conn = self.conn();
         tokio::task::spawn_blocking(move || -> Result<()> {

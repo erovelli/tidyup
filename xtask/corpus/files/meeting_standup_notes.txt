@@ -1,0 +1,4 @@
+Daily standup notes. Attendees: full team. Yesterday: finished the auth
+refactor and merged the rollback fix. Today: start on the config plumbing and
+review the open pull request. Blockers: waiting on the staging deploy. Action
+items: Alice to update the runbook, Bob to file the flaky-test ticket.
