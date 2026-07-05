@@ -60,6 +60,22 @@ impl ContentExtractor for ExcelExtractor {
     }
 
     async fn extract(&self, path: &Path) -> Result<ExtractedContent> {
+        // `calamine` opens the whole workbook/archive in memory, so bound the
+        // input: above the ceiling, defer to review rather than risk OOM.
+        if let Ok(meta) = tokio::fs::metadata(path).await {
+            if meta.len() > crate::MAX_DOCUMENT_BYTES {
+                tracing::warn!(
+                    "spreadsheet too large to parse safely ({} bytes) {}: deferring to review",
+                    meta.len(),
+                    path.display(),
+                );
+                return Ok(ExtractedContent {
+                    text: None,
+                    mime: mime_for_extension(path),
+                    metadata: serde_json::json!({ "too_large": true, "size_bytes": meta.len() }),
+                });
+            }
+        }
         let owned: PathBuf = path.to_path_buf();
         let result = tokio::task::spawn_blocking(move || transcribe_workbook(&owned)).await?;
 
@@ -170,6 +186,26 @@ mod tests {
         assert_eq!(
             out.mime,
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_workbook_is_deferred_not_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.xlsx");
+        // Sparse file just over the ceiling; the guard short-circuits before
+        // calamine opens it, so no real bytes and no parse.
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(crate::MAX_DOCUMENT_BYTES + 1).unwrap();
+        drop(f);
+
+        let out = ExcelExtractor::new().extract(&path).await.unwrap();
+        assert!(out.text.is_none(), "oversized workbook must not be parsed");
+        assert_eq!(
+            out.metadata
+                .get("too_large")
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
         );
     }
 

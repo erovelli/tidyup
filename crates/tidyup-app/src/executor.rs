@@ -375,26 +375,33 @@ fn move_path(src: &Path, dst: &Path) -> anyhow::Result<()> {
 }
 
 fn is_cross_device(e: &std::io::Error) -> bool {
-    // Portable detection via ErrorKind::CrossesDevices landed in stable; older
-    // rustcs require inspecting the raw os error. Accept either.
-    #[allow(unused_variables)]
-    let kind = e.kind();
+    // A cross-volume `rename` fails with a platform-specific OS error.
+    // `io::ErrorKind::CrossesDevices` is still unstable (feature `io_error_more`),
+    // so we match the raw OS error per platform, with a string fallback for any
+    // exotic target. Unix: `EXDEV`. Windows: `ERROR_NOT_SAME_DEVICE`.
     #[cfg(unix)]
-    {
-        if e.raw_os_error() == Some(libc_exdev()) {
-            return true;
-        }
+    if e.raw_os_error() == Some(EXDEV) {
+        return true;
     }
-    // String-match fallback for platforms where kind doesn't surface the distinction.
-    e.to_string().to_lowercase().contains("cross-device")
+    #[cfg(windows)]
+    if e.raw_os_error() == Some(ERROR_NOT_SAME_DEVICE) {
+        return true;
+    }
+    let msg = e.to_string().to_lowercase();
+    msg.contains("cross-device") || msg.contains("different disk")
 }
 
+/// `EXDEV` — "cross-device link". 18 on Linux, macOS, and FreeBSD; hard-coded to
+/// avoid a `libc` dependency.
 #[cfg(unix)]
-const fn libc_exdev() -> i32 {
-    // EXDEV is 18 on Linux, 18 on macOS, 18 on FreeBSD. Hard-code to avoid a
-    // libc dep.
-    18
-}
+const EXDEV: i32 = 18;
+
+/// `ERROR_NOT_SAME_DEVICE` — Win32 error surfaced by `rename` (`MoveFileEx`) when
+/// source and destination are on different volumes. Without this branch,
+/// cross-volume moves would fail outright on Windows instead of falling back to
+/// copy-verify-delete.
+#[cfg(windows)]
+const ERROR_NOT_SAME_DEVICE: i32 = 17;
 
 /// Copy subtree (or file), verify via BLAKE3 hash, then delete source. If
 /// anything fails, staged data at the destination is removed; originals remain
@@ -467,8 +474,8 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> anyhow::Result<()> {
 /// relative position under `dst`. Missing / divergent files fail the copy.
 fn verify_tree(src: &Path, dst: &Path) -> anyhow::Result<()> {
     if src.is_file() {
-        let a = blake3_of(src)?;
-        let b = blake3_of(dst)?;
+        let a = blake3_stream(src)?;
+        let b = blake3_stream(dst)?;
         if a != b {
             return Err(anyhow!(
                 "hash mismatch after copy: {} vs {}",
@@ -488,8 +495,8 @@ fn verify_tree(src: &Path, dst: &Path) -> anyhow::Result<()> {
         if !copied.exists() {
             return Err(anyhow!("missing in staged copy: {}", copied.display()));
         }
-        let a = blake3_of(entry.path())?;
-        let b = blake3_of(&copied)?;
+        let a = blake3_stream(entry.path())?;
+        let b = blake3_stream(&copied)?;
         if a != b {
             return Err(anyhow!(
                 "hash mismatch after copy: {} vs {}",
@@ -501,23 +508,23 @@ fn verify_tree(src: &Path, dst: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn blake3_of(path: &Path) -> anyhow::Result<String> {
-    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    Ok(blake3::hash(&bytes).to_hex().to_string())
-}
-
 /// Streaming BLAKE3 of a file, hex-encoded. Reads in fixed-size chunks so a
-/// multi-GB file never lands in memory at once. Produces the same digest as
-/// [`blake3_of`] (BLAKE3 is chunking-independent).
+/// multi-GB file never lands in memory at once — used for the cross-volume
+/// copy verify and the apply-time TOCTOU re-hash, both of which run over
+/// arbitrarily large user files.
 fn blake3_stream(path: &Path) -> anyhow::Result<String> {
     use std::io::Read;
     let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut hasher = blake3::Hasher::new();
     let mut buf = vec![0u8; 64 * 1024];
     loop {
-        let n = file
-            .read(&mut buf)
-            .with_context(|| format!("read {}", path.display()))?;
+        let n = match file.read(&mut buf) {
+            Ok(n) => n,
+            // Retry on EINTR like `std::fs::read` does, so a signal delivered
+            // mid-read doesn't spuriously fail a verify/TOCTOU re-hash.
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+        };
         if n == 0 {
             break;
         }
@@ -698,6 +705,64 @@ mod tests {
     use tidyup_core::frontend::Level;
     use tidyup_core::Result as CoreResult;
     use tidyup_domain::{ChangeStatus, ChangeType};
+
+    #[test]
+    fn copy_verify_delete_relocates_file_and_removes_original() {
+        // Drives the cross-volume path directly (no real second volume needed):
+        // copy -> streamed-hash verify_tree -> delete original.
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src.bin");
+        let dst = dir.path().join("nested/dst.bin");
+        // Larger than one 64 KiB hash chunk so the streaming loop iterates.
+        let payload = vec![0xABu8; 200 * 1024];
+        std::fs::write(&src, &payload).unwrap();
+
+        copy_verify_delete(&src, &dst).unwrap();
+
+        assert!(!src.exists(), "original must be removed after verify");
+        assert_eq!(std::fs::read(&dst).unwrap(), payload, "content preserved");
+    }
+
+    #[test]
+    fn copy_verify_delete_relocates_subtree() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("bundle");
+        let dst = dir.path().join("moved");
+        std::fs::create_dir_all(src.join("a")).unwrap();
+        std::fs::write(src.join("a/one.txt"), b"one").unwrap();
+        std::fs::write(src.join("two.txt"), vec![7u8; 130 * 1024]).unwrap();
+
+        copy_verify_delete(&src, &dst).unwrap();
+
+        assert!(!src.exists(), "original subtree removed");
+        assert_eq!(std::fs::read(dst.join("a/one.txt")).unwrap(), b"one");
+        assert_eq!(
+            std::fs::read(dst.join("two.txt")).unwrap().len(),
+            130 * 1024
+        );
+    }
+
+    #[test]
+    fn cross_device_detected_from_os_error() {
+        // A real cross-volume rename surfaces the platform errno; is_cross_device
+        // must route it to copy-verify-delete rather than failing the move.
+        #[cfg(unix)]
+        {
+            let exdev = std::io::Error::from_raw_os_error(EXDEV);
+            assert!(is_cross_device(&exdev), "EXDEV must count as cross-device");
+        }
+        #[cfg(windows)]
+        {
+            let not_same = std::io::Error::from_raw_os_error(ERROR_NOT_SAME_DEVICE);
+            assert!(is_cross_device(&not_same));
+        }
+        // A non-cross-device OS error (errno 13) must NOT trigger the fallback.
+        assert!(!is_cross_device(&std::io::Error::from_raw_os_error(13)));
+        // String fallback for exotic platforms whose errno we don't hard-code.
+        assert!(is_cross_device(&std::io::Error::other(
+            "Invalid cross-device link"
+        )));
+    }
 
     struct NullProgress;
     #[async_trait]

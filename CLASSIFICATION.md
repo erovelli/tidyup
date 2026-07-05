@@ -34,7 +34,7 @@ All of this must run **locally, deterministically, reversibly, and fast enough f
 
 tidyup classifies via a three-tier cascade, each tier cheaper than the last, short-circuiting on confidence. The default-binary spine is non-LLM: deterministic heuristics plus embedding similarity carry the classification load. The LLM is an optional escape hatch, never a default.
 
-1. **Tier 1 — Heuristics (~1 ms).** Extension, MIME, marker-file matching, simple keyword rules. Handles the obvious cases (`.gitignore`, `Cargo.toml`, `*.env`, MIME-obvious media types) for free. Files with unambiguous category by extension never reach Tier 2.
+1. **Tier 1 — Heuristics (~1 ms).** Extension, MIME, marker-file matching, simple keyword rules. Handles the obvious cases (`.gitignore`, `Cargo.toml`, `*.env`) for free. Files with an unambiguous category by extension short-circuit here and never reach Tier 2 — **except** image/audio files when the multimodal (SigLIP/CLAP) bundle is installed: those deliberately bypass the Tier-1 extension short-circuit so cross-modal Tier 2 can classify them by content, with the Tier-1 category as the fallback when Tier 2 misses (see "Multimodal Tier 2").
 2. **Tier 2 — Embedding similarity (~50 ms).** The extracted body is embedded to a vector and matched by cosine similarity — in **scan** mode against a fixed taxonomy, in **migration** mode against the target folders' content centroids. In scan mode the query is built by the single canonical `tidyup_domain::classification_query` (the filename prepended to the body), shared with the offline golden-corpus `eval` so the eval measures the shipped scan construction. Migration mode embeds the raw body only — the source *filename* is not part of the migration Tier-2 query (a folder's own `name_embedding` contributes a separate metadata term, but that is the target folder's name, not the source filename; see the migration section). The UES spine. Default Tier 2.
 3. **Tier 3 — Local LLM fallback (optional, opt-in, ~1–10 s).** Feature-gated under `--features llm-fallback`, off by default. When compiled in and enabled per-invocation, files that fall below Tier 2 confidence thresholds can be routed to a local LLM for a second opinion. Default builds exclude this tier entirely.
 
@@ -111,8 +111,15 @@ Adding a modality is a new encoder behind a port trait — currently
 [`AudioEmbeddingBackend`](crates/tidyup-core/src/inference.rs) — not a
 service-layer refactor. Each modality's backend is held as
 `Option<Arc<dyn …>>` on `ServiceContext`; the pipeline routes by
-[`FileModality`](crates/tidyup-core/src/inference.rs) and short-circuits to
-the text Tier 2 path when the modality backend is absent.
+[`FileModality`](crates/tidyup-core/src/inference.rs). When the matching
+backend **is** loaded (the bundle is on disk), an image/audio file bypasses the
+Tier-1 extension short-circuit and is classified cross-modally first — in scan
+mode against the image/audio taxonomy, in migration mode against the folders'
+`image_centroid` / `audio_centroid` — falling back to the Tier-1 category on a
+miss. When the backend is **absent** (the default install), or the file is
+too large to read, or no folder carries a centroid, routing short-circuits to
+Tier 1 / the text Tier 2 path exactly as before, so the default path is
+unchanged.
 
 ### Cross-modal latent-space isolation
 

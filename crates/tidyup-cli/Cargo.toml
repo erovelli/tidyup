@@ -38,7 +38,10 @@ tidyup-core           = { workspace = true }
 tidyup-app            = { workspace = true }
 tidyup-pipeline       = { workspace = true }
 tidyup-storage-sqlite = { workspace = true }
-tidyup-extract        = { workspace = true }
+# `audio` pulls the pure-Rust `lofty` tag reader so `.mp3`/`.flac`/… get ID3
+# metadata — enabling music-album clustering and metadata-based renames. Pure
+# Rust, no network/LLM: the privacy model is unaffected.
+tidyup-extract        = { workspace = true, features = ["audio"] }
 tidyup-embeddings-ort = { workspace = true }
 
 # Feature-gated. MUST NOT be listed in workspace defaults or in any dep of a

@@ -33,7 +33,9 @@ tidyup-core           = { workspace = true }
 tidyup-app            = { workspace = true }
 tidyup-pipeline       = { workspace = true }
 tidyup-storage-sqlite = { workspace = true }
-tidyup-extract        = { workspace = true }
+# `audio` (pure-Rust `lofty`) so audio files get ID3 tags for music-album
+# clustering + metadata renames. No network/LLM — privacy model unaffected.
+tidyup-extract        = { workspace = true, features = ["audio"] }
 tidyup-embeddings-ort = { workspace = true }
 
 # Feature-gated power-user opt-in. MUST NOT appear in the default graph — the

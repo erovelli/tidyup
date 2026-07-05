@@ -19,6 +19,8 @@
 //! [`parse_content_classification`](tidyup_core::inference::parse_content_classification)
 //! for tolerant JSON decoding.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tidyup_core::inference::{
@@ -32,6 +34,64 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_MAX_TOKENS: u32 = 256;
 const CLASSIFY_MAX_TOKENS: u32 = 300;
 const CLASSIFY_TEMPERATURE: f32 = 0.1;
+/// Give up establishing a TCP/TLS connection after this long.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Give up on a whole request/response after this long, so a stalled server
+/// can never hang classification indefinitely (Tier 3 then falls back to the
+/// Tier-2 verdict).
+const REQUEST_TIMEOUT: Duration = Duration::from_mins(1);
+
+/// Redacting wrapper for an API key.
+///
+/// Keeps the secret out of `Debug`, `Display`, and any serialized output — the
+/// raw value is reachable only via [`Secret::expose`]. This upholds the "the
+/// API key is never written to disk" promise even if a [`RemoteEndpoint`] is
+/// accidentally logged or serialized: the derived `Debug`/`Serialize` on the
+/// enum inherit this masking.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(transparent)]
+pub struct Secret(String);
+
+impl Secret {
+    /// The raw secret. Call only at the HTTP boundary (the auth header).
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for Secret {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl From<&str> for Secret {
+    fn from(s: &str) -> Self {
+        Self(s.to_string())
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(***)")
+    }
+}
+
+impl Serialize for Secret {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        // Never emit the real key — masks it in any serialized form. This is
+        // deliberately asymmetric with the transparent `Deserialize`: a
+        // `RemoteEndpoint` is always built fresh from the `api_key_env` var at
+        // invocation and is never persisted+reloaded, so a live key never
+        // round-trips through this masking. Don't add a serialize-then-reload
+        // path for a populated endpoint — the key would come back as "***".
+        serializer.serialize_str("***")
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Endpoint config
@@ -50,13 +110,13 @@ pub enum RemoteEndpoint {
     #[serde(rename = "openai")]
     OpenAi {
         url: String,
-        api_key: String,
+        api_key: Secret,
         model: String,
     },
     /// Anthropic Messages API. `api_base` defaults to
     /// `https://api.anthropic.com/v1/messages`.
     Anthropic {
-        api_key: String,
+        api_key: Secret,
         model: String,
         #[serde(default)]
         api_base: Option<String>,
@@ -82,6 +142,45 @@ impl RemoteEndpoint {
             | Self::Ollama { model, .. } => model,
         }
     }
+}
+
+/// Reject an endpoint whose URL is malformed or would send an API key over
+/// cleartext `http`. Key-carrying providers (`OpenAI`, `Anthropic`) require
+/// `https` unless the host is loopback; Ollama (no key) may use plain `http`.
+fn validate_endpoint(endpoint: &RemoteEndpoint) -> Result<()> {
+    match endpoint {
+        RemoteEndpoint::OpenAi { url, .. } => require_valid_url(url, true),
+        // `None` uses the hard-coded https `ANTHROPIC_API_BASE`, so it's safe.
+        RemoteEndpoint::Anthropic { api_base, .. } => api_base
+            .as_ref()
+            .map_or_else(|| Ok(()), |base| require_valid_url(base, true)),
+        RemoteEndpoint::Ollama { url, .. } => require_valid_url(url, false),
+    }
+}
+
+fn require_valid_url(raw: &str, carries_secret: bool) -> Result<()> {
+    let url = reqwest::Url::parse(raw)
+        .map_err(|e| anyhow::anyhow!("invalid remote endpoint URL {raw:?}: {e}"))?;
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" if !carries_secret || is_loopback_host(&url) => Ok(()),
+        "http" => Err(anyhow::anyhow!(
+            "refusing to send the API key over cleartext http to {raw:?}; use https \
+             (plain http is allowed only for a loopback host)"
+        )),
+        other => Err(anyhow::anyhow!(
+            "unsupported URL scheme {other:?} for {raw:?}; use https"
+        )),
+    }
+}
+
+fn is_loopback_host(url: &reqwest::Url) -> bool {
+    // `Url::host_str` returns the *bracketed* form for IPv6, so loopback `::1`
+    // arrives as "[::1]".
+    matches!(
+        url.host_str(),
+        Some("localhost" | "127.0.0.1" | "::1" | "[::1]")
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -115,8 +214,17 @@ impl RemoteText {
     /// The inner `reqwest::Client` is built once and reused across calls for
     /// connection-pool efficiency.
     pub fn new(endpoint: RemoteEndpoint) -> Result<Self> {
+        validate_endpoint(&endpoint)?;
         let client = reqwest::Client::builder()
             .user_agent(USER_AGENT)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
+            // No redirects: `validate_endpoint` only vetted the configured URL,
+            // and reqwest does NOT strip a custom `x-api-key` header (Anthropic)
+            // on a cross-host redirect the way it strips `Authorization`. A
+            // compromised endpoint could otherwise 302 the key to cleartext
+            // http. Chat APIs don't redirect, so refuse to follow any.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| anyhow::anyhow!("build reqwest client: {e}"))?;
         let model_id = format!("{}/{}", endpoint.model_id_prefix(), endpoint.model());
@@ -133,14 +241,34 @@ impl RemoteText {
                 url,
                 api_key,
                 model,
-            } => openai::chat(&self.client, url, api_key, model, system, user, opts).await,
+            } => {
+                openai::chat(
+                    &self.client,
+                    url,
+                    api_key.expose(),
+                    model,
+                    system,
+                    user,
+                    opts,
+                )
+                .await
+            }
             RemoteEndpoint::Anthropic {
                 api_key,
                 model,
                 api_base,
             } => {
                 let base = api_base.as_deref().unwrap_or(ANTHROPIC_API_BASE);
-                anthropic::chat(&self.client, base, api_key, model, system, user, opts).await
+                anthropic::chat(
+                    &self.client,
+                    base,
+                    api_key.expose(),
+                    model,
+                    system,
+                    user,
+                    opts,
+                )
+                .await
             }
             RemoteEndpoint::Ollama { url, model } => {
                 ollama::chat(&self.client, url, model, system, user, opts).await
@@ -526,33 +654,74 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_serde_roundtrip_openai() {
+    fn serialize_redacts_openai_api_key() {
         let ep = RemoteEndpoint::OpenAi {
             url: "https://api.openai.com/v1".into(),
-            api_key: "sk-x".into(),
+            api_key: "sk-supersecret".into(),
             model: "gpt-4o".into(),
         };
         let json = serde_json::to_string(&ep).unwrap();
         assert!(json.contains("\"kind\":\"openai\""));
-        let back: RemoteEndpoint = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, ep);
+        assert!(
+            !json.contains("sk-supersecret"),
+            "raw key must never be serialized: {json}"
+        );
+        assert!(json.contains("***"), "key field should be masked: {json}");
     }
 
     #[test]
-    fn endpoint_serde_roundtrip_anthropic() {
+    fn serialize_redacts_anthropic_api_key() {
         let ep = RemoteEndpoint::Anthropic {
-            api_key: "key".into(),
+            api_key: "secret-key-value".into(),
             model: "claude-sonnet-4-6".into(),
             api_base: None,
         };
         let json = serde_json::to_string(&ep).unwrap();
         assert!(json.contains("\"kind\":\"anthropic\""));
-        let back: RemoteEndpoint = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, ep);
+        assert!(!json.contains("secret-key-value"), "raw key leaked: {json}");
+        assert!(json.contains("***"), "key field should be masked: {json}");
+    }
+
+    #[test]
+    fn rejects_cleartext_http_anthropic_api_base() {
+        // The Anthropic `api_base` override must be vetted too — its key rides
+        // in an `x-api-key` header, so cleartext http to a non-loopback host
+        // is refused.
+        let err = RemoteText::new(RemoteEndpoint::Anthropic {
+            api_key: "k".into(),
+            model: "m".into(),
+            api_base: Some("http://proxy.example.com/v1/messages".into()),
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("cleartext http"), "got: {err}");
+
+        // Loopback IPv6 over http is allowed (fixture for the "[::1]" arm).
+        assert!(RemoteText::new(RemoteEndpoint::Anthropic {
+            api_key: "k".into(),
+            model: "m".into(),
+            api_base: Some("http://[::1]:8080/v1/messages".into()),
+        })
+        .is_ok());
+    }
+
+    #[test]
+    fn debug_redacts_api_key() {
+        let ep = RemoteEndpoint::OpenAi {
+            url: "https://api.openai.com/v1".into(),
+            api_key: "sk-supersecret".into(),
+            model: "gpt-4o".into(),
+        };
+        let rendered = format!("{ep:?}");
+        assert!(
+            !rendered.contains("sk-supersecret"),
+            "Debug must not leak the key: {rendered}"
+        );
+        assert!(rendered.contains("***"));
     }
 
     #[test]
     fn endpoint_serde_roundtrip_ollama() {
+        // Ollama has no secret field, so it roundtrips cleanly.
         let ep = RemoteEndpoint::Ollama {
             url: "http://localhost:11434".into(),
             model: "llama3.2".into(),
@@ -571,5 +740,53 @@ mod tests {
         })
         .unwrap();
         assert_eq!(backend.model_id(), "remote-ollama/llama3.2");
+    }
+
+    #[test]
+    fn rejects_cleartext_http_for_key_carrying_endpoint() {
+        let err = RemoteText::new(RemoteEndpoint::OpenAi {
+            url: "http://api.example.com/v1".into(),
+            api_key: "sk-x".into(),
+            model: "m".into(),
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("cleartext http"), "got: {err}");
+    }
+
+    #[test]
+    fn allows_https_and_loopback_http_with_key() {
+        assert!(RemoteText::new(RemoteEndpoint::OpenAi {
+            url: "https://api.openai.com/v1".into(),
+            api_key: "sk-x".into(),
+            model: "m".into(),
+        })
+        .is_ok());
+        // Loopback http is allowed even with a key (local proxy / dev server).
+        assert!(RemoteText::new(RemoteEndpoint::OpenAi {
+            url: "http://localhost:8080/v1".into(),
+            api_key: "sk-x".into(),
+            model: "m".into(),
+        })
+        .is_ok());
+        // Ollama over plain http (carries no key) is fine.
+        assert!(RemoteText::new(RemoteEndpoint::Ollama {
+            url: "http://localhost:11434".into(),
+            model: "llama3.2".into(),
+        })
+        .is_ok());
+    }
+
+    #[test]
+    fn rejects_malformed_endpoint_url() {
+        let err = RemoteText::new(RemoteEndpoint::OpenAi {
+            url: "not a url".into(),
+            api_key: "sk-x".into(),
+            model: "m".into(),
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("invalid remote endpoint URL"),
+            "got: {err}"
+        );
     }
 }

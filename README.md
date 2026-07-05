@@ -226,7 +226,7 @@ backup_retention_days = 30             # shelved originals older than this are e
 
 [classifier]
 tiers = ["heuristics", "embeddings"]   # tier cascade order; "llm" is added only under the triple-gated opt-in
-min_confidence = 0.75                  # fallback auto-classify threshold for the composite score
+min_confidence = 0.75                  # --yes auto-approve threshold for moves; does not change classification/review thresholds
 
 [inference]
 backends = ["embeddings-ort"]          # reserved: parsed for forward-compat but not yet consulted; the

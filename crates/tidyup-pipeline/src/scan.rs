@@ -281,53 +281,41 @@ async fn classify_file(
         .map(|e| e.mime.clone())
         .or_else(|| mime.clone());
 
-    // Tier 1.
-    if let Some(hit) = heuristics::classify(path, effective_mime.as_deref()) {
-        if hit.confidence >= config.heuristic_threshold {
-            let year =
-                year_from_path_and_text(path, extracted.as_ref().and_then(|e| e.text.as_deref()));
-            let keywords = extracted
-                .as_ref()
-                .and_then(|e| e.text.as_deref())
-                .map(|t| yake::extract_keywords(t, 8))
-                .unwrap_or_default();
-            let metadata_json = extracted
-                .as_ref()
-                .map_or(serde_json::Value::Null, |e| e.metadata.clone());
-            let rename = gate_rename(
-                path,
-                &metadata_json,
-                &keywords,
-                year,
-                hit.confidence,
-                embeddings,
-                extracted.as_ref().and_then(|e| e.text.as_deref()),
-                &filename,
-                config,
-            )
-            .await?;
-            return Ok(Some(ClassifiedFile {
-                folder_path: hit.taxonomy_path.to_string(),
-                confidence: hit.confidence,
-                reasoning: format!("tier1 heuristic: {}", hit.reason),
-                needs_review: false,
-                year,
-                temporal: candidates
-                    .iter()
-                    .find(|c| c.folder_path == hit.taxonomy_path)
-                    .is_some_and(|c| c.temporal),
-                rename: rename.proposal,
-                classification_confidence: Some(hit.confidence),
-                rename_mismatch_score: rename.mismatch_score,
-            }));
+    // Tier 1 heuristic hit above the short-circuit threshold, if any.
+    let tier1_hit = heuristics::classify(path, effective_mime.as_deref())
+        .filter(|hit| hit.confidence >= config.heuristic_threshold);
+
+    // Ordering: for image/audio whose cross-modal backend is loaded (the
+    // multimodal bundle is installed), prefer content classification (SigLIP /
+    // CLAP) and use Tier 1 only as the fallback — otherwise a `.jpg`/`.mp3`
+    // would short-circuit at Tier 1 by extension and never reach Tier 2. When
+    // the backend is absent (the default install), Tier 1 wins first exactly as
+    // before, so this changes nothing on the default path.
+    let modality = file_modality(path, effective_mime.as_deref());
+    let media_backend_present = match modality {
+        FileModality::Image => multimodal.image.is_some(),
+        FileModality::Audio => multimodal.audio.is_some(),
+        _ => false,
+    };
+
+    if !media_backend_present {
+        if let Some(hit) = &tier1_hit {
+            return Ok(Some(
+                tier1_classified(
+                    path,
+                    hit,
+                    extracted.as_ref(),
+                    candidates,
+                    embeddings,
+                    &filename,
+                    config,
+                )
+                .await?,
+            ));
         }
     }
 
-    // Tier 2 — modality-aware. Image/audio files with the corresponding
-    // backend present go through cross-modal classification (SigLIP / CLAP).
-    // Fall through to text classification for everything else, or if the
-    // modality backend is absent.
-    let modality = file_modality(path, effective_mime.as_deref());
+    // Tier 2 — modality-aware cross-modal classification.
     if matches!(modality, FileModality::Image) {
         if let Some(img_ctx) = multimodal.image.as_ref() {
             if let Some(verdict) = classify_image(
@@ -355,6 +343,26 @@ async fn classify_file(
             {
                 return Ok(Some(verdict));
             }
+        }
+    }
+
+    // Cross-modal missed (ambiguous, unreadable, or oversized) for media whose
+    // Tier 1 we deferred above — honor that confident hit now (a `.jpg` is still
+    // a photo) rather than dropping to the review path.
+    if media_backend_present {
+        if let Some(hit) = &tier1_hit {
+            return Ok(Some(
+                tier1_classified(
+                    path,
+                    hit,
+                    extracted.as_ref(),
+                    candidates,
+                    embeddings,
+                    &filename,
+                    config,
+                )
+                .await?,
+            ));
         }
     }
 
@@ -506,6 +514,12 @@ fn build_llm_query(c: &tidyup_core::inference::ContentClassification) -> String 
     parts.join(" ")
 }
 
+/// File size in bytes, or `0` if it can't be stat'd (treated as "small enough";
+/// the subsequent read then fails closed to the Tier-1 fallback).
+async fn file_len(path: &Path) -> u64 {
+    tokio::fs::metadata(path).await.map_or(0, |m| m.len())
+}
+
 /// Decide a file's modality from its extension + MIME. Used to pick which
 /// Tier 2 backend handles it. Mirrors the classification in
 /// `tidyup-extract` but produces the [`FileModality`] enum the inference
@@ -559,6 +573,11 @@ async fn classify_image(
     if ctx.candidates.is_empty() {
         return Ok(None);
     }
+    // Bound the read: an oversized image is left to the Tier-1 fallback rather
+    // than slurped whole into memory for embedding.
+    if file_len(path).await > tidyup_extract::MAX_DOCUMENT_BYTES {
+        return Ok(None);
+    }
     let Ok(bytes) = tokio::fs::read(path).await else {
         return Ok(None);
     };
@@ -604,6 +623,11 @@ async fn classify_audio(
     if ctx.candidates.is_empty() {
         return Ok(None);
     }
+    // Bound the read: an oversized audio file is left to the Tier-1 fallback
+    // rather than slurped whole into memory for embedding.
+    if file_len(path).await > tidyup_extract::MAX_DOCUMENT_BYTES {
+        return Ok(None);
+    }
     let Ok(bytes) = tokio::fs::read(path).await else {
         return Ok(None);
     };
@@ -632,6 +656,53 @@ async fn classify_audio(
         classification_confidence: Some(best_score),
         rename_mismatch_score: None,
     }))
+}
+
+/// Build the Tier-1 (`needs_review = false`) result for a confident heuristic
+/// hit. Shared by the two call sites in `classify_file`: the normal Tier-1
+/// short-circuit, and the fallback when a media file's cross-modal Tier 2 was
+/// tried first and missed.
+async fn tier1_classified(
+    path: &Path,
+    hit: &HeuristicMatch,
+    extracted: Option<&tidyup_core::extractor::ExtractedContent>,
+    candidates: &[ScanCandidate],
+    embeddings: &dyn EmbeddingBackend,
+    filename: &str,
+    config: &ClassifierConfig,
+) -> Result<ClassifiedFile> {
+    let text = extracted.and_then(|e| e.text.as_deref());
+    let year = year_from_path_and_text(path, text);
+    let keywords = text
+        .map(|t| yake::extract_keywords(t, 8))
+        .unwrap_or_default();
+    let metadata_json = extracted.map_or(serde_json::Value::Null, |e| e.metadata.clone());
+    let rename = gate_rename(
+        path,
+        &metadata_json,
+        &keywords,
+        year,
+        hit.confidence,
+        embeddings,
+        text,
+        filename,
+        config,
+    )
+    .await?;
+    Ok(ClassifiedFile {
+        folder_path: hit.taxonomy_path.to_string(),
+        confidence: hit.confidence,
+        reasoning: format!("tier1 heuristic: {}", hit.reason),
+        needs_review: false,
+        year,
+        temporal: candidates
+            .iter()
+            .find(|c| c.folder_path == hit.taxonomy_path)
+            .is_some_and(|c| c.temporal),
+        rename: rename.proposal,
+        classification_confidence: Some(hit.confidence),
+        rename_mismatch_score: rename.mismatch_score,
+    })
 }
 
 fn weak_heuristic(hit: &HeuristicMatch, _path: &Path) -> ClassifiedFile {
@@ -1271,6 +1342,62 @@ mod tests {
             p.reasoning,
         );
         assert!(p.proposed_path.to_string_lossy().contains("Photos"));
+    }
+
+    #[tokio::test]
+    async fn image_reaches_tier2_at_default_threshold_when_backend_present() {
+        // WP-7 regression signal: under the SHIPPED default heuristic_threshold
+        // (0.60), a `.png` whose Tier-1 heuristic (Photos/ @ 0.75) would
+        // normally short-circuit must instead route through the image backend
+        // when the SigLIP bundle is loaded. Before the fix, common media never
+        // reached cross-modal Tier 2 in scan mode.
+        let td = TempDir::new().unwrap();
+        let img_path = td.path().join("snapshot.png");
+        image::RgbImage::new(4, 4).save(&img_path).unwrap();
+
+        let img_be = BucketImageBackend;
+        let candidates = vec![ScanCandidate {
+            folder_path: "Photos/".to_string(),
+            description: "a photograph".to_string(),
+            temporal: true,
+            embedding: img_be.embed_text("a photograph").await.unwrap(),
+        }];
+        let img_ctx = ImageContext {
+            backend: &img_be,
+            candidates: &candidates,
+        };
+        let multimodal = MultimodalContext {
+            image: Some(img_ctx),
+            audio: None,
+        };
+
+        let eb = BucketEmbeddings;
+        let cfg = ClassifierConfig {
+            heuristic_threshold: 0.6, // shipped default — Tier 1 (0.75) WOULD short-circuit
+            embedding_threshold: 0.0,
+            ambiguity_gap: 0.0,
+            ..ClassifierConfig::default()
+        };
+        let ex: Vec<Arc<dyn ContentExtractor>> = vec![];
+        let out = run_scan(
+            td.path(),
+            td.path(),
+            &[],
+            &eb,
+            &multimodal,
+            None,
+            &ex,
+            &cfg,
+            &NullProgress,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.proposals.len(), 1);
+        assert!(
+            out.proposals[0].reasoning.contains("tier2 image"),
+            "at the default threshold the image must reach SigLIP, not Tier 1; got {}",
+            out.proposals[0].reasoning,
+        );
     }
 
     #[test]
