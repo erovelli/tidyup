@@ -105,7 +105,7 @@ symphonia    = { version = "0.6", default-features = false, features = ["wav", "
 # binary dlopens `libonnxruntime` via the `ORT_DYLIB_PATH` env var or a
 # path set by tidyup at startup. First-run setup fetches the library and
 # model alongside each other into `dirs::cache_dir()/tidyup/models/`.
-ort          = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "load-dynamic", "api-23"] }
+ort          = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "load-dynamic", "api-23"] }
 tokenizers   = { version = "0.23", default-features = false, features = ["onig"] }
 ndarray      = "0.17"
 
