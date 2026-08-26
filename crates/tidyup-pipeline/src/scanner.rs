@@ -184,7 +184,7 @@ fn detect_bundle(dir: &Path) -> Option<(BundleKind, &'static str)> {
                         .extension()
                         .is_some_and(|ext| ext.eq_ignore_ascii_case("ipynb")) =>
                 {
-                    notebook_count += 1;
+                    notebook_count = notebook_count.saturating_add(1);
                 }
                 _ => {}
             }

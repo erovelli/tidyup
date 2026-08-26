@@ -17,6 +17,10 @@
 //! is a blocking C++ call. Callers may share a single [`OrtEmbeddings`]
 //! across tasks via [`std::sync::Arc`].
 
+// ONNX tensor shapes are checked immediately before indexed reads. Capacity
+// products and tensor coordinates are model-defined, bounded dimensions.
+#![allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 

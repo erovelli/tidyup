@@ -37,9 +37,8 @@ unused_lifetimes                  = "warn"
 unused_qualifications             = "warn"
 
 [workspace.lints.clippy]
-pedantic         = { level = "warn", priority = -1 }
-nursery          = { level = "warn", priority = -1 }
-cargo            = { level = "warn", priority = -1 }
+pedantic         = { level = "deny", priority = -1 }
+nursery          = { level = "deny", priority = -1 }
 # Pragmatic overrides — pedantic defaults that create noise without catching real bugs.
 module_name_repetitions   = "allow"
 must_use_candidate        = "allow"
@@ -47,11 +46,19 @@ missing_errors_doc        = "allow"
 missing_panics_doc        = "allow"
 multiple_crate_versions   = "allow"
 # Things we actively want to catch.
-unwrap_used               = "warn"
-expect_used               = "warn"
-dbg_macro                 = "warn"
-todo                      = "warn"
-unimplemented             = "warn"
+unwrap_used               = "deny"
+expect_used               = "deny"
+indexing_slicing          = "deny"
+arithmetic_side_effects   = "deny"
+unreachable               = "deny"
+unimplemented             = "deny"
+unchecked_time_subtraction = "deny"
+todo                      = "deny"
+string_slice              = "deny"
+panic_in_result_fn        = "deny"
+panic                     = "deny"
+exit                      = "deny"
+as_conversions            = "deny"
 
 [workspace.dependencies]
 # Internal
@@ -89,7 +96,7 @@ infer        = "0.19"
 mime_guess   = "2.0"
 
 # Content extraction (feature-gated per format in tidyup-extract)
-pdf-extract  = "0.10"
+pdf-extract  = "0.12"
 calamine     = "0.35"
 image        = "0.25"
 kamadak-exif = "0.6"
@@ -105,7 +112,7 @@ symphonia    = { version = "0.6", default-features = false, features = ["wav", "
 # binary dlopens `libonnxruntime` via the `ORT_DYLIB_PATH` env var or a
 # path set by tidyup at startup. First-run setup fetches the library and
 # model alongside each other into `dirs::cache_dir()/tidyup/models/`.
-ort          = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "load-dynamic", "api-23"] }
+ort          = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "load-dynamic", "api-23"] }
 tokenizers   = { version = "0.23", default-features = false, features = ["onig"] }
 ndarray      = "0.17"
 

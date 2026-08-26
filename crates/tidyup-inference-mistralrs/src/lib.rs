@@ -167,7 +167,7 @@ impl TextBackend for MistralRsEngine {
         let captions = frame_captions
             .iter()
             .enumerate()
-            .map(|(i, c)| format!("Frame {}: {c}", i + 1))
+            .map(|(i, c)| format!("Frame {}: {c}", i.saturating_add(1)))
             .collect::<Vec<_>>()
             .join("\n");
         let user = format!("Filename: {filename}\n\nFrame descriptions:\n{captions}");
@@ -188,10 +188,9 @@ impl TextBackend for MistralRsEngine {
     async fn complete(&self, prompt: &str, opts: &GenerationOptions) -> Result<String> {
         let messages = TextMessages::new().add_message(TextMessageRole::User, prompt);
 
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let request = RequestBuilder::from(messages)
             .enable_thinking(false)
-            .set_sampler_max_len(opts.max_tokens as usize)
+            .set_sampler_max_len(usize::try_from(opts.max_tokens).unwrap_or(usize::MAX))
             .set_sampler_temperature(f64::from(opts.temperature));
 
         let response = self

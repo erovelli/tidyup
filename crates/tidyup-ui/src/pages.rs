@@ -261,12 +261,17 @@ const DIFF_TOP_PAD: u32 = 12;
 
 /// Pixel height for `n` rows including top/bottom padding.
 fn rows_to_height(n: usize) -> u32 {
-    u32::try_from(n).unwrap_or(u32::MAX / ROW_HEIGHT) * ROW_HEIGHT + DIFF_TOP_PAD * 2
+    u32::try_from(n)
+        .unwrap_or(u32::MAX / ROW_HEIGHT)
+        .saturating_mul(ROW_HEIGHT)
+        .saturating_add(DIFF_TOP_PAD.saturating_mul(2))
 }
 
 /// Vertical center of the row at `idx` inside the diff body.
 fn row_center_y(idx: usize) -> u32 {
-    DIFF_TOP_PAD + u32::try_from(idx).unwrap_or(0) * ROW_HEIGHT + ROW_HEIGHT / 2
+    DIFF_TOP_PAD
+        .saturating_add(u32::try_from(idx).unwrap_or(0).saturating_mul(ROW_HEIGHT))
+        .saturating_add(ROW_HEIGHT / 2)
 }
 
 #[derive(Clone, PartialEq)]
@@ -414,7 +419,11 @@ impl TreeBuilder {
     }
 
     fn file_count(&self) -> usize {
-        self.files.len() + self.folders.values().map(Self::file_count).sum::<usize>()
+        self.folders
+            .values()
+            .fold(self.files.len(), |count, folder| {
+                count.saturating_add(folder.file_count())
+            })
     }
 
     fn flatten(
@@ -430,12 +439,14 @@ impl TreeBuilder {
                 depth,
                 file_count: child.file_count(),
             });
-            child.flatten(depth + 1, proposals, rows, file_row_by_id);
+            child.flatten(depth.saturating_add(1), proposals, rows, file_row_by_id);
         }
         let mut files = self.files.clone();
         files.sort_by(|a, b| a.0.cmp(&b.0));
         for (name, idx) in files {
-            let p = &proposals[idx];
+            let Some(p) = proposals.get(idx) else {
+                continue;
+            };
             let row_idx = rows.len();
             rows.push(TreeRow::File {
                 name,
@@ -449,16 +460,10 @@ impl TreeBuilder {
     }
 }
 
-const fn count_folders(rows: &[TreeRow]) -> usize {
-    let mut i = 0;
-    let mut count = 0;
-    while i < rows.len() {
-        if matches!(rows[i], TreeRow::Folder { .. }) {
-            count += 1;
-        }
-        i += 1;
-    }
-    count
+fn count_folders(rows: &[TreeRow]) -> usize {
+    rows.iter()
+        .filter(|row| matches!(row, TreeRow::Folder { .. }))
+        .count()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -847,7 +852,7 @@ fn TreeRowView(
             depth,
             file_count,
         } => {
-            let pad = 12 + depth * 24;
+            let pad = depth.saturating_mul(24).saturating_add(12);
             rsx! {
                 div {
                     class: "tree-row tree-folder",
@@ -868,7 +873,7 @@ fn TreeRowView(
             change_type,
             proposal_id,
         } => {
-            let pad = 12 + depth * 24;
+            let pad = depth.saturating_mul(24).saturating_add(12);
             let chip = confidence_chip(confidence);
             let is_rename = matches!(change_type, ChangeType::Rename | ChangeType::RenameAndMove);
 
@@ -2107,13 +2112,12 @@ fn confidence_chip(c: f32) -> (&'static str, String) {
     (cls, pct)
 }
 
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
-)]
 fn percent_u32(current: u64, total: Option<u64>) -> Option<u32> {
     let total = total.filter(|t| *t > 0)?;
-    let pct = (current.min(total) as f64 / total as f64 * 100.0).round();
-    Some(pct as u32)
+    let pct = current
+        .min(total)
+        .saturating_mul(100)
+        .saturating_add(total / 2)
+        .checked_div(total)?;
+    u32::try_from(pct).ok()
 }

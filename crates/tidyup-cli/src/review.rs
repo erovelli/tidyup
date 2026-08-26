@@ -143,7 +143,7 @@ fn prompt_each(proposals: Vec<ChangeProposal>) -> Result<Vec<ReviewDecision>> {
             decisions.push(ReviewDecision::Approve(p.id));
             continue;
         }
-        render_proposal(&term, i + 1, total, &p);
+        render_proposal(&term, i.saturating_add(1), total, &p);
         let mut misses = 0u32;
         loop {
             let key = match term.read_key() {
@@ -203,7 +203,7 @@ fn prompt_each(proposals: Vec<ChangeProposal>) -> Result<Vec<ReviewDecision>> {
                 // MAX_UNRECOGNIZED_KEYS); a single stray key on a real terminal
                 // just re-prompts without losing prior decisions.
                 _ => {
-                    misses += 1;
+                    misses = misses.saturating_add(1);
                     if misses >= MAX_UNRECOGNIZED_KEYS {
                         return Err(anyhow::anyhow!(
                             "interactive review received no valid keystroke after \
@@ -277,7 +277,7 @@ fn prompt_each_bundle(bundles: Vec<BundleProposal>) -> Result<Vec<Uuid>> {
             approved.push(b.id);
             continue;
         }
-        render_bundle(&term, i + 1, total, &b);
+        render_bundle(&term, i.saturating_add(1), total, &b);
         let mut misses = 0u32;
         loop {
             let key = match term.read_key() {
@@ -321,7 +321,7 @@ fn prompt_each_bundle(bundles: Vec<BundleProposal>) -> Result<Vec<Uuid>> {
                     break;
                 }
                 _ => {
-                    misses += 1;
+                    misses = misses.saturating_add(1);
                     if misses >= MAX_UNRECOGNIZED_KEYS {
                         return Err(anyhow::anyhow!(
                             "interactive review received no valid keystroke after \

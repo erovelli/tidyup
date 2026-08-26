@@ -1,6 +1,13 @@
 // `SigLIP` and other proper nouns appear frequently in this module; treating
 // them as missing-backticks is noise.
 #![allow(clippy::doc_markdown)]
+// Image/tensor dimensions are fixed by the model and checked before indexed
+// reads. The explicit numeric conversions implement NCHW image preprocessing.
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::indexing_slicing
+)]
 
 //! SigLIP cross-modal image/text embedding backend — Phase 7 multimodal Tier 2
 //! image classifier.

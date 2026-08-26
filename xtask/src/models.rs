@@ -39,7 +39,7 @@ pub fn download(force: bool, siglip: bool, clap: bool) -> Result<()> {
 
     let mut unpinned = 0usize;
     for bundle in bundles {
-        unpinned += download_bundle(&cache, bundle, force)?;
+        unpinned = unpinned.saturating_add(download_bundle(&cache, bundle, force)?);
     }
 
     if unpinned > 0 {
@@ -89,7 +89,7 @@ fn download_bundle(cache: &Path, bundle: &BundleSpec, force: bool) -> Result<usi
                         "  · {} already present — blake3={blake3} size={size} (unpinned)",
                         spec.filename
                     );
-                    unpinned += 1;
+                    unpinned = unpinned.saturating_add(1);
                 }
             }
             continue;
@@ -104,7 +104,7 @@ fn download_bundle(cache: &Path, bundle: &BundleSpec, force: bool) -> Result<usi
                     "  ✓ {} downloaded — blake3={blake3} size={size} (unpinned)",
                     spec.filename
                 );
-                unpinned += 1;
+                unpinned = unpinned.saturating_add(1);
             }
         }
     }
@@ -151,7 +151,7 @@ pub fn verify(siglip: bool, clap: bool) -> Result<()> {
         match verify_fn() {
             Ok(dir) => println!("  ✓ {name}: OK ({})", dir.display()),
             Err(e) => {
-                failures += 1;
+                failures = failures.saturating_add(1);
                 println!("  ✗ {name}: {e:#}");
             }
         }
@@ -194,10 +194,13 @@ fn fetch(dest: &Path, spec: &ArtifactSpec) -> Result<()> {
             if n == 0 {
                 break;
             }
+            let chunk = buf
+                .get(..n)
+                .ok_or_else(|| anyhow::anyhow!("download read exceeded transfer buffer"))?;
             writer
-                .write_all(&buf[..n])
+                .write_all(chunk)
                 .with_context(|| format!("write {}", tmp.display()))?;
-            bar.inc(n as u64);
+            bar.inc(u64::try_from(n).unwrap_or(u64::MAX));
         }
         writer.flush().ok();
     }

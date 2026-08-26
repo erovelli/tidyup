@@ -330,7 +330,9 @@ impl Calibration {
     /// Map a raw score to a calibrated confidence. `Identity` returns the input
     /// unchanged; `Platt` applies logistic scaling (output always in `[0, 1]`).
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
+    // The logistic result is bounded to `[0, 1]`; narrowing it to the public
+    // score type cannot overflow or change its sign.
+    #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
     pub fn calibrate(&self, raw: f32) -> f32 {
         match *self {
             Self::Identity => raw,

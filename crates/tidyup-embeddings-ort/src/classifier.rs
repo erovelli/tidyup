@@ -150,10 +150,12 @@ impl EmbeddingClassifier {
     pub fn top_k(&self, embedding: &[f32], k: usize) -> Vec<EmbeddingClassification> {
         rank_top_k(embedding, &self.category_embeddings, k)
             .into_iter()
-            .map(|(i, score)| EmbeddingClassification {
-                folder: self.entries[i].path.to_string(),
-                confidence: score,
-                entry_index: i,
+            .filter_map(|(i, score)| {
+                self.entries.get(i).map(|entry| EmbeddingClassification {
+                    folder: entry.path.to_string(),
+                    confidence: score,
+                    entry_index: i,
+                })
             })
             .collect()
     }
@@ -219,7 +221,13 @@ fn finalize(
     text: &str,
     filename: &str,
 ) -> EmbeddingClassification {
-    let entry = &entries[idx];
+    let Some(entry) = entries.get(idx) else {
+        return EmbeddingClassification {
+            folder: "Other/".to_string(),
+            confidence: score,
+            entry_index: idx,
+        };
+    };
     let folder = if entry.temporal {
         extract_year(text, filename)
             .map_or_else(|| entry.path.to_string(), |y| format!("{}{y}/", entry.path))

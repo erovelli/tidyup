@@ -37,7 +37,10 @@ fn parse_domain<T, E: std::error::Error + Send + Sync + 'static>(
     })
 }
 
-#[allow(clippy::cast_possible_truncation)]
+// SQLite represents REAL values as f64, while domain confidence scores are
+// intentionally f32. Values originate from f32 on write, so this round-trip is
+// bounded and the narrowing is deliberate.
+#[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
 const fn f64_to_f32(v: f64) -> f32 {
     v as f32
 }

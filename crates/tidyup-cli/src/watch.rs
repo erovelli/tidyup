@@ -198,10 +198,12 @@ fn drain_relevant(
     window: Duration,
 ) -> usize {
     let mut count = count_relevant(first);
-    let deadline = Instant::now() + window;
+    let Some(deadline) = Instant::now().checked_add(window) else {
+        return count;
+    };
     while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
         match rx.recv_timeout(remaining) {
-            Ok(event) => count += count_relevant(&event),
+            Ok(event) => count = count.saturating_add(count_relevant(&event)),
             Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
         }
     }

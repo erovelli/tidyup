@@ -42,8 +42,7 @@ fn row_to_file(row: &Row<'_>) -> rusqlite::Result<IndexedFile> {
     let id = Uuid::parse_str(&id_str).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
     })?;
-    #[allow(clippy::cast_sign_loss)]
-    let size_bytes = if size < 0 { 0 } else { size as u64 };
+    let size_bytes = u64::try_from(size).unwrap_or(0);
     Ok(IndexedFile {
         id: FileId(id),
         path: PathBuf::from(path_str),

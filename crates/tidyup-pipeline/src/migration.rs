@@ -140,8 +140,7 @@ pub async fn run_migration(
         }
     }
 
-    #[allow(clippy::cast_possible_truncation)]
-    let total = tree.loose_files.len() as u64;
+    let total = u64::try_from(tree.loose_files.len()).unwrap_or(u64::MAX);
     progress
         .phase_started(Phase::Classifying, Some(total))
         .await;
@@ -183,8 +182,7 @@ pub async fn run_migration(
                 Phase::Classifying,
                 ProgressItem {
                     label: path.display().to_string(),
-                    #[allow(clippy::cast_possible_truncation)]
-                    current: (idx as u64) + 1,
+                    current: u64::try_from(idx).unwrap_or(u64::MAX).saturating_add(1),
                     total: Some(total),
                 },
             )
@@ -325,12 +323,12 @@ async fn classify_file(
         return Ok(None);
     }
 
-    let (tier2_folder, tier2_score, tier2_breakdown) = ranked[0].clone();
-    let tier2_gap = if ranked.len() >= 2 {
-        tier2_score - ranked[1].1
-    } else {
-        tier2_score
+    let Some((tier2_folder, tier2_score, tier2_breakdown)) = ranked.first().cloned() else {
+        return Ok(None);
     };
+    let tier2_gap = ranked
+        .get(1)
+        .map_or(tier2_score, |(_, score, _)| tier2_score - score);
     let tier2_needs_review =
         tier2_score < config.embedding_threshold || tier2_gap < config.ambiguity_gap;
 
@@ -356,20 +354,19 @@ async fn classify_file(
             )
             .await
             {
-                Ok(Some((rerank, model_id))) if rerank[0].1 > chosen_score => {
-                    let (f, s, b) = rerank[0].clone();
-                    let g = if rerank.len() >= 2 {
-                        s - rerank[1].1
-                    } else {
-                        s
-                    };
-                    chosen_folder = f;
-                    chosen_score = s;
-                    chosen_gap = g;
-                    chosen_breakdown = b;
-                    chosen_ranked = rerank;
-                    tier3_used = true;
-                    tier3_model = Some(model_id);
+                Ok(Some((rerank, model_id))) => {
+                    if let Some((f, s, b)) = rerank.first().cloned() {
+                        if s > chosen_score {
+                            let g = rerank.get(1).map_or(s, |(_, score, _)| s - score);
+                            chosen_folder = f;
+                            chosen_score = s;
+                            chosen_gap = g;
+                            chosen_breakdown = b;
+                            chosen_ranked = rerank;
+                            tier3_used = true;
+                            tier3_model = Some(model_id);
+                        }
+                    }
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -681,12 +678,8 @@ fn rank_centroids(
     }
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    let (folder, score) = ranked[0].clone();
-    let gap = if ranked.len() >= 2 {
-        score - ranked[1].1
-    } else {
-        score
-    };
+    let (folder, score) = ranked.first().cloned()?;
+    let gap = ranked.get(1).map_or(score, |(_, next)| score - next);
     let needs_review = score < config.embedding_threshold || gap < config.ambiguity_gap;
 
     let candidates: Vec<Candidate> = ranked
@@ -918,28 +911,7 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 }
 
 fn find_year(s: &str) -> Option<i32> {
-    let bytes = s.as_bytes();
-    if bytes.len() < 4 {
-        return None;
-    }
-    for i in 0..=bytes.len() - 4 {
-        if bytes[i] == b'2'
-            && bytes[i + 1] == b'0'
-            && bytes[i + 2].is_ascii_digit()
-            && bytes[i + 3].is_ascii_digit()
-        {
-            let before_ok = i == 0 || !bytes[i - 1].is_ascii_digit();
-            let after_ok = i + 4 >= bytes.len() || !bytes[i + 4].is_ascii_digit();
-            if before_ok && after_ok {
-                if let Ok(y) = s[i..i + 4].parse::<i32>() {
-                    if (2000..=2039).contains(&y) {
-                        return Some(y);
-                    }
-                }
-            }
-        }
-    }
-    None
+    crate::text_util::find_year(s)
 }
 
 fn build_proposal(source: &Path, v: &Verdict) -> ChangeProposal {
@@ -1442,28 +1414,28 @@ mod tests {
             _f: &str,
             _m: &str,
         ) -> tidyup_core::Result<tidyup_core::inference::ContentClassification> {
-            unreachable!()
+            panic!("audio path not exercised by this test")
         }
         async fn classify_video(
             &self,
             _f: &str,
             _c: &[String],
         ) -> tidyup_core::Result<tidyup_core::inference::ContentClassification> {
-            unreachable!()
+            panic!("video path not exercised by this test")
         }
         async fn classify_image_description(
             &self,
             _f: &str,
             _d: &str,
         ) -> tidyup_core::Result<tidyup_core::inference::ContentClassification> {
-            unreachable!()
+            panic!("image-description path not exercised by this test")
         }
         async fn complete(
             &self,
             _p: &str,
             _o: &tidyup_core::inference::GenerationOptions,
         ) -> tidyup_core::Result<String> {
-            unreachable!()
+            panic!("completion path not exercised by this test")
         }
         fn model_id(&self) -> &'static str {
             "stub-llm"

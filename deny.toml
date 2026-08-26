@@ -20,6 +20,12 @@ ignore  = [
     # hf-hub -> mistralrs. Only reachable under --features llm-fallback.
     { id = "RUSTSEC-2025-0119", reason = "transitive via hf-hub -> indicatif; only under --features llm-fallback; no upstream fix" },
 
+    # ttf-parser 0.25.1 is unmaintained, but has no reported vulnerability and
+    # no safe upgrade. It remains a transitive dependency of the latest
+    # pdf-extract 0.12 -> lopdf 0.42 chain. Revisit when lopdf adopts skrifa or
+    # another maintained font parser.
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser: unmaintained transitive dependency of latest pdf-extract/lopdf; no safe upgrade" },
+
     # gtk-rs GTK3 bindings archived 2024. Pulled in transitively via
     # dioxus-desktop -> wry/tao/muda/tray-icon only in the `tidyup-ui` binary.
     # Upstream recommends migrating to gtk4-rs, but wry/tao haven't cut over

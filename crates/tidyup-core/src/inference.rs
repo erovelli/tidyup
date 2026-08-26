@@ -363,10 +363,9 @@ Respond ONLY with the JSON object. No explanation."#;
 /// and surrounding prose. Implementations of [`TextBackend`] should pass raw
 /// model responses through this rather than reimplementing parsing.
 pub fn parse_content_classification(content: &str) -> Result<ContentClassification> {
-    let stripped = content.find("</think>").map_or_else(
-        || content.trim(),
-        |pos| content[pos + "</think>".len()..].trim(),
-    );
+    let stripped = content
+        .split_once("</think>")
+        .map_or_else(|| content.trim(), |(_, after)| after.trim());
 
     if let Ok(c) = serde_json::from_str::<ContentClassification>(stripped) {
         return Ok(c);
@@ -384,8 +383,10 @@ pub fn parse_content_classification(content: &str) -> Result<ContentClassificati
 
     if let (Some(start), Some(end)) = (cleaned.find('{'), cleaned.rfind('}')) {
         if end > start {
-            if let Ok(c) = serde_json::from_str::<ContentClassification>(&cleaned[start..=end]) {
-                return Ok(c);
+            if let Some(json) = cleaned.get(start..=end) {
+                if let Ok(c) = serde_json::from_str::<ContentClassification>(json) {
+                    return Ok(c);
+                }
             }
         }
     }

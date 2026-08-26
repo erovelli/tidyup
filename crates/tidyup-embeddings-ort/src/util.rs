@@ -32,14 +32,12 @@ pub fn l2_normalize(v: &mut [f32]) {
 #[must_use]
 pub fn extract_year(text: &str, filename: &str) -> Option<i32> {
     find_year_in(filename).or_else(|| {
-        // Char-boundary-safe window: byte 1000 may split a multibyte codepoint,
-        // which a raw `&text[..1000]` would panic on. Round the cut down to a
-        // boundary. (`is_char_boundary(0)` is always true, so this terminates.)
-        let mut end = text.len().min(1000);
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        find_year_in(&text[..end])
+        let excerpt = text
+            .char_indices()
+            .nth(1000)
+            .and_then(|(end, _)| text.get(..end))
+            .unwrap_or(text);
+        find_year_in(excerpt)
     })
 }
 
@@ -48,22 +46,25 @@ pub fn extract_year(text: &str, filename: &str) -> Option<i32> {
 /// edges, so `file12024.pdf` and `file20249.pdf` both return `None`.
 fn find_year_in(s: &str) -> Option<i32> {
     let bytes = s.as_bytes();
-    let len = bytes.len();
-    if len < 4 {
-        return None;
-    }
-    for i in 0..=len - 4 {
-        if bytes[i] == b'2'
-            && bytes[i + 1] == b'0'
-            && bytes[i + 2].is_ascii_digit()
-            && bytes[i + 3].is_ascii_digit()
-        {
-            let before_ok = i == 0 || !bytes[i - 1].is_ascii_digit();
-            let after_ok = i + 4 >= len || !bytes[i + 4].is_ascii_digit();
-            if before_ok && after_ok {
-                if let Ok(year) = s[i..i + 4].parse::<i32>() {
-                    if (2000..=2039).contains(&year) {
-                        return Some(year);
+    for (i, window) in bytes.windows(4).enumerate() {
+        if let [b'2', b'0', third, fourth] = window {
+            if third.is_ascii_digit() && fourth.is_ascii_digit() {
+                let before_ok = i
+                    .checked_sub(1)
+                    .and_then(|before| bytes.get(before))
+                    .is_none_or(|byte| !byte.is_ascii_digit());
+                let after_ok = i
+                    .checked_add(4)
+                    .and_then(|after| bytes.get(after))
+                    .is_none_or(|byte| !byte.is_ascii_digit());
+                if before_ok && after_ok {
+                    if let Ok(year) = std::str::from_utf8(window)
+                        .unwrap_or_default()
+                        .parse::<i32>()
+                    {
+                        if (2000..=2039).contains(&year) {
+                            return Some(year);
+                        }
                     }
                 }
             }

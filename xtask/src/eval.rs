@@ -16,6 +16,14 @@
 //! calibration work). It is intentionally **not** wired into `cargo xtask ci`,
 //! which must stay model-free.
 
+// This developer-only evaluator computes aggregate metrics and indexes vectors
+// whose dimensions are established by the loaded corpus.
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::indexing_slicing
+)]
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

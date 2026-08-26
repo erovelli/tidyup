@@ -213,7 +213,7 @@ impl ContentExtractor for PlainTextExtractor {
         let mut buf = Vec::new();
         (&mut file).take(MAX_BYTES).read_to_end(&mut buf).await?;
 
-        let truncated = buf.len() as u64 == MAX_BYTES;
+        let truncated = u64::try_from(buf.len()).is_ok_and(|len| len == MAX_BYTES);
         let text = String::from_utf8_lossy(&buf).into_owned();
         let mime = crate::mime::detect(path)
             .await

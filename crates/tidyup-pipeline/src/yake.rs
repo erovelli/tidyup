@@ -36,6 +36,14 @@
 //! the English `bge-small` model — full multilingual *classification* awaits a
 //! multilingual embedding model (`bge-m3`).
 
+// YAKE's scoring equations and adjacent-token windows use indices whose
+// bounds are established by construction in this module.
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::indexing_slicing
+)]
+
 use std::collections::{HashMap, HashSet};
 
 /// Longest keyphrase (in words) the extractor will consider.
