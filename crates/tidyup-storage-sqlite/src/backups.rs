@@ -91,7 +91,10 @@ fn hash_file(path: &Path) -> Result<String> {
         if n == 0 {
             break;
         }
-        hasher.update(&buf[..n]);
+        let chunk = buf
+            .get(..n)
+            .ok_or_else(|| anyhow!("file read exceeded the hashing buffer"))?;
+        hasher.update(chunk);
     }
     Ok(hasher.finalize().to_hex().to_string())
 }
@@ -418,7 +421,9 @@ impl BackupStore for SqliteStore {
     async fn prune_older_than_days(&self, days: u32) -> tidyup_core::Result<usize> {
         let conn = self.conn();
         let result = tokio::task::spawn_blocking(move || -> Result<usize> {
-            let cutoff = Utc::now() - chrono::Duration::days(i64::from(days));
+            let cutoff = Utc::now()
+                .checked_sub_signed(chrono::Duration::days(i64::from(days)))
+                .ok_or_else(|| anyhow!("backup retention cutoff is outside the supported range"))?;
             let shelved = BackupStatus::Shelved.as_str();
             let expired = BackupStatus::Expired.as_str();
             let victims: Vec<PathBuf> = {

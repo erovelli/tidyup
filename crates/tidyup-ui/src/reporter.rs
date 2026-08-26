@@ -75,7 +75,7 @@ impl ProgressReporter for DioxusReporter {
         messages.with_mut(|list| {
             list.push(entry);
             if list.len() > MAX_MESSAGES {
-                let drop_n = list.len() - MAX_MESSAGES;
+                let drop_n = list.len().saturating_sub(MAX_MESSAGES);
                 list.drain(0..drop_n);
             }
         });

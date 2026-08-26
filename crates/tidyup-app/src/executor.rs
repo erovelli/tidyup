@@ -73,8 +73,7 @@ pub async fn apply_loose_decisions(
     // a file. (Rejected decisions don't contribute a target.)
     check_no_duplicate_targets(decisions, &by_id)?;
 
-    #[allow(clippy::cast_possible_truncation)]
-    let total = decisions.len() as u64;
+    let total = u64::try_from(decisions.len()).unwrap_or(u64::MAX);
     deps.progress
         .phase_started(Phase::Applying, Some(total))
         .await;
@@ -88,7 +87,7 @@ pub async fn apply_loose_decisions(
                 new_target,
             } => (*proposal_id, Some(new_target.clone())),
             ReviewDecision::Reject(id) => {
-                report.skipped += 1;
+                report.skipped = report.skipped.saturating_add(1);
                 // Persist the review outcome so the rejected proposal leaves the
                 // pending set (else it re-surfaces on every run). Only on a real
                 // apply — a dry-run is a pure preview that mutates no state.
@@ -107,7 +106,7 @@ pub async fn apply_loose_decisions(
         };
 
         let Some(proposal) = by_id.get(&proposal_id) else {
-            report.skipped += 1;
+            report.skipped = report.skipped.saturating_add(1);
             continue;
         };
 
@@ -117,21 +116,20 @@ pub async fn apply_loose_decisions(
 
         match apply_single(proposal, &target, deps, dry_run).await {
             Ok(()) => {
-                report.applied += 1;
+                report.applied = report.applied.saturating_add(1);
                 deps.progress
                     .item_completed(
                         Phase::Applying,
                         ProgressItem {
                             label: proposal.original_path.display().to_string(),
-                            #[allow(clippy::cast_possible_truncation)]
-                            current: (idx as u64) + 1,
+                            current: u64::try_from(idx).unwrap_or(u64::MAX).saturating_add(1),
                             total: Some(total),
                         },
                     )
                     .await;
             }
             Err(e) => {
-                report.failed += 1;
+                report.failed = report.failed.saturating_add(1);
                 deps.progress
                     .message(
                         Level::Warn,
@@ -165,7 +163,7 @@ pub async fn apply_bundles(
     }
     for bundle in bundles {
         if !auto_apply.contains(&bundle.id) {
-            report.bundles_skipped += 1;
+            report.bundles_skipped = report.bundles_skipped.saturating_add(1);
             continue;
         }
         // Two atomic strategies: directory bundles (code projects, etc.) move by
@@ -178,9 +176,9 @@ pub async fn apply_bundles(
             apply_bundle_atomic(bundle, deps, dry_run).await
         };
         match result {
-            Ok(()) => report.bundles_applied += 1,
+            Ok(()) => report.bundles_applied = report.bundles_applied.saturating_add(1),
             Err(e) => {
-                report.bundles_failed += 1;
+                report.bundles_failed = report.bundles_failed.saturating_add(1);
                 deps.progress
                     .message(
                         Level::Warn,
@@ -528,7 +526,10 @@ fn blake3_stream(path: &Path) -> anyhow::Result<String> {
         if n == 0 {
             break;
         }
-        hasher.update(&buf[..n]);
+        let chunk = buf
+            .get(..n)
+            .ok_or_else(|| anyhow::anyhow!("file read exceeded hashing buffer"))?;
+        hasher.update(chunk);
     }
     Ok(hasher.finalize().to_hex().to_string())
 }

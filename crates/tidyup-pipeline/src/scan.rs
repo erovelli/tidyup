@@ -177,8 +177,7 @@ pub async fn run_scan(
         }
     }
 
-    #[allow(clippy::cast_possible_truncation)]
-    let total = loose_files.len() as u64;
+    let total = u64::try_from(loose_files.len()).unwrap_or(u64::MAX);
     progress
         .phase_started(Phase::Classifying, Some(total))
         .await;
@@ -220,8 +219,7 @@ pub async fn run_scan(
                 Phase::Classifying,
                 ProgressItem {
                     label: path.display().to_string(),
-                    #[allow(clippy::cast_possible_truncation)]
-                    current: (idx as u64) + 1,
+                    current: u64::try_from(idx).unwrap_or(u64::MAX).saturating_add(1),
                     total: Some(total),
                 },
             )
@@ -416,7 +414,9 @@ async fn classify_file(
         }
     }
 
-    let candidate = &candidates[chosen_idx];
+    let candidate = candidates
+        .get(chosen_idx)
+        .ok_or_else(|| anyhow::anyhow!("selected classification candidate is out of bounds"))?;
     let final_needs_review =
         chosen_score < config.embedding_threshold || chosen_gap < config.ambiguity_gap;
 
@@ -589,7 +589,9 @@ async fn classify_image(
     let Some(idx) = best_idx else {
         return Ok(None);
     };
-    let candidate = &ctx.candidates[idx];
+    let Some(candidate) = ctx.candidates.get(idx) else {
+        return Ok(None);
+    };
     let needs_review = best_score < config.embedding_threshold || gap < config.ambiguity_gap;
     let year = year_from_path_and_text(path, extracted.and_then(|e| e.text.as_deref()));
     Ok(Some(ClassifiedFile {
@@ -639,7 +641,9 @@ async fn classify_audio(
     let Some(idx) = best_idx else {
         return Ok(None);
     };
-    let candidate = &ctx.candidates[idx];
+    let Some(candidate) = ctx.candidates.get(idx) else {
+        return Ok(None);
+    };
     let needs_review = best_score < config.embedding_threshold || gap < config.ambiguity_gap;
     let year = year_from_path_and_text(path, extracted.and_then(|e| e.text.as_deref()));
     Ok(Some(ClassifiedFile {
@@ -827,28 +831,7 @@ fn year_from_path_and_text(path: &Path, text: Option<&str>) -> Option<i32> {
 }
 
 fn find_year(s: &str) -> Option<i32> {
-    let bytes = s.as_bytes();
-    if bytes.len() < 4 {
-        return None;
-    }
-    for i in 0..=bytes.len() - 4 {
-        if bytes[i] == b'2'
-            && bytes[i + 1] == b'0'
-            && bytes[i + 2].is_ascii_digit()
-            && bytes[i + 3].is_ascii_digit()
-        {
-            let before_ok = i == 0 || !bytes[i - 1].is_ascii_digit();
-            let after_ok = i + 4 >= bytes.len() || !bytes[i + 4].is_ascii_digit();
-            if before_ok && after_ok {
-                if let Ok(y) = s[i..i + 4].parse::<i32>() {
-                    if (2000..=2039).contains(&y) {
-                        return Some(y);
-                    }
-                }
-            }
-        }
-    }
-    None
+    crate::text_util::find_year(s)
 }
 
 fn build_proposal(source: &Path, output_root: &Path, c: &ClassifiedFile) -> ChangeProposal {
@@ -1497,28 +1480,28 @@ mod tests {
             _filename: &str,
             _metadata: &str,
         ) -> tidyup_core::Result<tidyup_core::inference::ContentClassification> {
-            unreachable!("audio path not exercised by these tests")
+            panic!("audio path not exercised by these tests")
         }
         async fn classify_video(
             &self,
             _filename: &str,
             _frame_captions: &[String],
         ) -> tidyup_core::Result<tidyup_core::inference::ContentClassification> {
-            unreachable!("video path not exercised by these tests")
+            panic!("video path not exercised by these tests")
         }
         async fn classify_image_description(
             &self,
             _filename: &str,
             _description: &str,
         ) -> tidyup_core::Result<tidyup_core::inference::ContentClassification> {
-            unreachable!("image-desc path not exercised by these tests")
+            panic!("image-desc path not exercised by these tests")
         }
         async fn complete(
             &self,
             _prompt: &str,
             _opts: &tidyup_core::inference::GenerationOptions,
         ) -> tidyup_core::Result<String> {
-            unreachable!("complete not exercised by these tests")
+            panic!("complete not exercised by these tests")
         }
         fn model_id(&self) -> &'static str {
             "stub-llm"
@@ -1672,28 +1655,28 @@ mod tests {
                 _f: &str,
                 _m: &str,
             ) -> tidyup_core::Result<tidyup_core::inference::ContentClassification> {
-                unreachable!()
+                panic!("audio path not exercised by this test")
             }
             async fn classify_video(
                 &self,
                 _f: &str,
                 _c: &[String],
             ) -> tidyup_core::Result<tidyup_core::inference::ContentClassification> {
-                unreachable!()
+                panic!("video path not exercised by this test")
             }
             async fn classify_image_description(
                 &self,
                 _f: &str,
                 _d: &str,
             ) -> tidyup_core::Result<tidyup_core::inference::ContentClassification> {
-                unreachable!()
+                panic!("image-description path not exercised by this test")
             }
             async fn complete(
                 &self,
                 _p: &str,
                 _o: &tidyup_core::inference::GenerationOptions,
             ) -> tidyup_core::Result<String> {
-                unreachable!()
+                panic!("completion path not exercised by this test")
             }
             fn model_id(&self) -> &'static str {
                 "exploding"

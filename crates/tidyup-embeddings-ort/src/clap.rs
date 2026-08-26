@@ -1,6 +1,15 @@
 // `CLAP` and `Symphonia` are proper nouns repeated throughout; doc_markdown
 // here is noise.
 #![allow(clippy::doc_markdown)]
+// Tensor dimensions are validated before indexing, and the DSP arithmetic is
+// intentionally wrapping neither integers nor user-controlled offsets. Keep
+// the numerical kernels readable while the workspace denies these lints for
+// ordinary application code.
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::indexing_slicing
+)]
 
 //! CLAP cross-modal audio/text embedding backend — Phase 7 multimodal Tier 2
 //! audio classifier.

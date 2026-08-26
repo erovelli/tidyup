@@ -319,7 +319,7 @@ impl TextBackend for RemoteText {
         let captions = frame_captions
             .iter()
             .enumerate()
-            .map(|(i, c)| format!("Frame {}: {c}", i + 1))
+            .map(|(i, c)| format!("Frame {}: {c}", i.saturating_add(1)))
             .collect::<Vec<_>>()
             .join("\n");
         let user = format!("Filename: {filename}\n\nFrame descriptions:\n{captions}");

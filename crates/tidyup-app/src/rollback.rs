@@ -122,9 +122,11 @@ impl RollbackService {
         // Bundles first — atomic per-bundle restore.
         for bundle in &bundles {
             match self.rollback_bundle(bundle, progress).await {
-                Ok(RestoreOutcome::Restored) => report.bundles_restored += 1,
+                Ok(RestoreOutcome::Restored) => {
+                    report.bundles_restored = report.bundles_restored.saturating_add(1);
+                }
                 Ok(RestoreOutcome::Conflict(why)) => {
-                    report.conflicts += 1;
+                    report.conflicts = report.conflicts.saturating_add(1);
                     progress
                         .message(
                             Level::Warn,
@@ -137,7 +139,7 @@ impl RollbackService {
                         .await;
                 }
                 Err(e) => {
-                    report.failures += 1;
+                    report.failures = report.failures.saturating_add(1);
                     progress
                         .message(
                             Level::Warn,
@@ -150,9 +152,11 @@ impl RollbackService {
 
         for proposal in &proposals {
             match self.rollback_proposal(proposal, progress).await {
-                Ok(RestoreOutcome::Restored) => report.restored += 1,
+                Ok(RestoreOutcome::Restored) => {
+                    report.restored = report.restored.saturating_add(1);
+                }
                 Ok(RestoreOutcome::Conflict(why)) => {
-                    report.conflicts += 1;
+                    report.conflicts = report.conflicts.saturating_add(1);
                     progress
                         .message(
                             Level::Warn,
@@ -165,7 +169,7 @@ impl RollbackService {
                         .await;
                 }
                 Err(e) => {
-                    report.failures += 1;
+                    report.failures = report.failures.saturating_add(1);
                     progress
                         .message(
                             Level::Warn,

@@ -139,7 +139,8 @@ async fn build_llm_backend(config: &TidyupConfig) -> Result<Arc<dyn TextBackend>
     let engine = tidyup_inference_mistralrs::MistralRsEngine::load(model_id)
         .await
         .context("loading mistralrs Tier 3 backend")?;
-    Ok(engine as Arc<dyn TextBackend>)
+    let backend: Arc<dyn TextBackend> = engine;
+    Ok(backend)
 }
 
 #[cfg(not(feature = "llm-fallback"))]

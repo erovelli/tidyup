@@ -39,7 +39,7 @@ async fn read_prefix(path: &Path) -> Option<Vec<u8>> {
         }
     };
     let mut buf = Vec::with_capacity(SNIFF_BYTES);
-    let mut limited = (&mut file).take(SNIFF_BYTES as u64);
+    let mut limited = (&mut file).take(u64::try_from(SNIFF_BYTES).unwrap_or(u64::MAX));
     if let Err(e) = limited.read_to_end(&mut buf).await {
         tracing::debug!("mime sniff: read failed for {}: {e}", path.display());
         return None;

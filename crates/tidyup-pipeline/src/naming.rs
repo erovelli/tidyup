@@ -264,7 +264,7 @@ fn truncate_at_boundary(s: &str, max: usize) -> String {
     if let Some(pos) = window.rfind('_') {
         // Only back off to the underscore if it leaves at least half the budget.
         if pos >= max / 2 {
-            return s[..pos].to_string();
+            return window.get(..pos).unwrap_or(window).to_string();
         }
     }
     window.to_string()

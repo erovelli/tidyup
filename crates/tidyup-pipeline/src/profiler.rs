@@ -177,7 +177,7 @@ fn build_node(root: &Path, dir: &Path, parent_segments: &[String]) -> io::Result
     let depth = if dir == root {
         0
     } else {
-        u32::try_from(parent_segments.len() + 1).unwrap_or(u32::MAX)
+        u32::try_from(parent_segments.len().saturating_add(1)).unwrap_or(u32::MAX)
     };
 
     let mut path_segments = parent_segments.to_vec();
@@ -215,7 +215,8 @@ fn build_node(root: &Path, dir: &Path, parent_segments: &[String]) -> io::Result
                 .and_then(|s| s.to_str())
                 .map(str::to_ascii_lowercase)
             {
-                *extension_counts.entry(format!(".{ext}")).or_insert(0) += 1;
+                let count = extension_counts.entry(format!(".{ext}")).or_insert(0);
+                *count = count.saturating_add(1);
             }
             if let Ok(meta) = entry.metadata() {
                 total_size = total_size.saturating_add(meta.len());
@@ -354,21 +355,21 @@ pub fn detect_organization<S: std::hash::BuildHasher>(
     let total = child_names.len();
 
     let year_hits = child_names.iter().filter(|n| is_year_bucket(n)).count();
-    if year_hits * 2 >= total {
+    if year_hits >= total.div_ceil(2) {
         return OrganizationType::DateBased {
             pattern: DatePattern::Year,
         };
     }
 
     let quarter_hits = child_names.iter().filter(|n| is_quarter_bucket(n)).count();
-    if quarter_hits * 2 >= total {
+    if quarter_hits >= total.div_ceil(2) {
         return OrganizationType::DateBased {
             pattern: DatePattern::Quarter,
         };
     }
 
     let month_hits = child_names.iter().filter(|n| is_month_bucket(n)).count();
-    if month_hits * 2 >= total {
+    if month_hits >= total.div_ceil(2) {
         return OrganizationType::DateBased {
             pattern: DatePattern::Month,
         };
@@ -396,21 +397,19 @@ fn is_year_bucket(name: &str) -> bool {
 
 fn is_quarter_bucket(name: &str) -> bool {
     // 2024-Q1, 2024_Q1, Q1-2024, Q1_2024
-    let parts: Vec<&str> = name.split(['-', '_']).collect();
-    if parts.len() != 2 {
+    let mut parts = name.split(['-', '_']);
+    let (Some(a), Some(b), None) = (parts.next(), parts.next(), parts.next()) else {
         return false;
-    }
-    let (a, b) = (parts[0], parts[1]);
+    };
     is_year_token(a) && is_quarter_token(b) || is_quarter_token(a) && is_year_token(b)
 }
 
 fn is_month_bucket(name: &str) -> bool {
     // 2024-01, 2024_01, 01-2024, jan-2024, 2024-jan
-    let parts: Vec<&str> = name.split(['-', '_']).collect();
-    if parts.len() != 2 {
+    let mut parts = name.split(['-', '_']);
+    let (Some(a), Some(b), None) = (parts.next(), parts.next(), parts.next()) else {
         return false;
-    }
-    let (a, b) = (parts[0], parts[1]);
+    };
     (is_year_token(a) && is_month_token(b)) || (is_month_token(a) && is_year_token(b))
 }
 
@@ -697,7 +696,7 @@ impl CentroidAccumulator {
             );
             return;
         }
-        self.count += 1;
+        self.count = self.count.saturating_add(1);
     }
 
     fn finish(mut self) -> (Option<Vec<f32>>, u32) {
@@ -882,7 +881,7 @@ pub fn diff_scans(previous: &TargetScan, current: &TargetScan) -> ScanDiff {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::float_cmp)]
+#[allow(clippy::as_conversions, clippy::float_cmp, clippy::unwrap_used)]
 mod tests {
     use super::*;
     use anyhow::Result;

@@ -22,7 +22,7 @@ pub fn content_hash_of(path: &Path) -> Option<String> {
     loop {
         match file.read(&mut buf) {
             Ok(0) => break,
-            Ok(n) => hasher.update(&buf[..n]),
+            Ok(n) => hasher.update(buf.get(..n)?),
             Err(_) => return None,
         };
     }

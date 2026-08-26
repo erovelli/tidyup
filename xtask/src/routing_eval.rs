@@ -45,6 +45,14 @@
 //! inter-annotator agreement on the labels. And like the rest of `eval`, this
 //! needs the embedding model installed — it is **not** part of model-free CI.
 
+// This developer-only statistical harness performs bounded train/test splits,
+// bootstrap indexing, and usize/float conversions for aggregate metrics.
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::indexing_slicing
+)]
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -728,7 +736,7 @@ mod tests {
     #[async_trait::async_trait]
     impl EmbeddingBackend for BatchRecordingBackend {
         async fn embed_text(&self, _t: &str) -> Result<Vec<f32>> {
-            unreachable!("routing eval uses embed_texts")
+            panic!("routing eval uses embed_texts")
         }
         async fn embed_texts(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
             use std::sync::atomic::Ordering::SeqCst;

@@ -214,11 +214,12 @@ fn shorten(s: &str) -> String {
     // a byte-slice panic. Rounding the start *up* keeps the suffix valid and
     // no longer than the budget.
     let tail_len = MAX.saturating_sub(3);
-    let mut start = s.len() - tail_len;
-    while !s.is_char_boundary(start) {
-        start += 1;
-    }
-    format!("…{}", &s[start..])
+    let min_start = s.len().saturating_sub(tail_len);
+    let suffix = s
+        .char_indices()
+        .find_map(|(start, _)| (start >= min_start).then(|| s.get(start..)).flatten())
+        .unwrap_or(s);
+    format!("…{suffix}")
 }
 
 #[cfg(test)]

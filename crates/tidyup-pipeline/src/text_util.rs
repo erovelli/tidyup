@@ -15,12 +15,39 @@ pub fn char_prefix(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
         return s;
     }
-    let mut end = max_bytes;
-    // `is_char_boundary(0)` is always true, so this terminates.
-    while !s.is_char_boundary(end) {
-        end -= 1;
+    let end = s
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= max_bytes)
+        .last()
+        .unwrap_or(0);
+    s.get(..end).unwrap_or_default()
+}
+
+/// Find the first standalone year in the supported `2000..=2039` range.
+#[must_use]
+pub fn find_year(s: &str) -> Option<i32> {
+    let bytes = s.as_bytes();
+    for (index, window) in bytes.windows(4).enumerate() {
+        if let [b'2', b'0', third, fourth] = window {
+            if !third.is_ascii_digit() || !fourth.is_ascii_digit() {
+                continue;
+            }
+            let before_ok = index
+                .checked_sub(1)
+                .and_then(|before| bytes.get(before))
+                .is_none_or(|byte| !byte.is_ascii_digit());
+            let after_ok = index
+                .checked_add(4)
+                .and_then(|after| bytes.get(after))
+                .is_none_or(|byte| !byte.is_ascii_digit());
+            let year = std::str::from_utf8(window).ok()?.parse::<i32>().ok()?;
+            if before_ok && after_ok && (2000..=2039).contains(&year) {
+                return Some(year);
+            }
+        }
     }
-    &s[..end]
+    None
 }
 
 #[cfg(test)]

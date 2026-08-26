@@ -238,7 +238,7 @@ fn group_by_time_window(
 
     for item in items {
         if let Some((_, last_t)) = current.last() {
-            if item.1 - *last_t > window_secs {
+            if item.1.saturating_sub(*last_t) > window_secs {
                 flush_window(&mut current, &mut groups, &mut leftover, min);
             }
         }

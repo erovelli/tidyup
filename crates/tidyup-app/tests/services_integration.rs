@@ -7,7 +7,12 @@
 //!
 //! [`ChangeLog`]: tidyup_core::storage::ChangeLog
 
-#![allow(clippy::unwrap_used, clippy::missing_panics_doc)]
+#![allow(
+    clippy::as_conversions,
+    clippy::indexing_slicing,
+    clippy::missing_panics_doc,
+    clippy::unwrap_used
+)]
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};

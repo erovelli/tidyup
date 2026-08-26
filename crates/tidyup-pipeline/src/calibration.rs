@@ -9,6 +9,14 @@
 //!
 //! Pure math — no models, no I/O — so it runs in CI and carries its own tests.
 
+// Fitting and binning are numerical kernels over validated in-memory vectors.
+// Primitive float narrowing has no fallible standard-library equivalent.
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::indexing_slicing
+)]
+
 use tidyup_domain::Calibration;
 
 const FIT_EPOCHS: usize = 500;
