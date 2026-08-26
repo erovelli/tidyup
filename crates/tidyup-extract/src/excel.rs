@@ -126,7 +126,7 @@ fn transcribe_workbook(path: &Path) -> std::result::Result<(String, Vec<String>,
             let cells: Vec<String> = row.iter().map(|c| format!("{c}")).collect();
             text.push_str(&cells.join("\t"));
             text.push('\n');
-            rows_read += 1;
+            rows_read = rows_read.saturating_add(1);
         }
     }
 
