@@ -131,6 +131,7 @@ pub async fn run_migration(
         match build_bundle_proposal(bundle, profiles, embeddings).await {
             Ok(bp) => outcome.bundles.push(bp),
             Err(e) => {
+                outcome.unclassified.extend(bundle.members.iter().cloned());
                 progress
                     .message(
                         Level::Warn,
@@ -158,6 +159,7 @@ pub async fn run_migration(
         {
             Ok(bp) => outcome.bundles.push(bp),
             Err(e) => {
+                outcome.unclassified.extend(bundle.members.iter().cloned());
                 progress
                     .message(
                         Level::Warn,
@@ -842,6 +844,10 @@ async fn build_content_bundle_proposal(
     extractors: &[Arc<dyn ContentExtractor>],
     config: &ClassifierConfig,
 ) -> Result<BundleProposal> {
+    if profiles.last_scan.leaf_folders.is_empty() {
+        return cold_start_content_bundle(bundle, &profiles.target_root);
+    }
+
     let mut classified = Vec::with_capacity(bundle.members.len());
     for member in &bundle.members {
         let verdict = classify_file(
@@ -912,6 +918,64 @@ async fn build_content_bundle_proposal(
         proposals,
         confidence,
         bundle.reasoning.clone(),
+    )?)
+}
+
+fn cold_start_content_bundle(
+    bundle: &DetectedBundle,
+    target_root: &Path,
+) -> Result<BundleProposal> {
+    let label = bundle.target_subdir.clone().unwrap_or_else(|| {
+        bundle
+            .root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("collection")
+            .to_string()
+    });
+    let collection_root = target_root.join(&label);
+    let members = bundle
+        .members
+        .iter()
+        .map(|source| {
+            let proposed_name = source
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_string();
+            ChangeProposal {
+                id: Uuid::new_v4(),
+                file_id: None,
+                change_type: ChangeType::Move,
+                original_path: source.clone(),
+                proposed_path: collection_root.join(&proposed_name),
+                proposed_name,
+                confidence: 0.0,
+                reasoning: format!(
+                    "{}; cold-start fallback preserves the collection at the target root",
+                    bundle.reasoning
+                ),
+                needs_review: true,
+                status: ChangeStatus::Pending,
+                created_at: Utc::now(),
+                applied_at: None,
+                bundle_id: None,
+                classification_confidence: None,
+                rename_mismatch_score: None,
+                content_hash: crate::hashing::content_hash_of(source),
+            }
+        })
+        .collect();
+    Ok(BundleProposal::new(
+        bundle.root.clone(),
+        bundle.kind.clone(),
+        target_root.to_path_buf(),
+        members,
+        0.0,
+        format!(
+            "{}; no learned destination exists, so preserve this collection at the target root for review",
+            bundle.reasoning
+        ),
     )?)
 }
 
@@ -994,9 +1058,14 @@ async fn build_bundle_proposal(
         .unwrap_or("bundle")
         .to_string();
 
-    let target_parent = pick_bundle_target(bundle, profiles, embeddings, &leaf_name)
-        .await
-        .ok_or_else(|| anyhow::anyhow!("no semantic destination for bundle {leaf_name}"))?;
+    let (target_parent, confidence, fallback) = if profiles.last_scan.leaf_folders.is_empty() {
+        (profiles.target_root.clone(), 0.0, true)
+    } else {
+        let (target, score) = pick_bundle_target(bundle, profiles, embeddings, &leaf_name)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("no semantic destination for bundle {leaf_name}"))?;
+        (target, score, false)
+    };
 
     let bundle_target_root = target_parent.join(&leaf_name);
 
@@ -1016,7 +1085,7 @@ async fn build_bundle_proposal(
             original_path: m.clone(),
             proposed_path,
             proposed_name: name,
-            confidence: 0.90,
+            confidence,
             reasoning: bundle.reasoning.clone(),
             needs_review: false,
             status: ChangeStatus::Pending,
@@ -1034,8 +1103,15 @@ async fn build_bundle_proposal(
         bundle.kind.clone(),
         target_parent,
         members,
-        0.90,
-        bundle.reasoning.clone(),
+        confidence,
+        if fallback {
+            format!(
+                "{}; no learned destination exists, so preserve this bundle at the target root for review",
+                bundle.reasoning
+            )
+        } else {
+            format!("{}; semantic bundle routing", bundle.reasoning)
+        },
     )?)
 }
 
@@ -1044,10 +1120,7 @@ async fn pick_bundle_target(
     profiles: &ProfileCache,
     embeddings: &dyn EmbeddingBackend,
     leaf_name: &str,
-) -> Option<PathBuf> {
-    if profiles.last_scan.leaf_folders.is_empty() {
-        return None;
-    }
+) -> Option<(PathBuf, f32)> {
     // Bundle kind controls atomicity, not placement. Placement is ranked from
     // the kind label, collection name, and member names against the learned
     // target-folder profiles.
@@ -1074,7 +1147,7 @@ async fn pick_bundle_target(
             }
         }
     }
-    best.map(|(p, _)| p)
+    best
 }
 
 #[cfg(test)]
@@ -1261,6 +1334,43 @@ mod tests {
         }
     }
 
+    fn empty_cache(target_root: &Path) -> ProfileCache {
+        ProfileCache {
+            target_root: target_root.to_path_buf(),
+            model_id: "bucket".to_string(),
+            embedding_dim: 7,
+            profiles: HashMap::new(),
+            last_scan: TargetScan {
+                root: target_root.to_path_buf(),
+                nodes: HashMap::new(),
+                leaf_folders: vec![],
+                scan_timestamp: SystemTime::now(),
+            },
+            created_at: SystemTime::now(),
+            last_updated: SystemTime::now(),
+        }
+    }
+
+    struct FailingEmbeddings;
+    #[async_trait]
+    impl EmbeddingBackend for FailingEmbeddings {
+        async fn embed_text(&self, _text: &str) -> Result<Vec<f32>> {
+            anyhow::bail!("synthetic embedding failure")
+        }
+
+        async fn embed_texts(&self, _texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            anyhow::bail!("synthetic embedding failure")
+        }
+
+        fn dimensions(&self) -> usize {
+            7
+        }
+
+        fn model_id(&self) -> &'static str {
+            "failing"
+        }
+    }
+
     #[tokio::test]
     async fn loose_file_classified_into_leaf_folder() {
         let src = TempDir::new().unwrap();
@@ -1376,6 +1486,125 @@ mod tests {
             .iter()
             .any(|l| l == &b.target_parent));
         assert_eq!(b.members.len(), 2);
+        assert!(
+            (b.confidence - 0.90).abs() > 1e-3,
+            "migration bundle confidence must be its raw semantic cosine, not the old fixed value"
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_start_preserves_structural_bundle_at_target_root() {
+        let src = TempDir::new().unwrap();
+        let tgt = TempDir::new().unwrap();
+        fs::create_dir_all(src.path().join("myproj/src")).unwrap();
+        fs::write(
+            src.path().join("myproj/Cargo.toml"),
+            b"[package]\nname='x'\n",
+        )
+        .unwrap();
+        fs::write(src.path().join("myproj/src/main.rs"), b"fn main() {}").unwrap();
+
+        let out = run_migration(
+            src.path(),
+            &empty_cache(tgt.path()),
+            &BucketEmbeddings,
+            None,
+            MigrationMultimodal::default(),
+            &[],
+            &ClassifierConfig::default(),
+            &NullProgress,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.bundles.len(), 1);
+        assert!(out.unclassified.is_empty());
+        let bundle = &out.bundles[0];
+        assert_eq!(bundle.target_parent, tgt.path());
+        assert_eq!(bundle.confidence, 0.0);
+        assert!(bundle.reasoning.contains("target root for review"));
+    }
+
+    #[tokio::test]
+    async fn cold_start_preserves_semantic_collection_at_target_root() {
+        let src = TempDir::new().unwrap();
+        let tgt = TempDir::new().unwrap();
+        fs::write(
+            src.path().join("atomsnotelectrons_submission.txt"),
+            b"submission",
+        )
+        .unwrap();
+        fs::write(
+            src.path().join("atomsnotelectrons_testbench.png"),
+            b"testbench",
+        )
+        .unwrap();
+        let extractors: Vec<Arc<dyn ContentExtractor>> = vec![Arc::new(PlainExtractor)];
+
+        let out = run_migration(
+            src.path(),
+            &empty_cache(tgt.path()),
+            &BucketEmbeddings,
+            None,
+            MigrationMultimodal::default(),
+            &extractors,
+            &ClassifierConfig::default(),
+            &NullProgress,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.bundles.len(), 1);
+        assert!(out.unclassified.is_empty());
+        let bundle = &out.bundles[0];
+        assert!(matches!(bundle.kind, BundleKind::SemanticCollection { .. }));
+        assert_eq!(bundle.target_parent, tgt.path());
+        assert_eq!(bundle.members.len(), 2);
+        assert!(bundle
+            .members
+            .iter()
+            .all(|member| member.change_type == ChangeType::Move));
+    }
+
+    #[tokio::test]
+    async fn failed_bundle_proposals_return_every_member_as_unclassified() {
+        let src = TempDir::new().unwrap();
+        let tgt = TempDir::new().unwrap();
+        fs::create_dir_all(src.path().join("myproj/src")).unwrap();
+        fs::write(
+            src.path().join("myproj/Cargo.toml"),
+            b"[package]\nname='x'\n",
+        )
+        .unwrap();
+        fs::write(src.path().join("myproj/src/main.rs"), b"fn main() {}").unwrap();
+        fs::write(
+            src.path().join("atomsnotelectrons_submission.txt"),
+            b"submission",
+        )
+        .unwrap();
+        fs::write(
+            src.path().join("atomsnotelectrons_testbench.png"),
+            b"testbench",
+        )
+        .unwrap();
+        let profiles = sample_cache(tgt.path(), &BucketEmbeddings).await;
+        let extractors: Vec<Arc<dyn ContentExtractor>> = vec![Arc::new(PlainExtractor)];
+
+        let out = run_migration(
+            src.path(),
+            &profiles,
+            &FailingEmbeddings,
+            None,
+            MigrationMultimodal::default(),
+            &extractors,
+            &ClassifierConfig::default(),
+            &NullProgress,
+        )
+        .await
+        .unwrap();
+
+        assert!(out.bundles.is_empty());
+        assert_eq!(out.unclassified.len(), 4);
     }
 
     #[tokio::test]
@@ -1386,20 +1615,7 @@ mod tests {
 
         let eb = BucketEmbeddings;
         // Empty cache (no leaves).
-        let profiles = ProfileCache {
-            target_root: tgt.path().to_path_buf(),
-            model_id: "bucket".to_string(),
-            embedding_dim: 7,
-            profiles: HashMap::new(),
-            last_scan: TargetScan {
-                root: tgt.path().to_path_buf(),
-                nodes: HashMap::new(),
-                leaf_folders: vec![],
-                scan_timestamp: SystemTime::now(),
-            },
-            created_at: SystemTime::now(),
-            last_updated: SystemTime::now(),
-        };
+        let profiles = empty_cache(tgt.path());
         let ex: Vec<Arc<dyn ContentExtractor>> = vec![Arc::new(PlainExtractor)];
 
         let out = run_migration(

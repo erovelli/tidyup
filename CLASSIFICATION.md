@@ -271,7 +271,7 @@ Both modes treat the LLM as an optional Tier 3 escape hatch rather than a defaul
 
 1. **Generative naming.** No coining of novel descriptive names like "Q3 board meeting notes" without extractive evidence. Consistent with the rename policy, but less ambitious than a multimodal LLM at freeform rename synthesis.
 2. **Natural-language reasoning strings.** Templated, not lyrical — strictly better for post-hoc threshold tuning, worse for explanation readability.
-3. **Cold-start into empty target hierarchies.** An LLM can classify into an empty folder via pure semantic reasoning; embeddings need at least a `name_embedding` or one sibling file for a centroid. **This is a real regression** for the "migrate into a freshly-sketched hierarchy" UX. Mitigations: seed empty folders from name embeddings only and accept weaker confidence; detect the empty-target case and surface all proposals to review; document `--features llm-fallback` as the recommended remedy for this specific workflow.
+3. **Cold-start into empty target hierarchies.** With no leaf folders there is no honest destination candidate for either embeddings or an LLM to rank. Loose files remain explicitly `unclassified`. Atomic directory bundles and semantic collections are preserved in the plan at the target root with confidence `0.0`, unchanged member names, and mandatory review. This deterministic fallback is category-neutral: it prevents files disappearing from the plan without fabricating a taxonomy from bundle kind or extension.
 4. **Long-tail esoterica.** Niche vocabulary unfamiliar to bge-small yields weak signal. Mitigation: weak confidence routes to review.
 5. **Multilingual coverage.** `bge-small-en-v1.5` is English-only, so *classification* of non-English documents is still weak — a multilingual embedding model (`bge-m3`, `multilingual-e5`) is the real fix but is larger (~500 MB+) and remains a roadmap item gated on demand vs. binary-size. What *does* work today: **keyword extraction is language-aware** (EN/ES/FR/DE stopword detection), so extractive renames for non-English content stay clean even though the classifier embeds in English.
 
@@ -315,7 +315,7 @@ The cost (1–10 s of inference) is paid only on hard cases — Tier 2 hits that
 - **Multilingual support.** When to swap to `bge-m3` or `multilingual-e5`? Gate on binary-size impact vs observed demand.
 - **Image-side rename gating.** Phase 7 image classification produces a folder choice but no rename proposal. The rename cascade still runs against text Tier 2 (EXIF metadata → keyword fill → keep). A future enhancement: cross-modal mismatch gate using SigLIP text + image embeddings of filename and content.
 - **Video keyframe extraction.** Still pending the `ffmpeg-next` FFI vs metadata-only decision.
-- **Cold-start UX mitigation.** Does tidyup detect "target hierarchy has no files yet" and advise the user about `--features llm-fallback`, or silently surface all proposals to review with low confidence? A `--bootstrap` mode that seeds profiles from folder-name embeddings only?
+- **Cold-start loose-file UX.** Bundles are now preserved safely at the target root, but loose files still have no honest category when the target exposes zero leaves. Should a future `--bootstrap` mode accept a user-authored taxonomy, or is an explicit unclassified list the right permanent behavior?
 - **Inline-YAKE maintenance.** A few hundred lines of keyword extraction inline is cheap but adds a small maintenance item. Acceptable until a mainstream crate crosses the DL threshold.
 
 ## References in repo

@@ -163,6 +163,7 @@ pub async fn run_scan(
         match build_bundle_proposal(bundle, output_root, candidates, embeddings).await {
             Ok(bp) => outcome.bundles.push(bp),
             Err(e) => {
+                outcome.unclassified.extend(bundle.members.iter().cloned());
                 progress
                     .message(
                         Level::Warn,
@@ -189,6 +190,7 @@ pub async fn run_scan(
         {
             Ok(bp) => outcome.bundles.push(bp),
             Err(e) => {
+                outcome.unclassified.extend(bundle.members.iter().cloned());
                 progress
                     .message(
                         Level::Warn,
@@ -1148,6 +1150,26 @@ mod tests {
         }
     }
 
+    struct FailingEmbeddings;
+    #[async_trait]
+    impl EmbeddingBackend for FailingEmbeddings {
+        async fn embed_text(&self, _text: &str) -> Result<Vec<f32>> {
+            anyhow::bail!("synthetic embedding failure")
+        }
+
+        async fn embed_texts(&self, _texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            anyhow::bail!("synthetic embedding failure")
+        }
+
+        fn dimensions(&self) -> usize {
+            7
+        }
+
+        fn model_id(&self) -> &'static str {
+            "failing"
+        }
+    }
+
     /// Extractor that reads a file as UTF-8.
     struct PlainExtractor;
     #[async_trait]
@@ -1396,6 +1418,47 @@ mod tests {
         }));
         // Bundles bypass per-file classification.
         assert!(out.proposals.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_bundle_proposals_return_every_member_as_unclassified() {
+        let td = TempDir::new().unwrap();
+        fs::create_dir_all(td.path().join("myproj/src")).unwrap();
+        fs::write(
+            td.path().join("myproj/Cargo.toml"),
+            b"[package]\nname='x'\n",
+        )
+        .unwrap();
+        fs::write(td.path().join("myproj/src/main.rs"), b"fn main() {}").unwrap();
+        fs::write(
+            td.path().join("atomsnotelectrons_submission.txt"),
+            b"submission",
+        )
+        .unwrap();
+        fs::write(
+            td.path().join("atomsnotelectrons_testbench.png"),
+            b"testbench",
+        )
+        .unwrap();
+        let extractors: Vec<Arc<dyn ContentExtractor>> = vec![Arc::new(PlainExtractor)];
+        let candidates = sample_candidates(&BucketEmbeddings).await;
+
+        let out = run_scan(
+            td.path(),
+            td.path(),
+            &candidates,
+            &FailingEmbeddings,
+            &MultimodalContext::default(),
+            None,
+            &extractors,
+            &ClassifierConfig::default(),
+            &NullProgress,
+        )
+        .await
+        .unwrap();
+
+        assert!(out.bundles.is_empty());
+        assert_eq!(out.unclassified.len(), 4);
     }
 
     #[tokio::test]
