@@ -71,6 +71,7 @@ In this system, elevation is a product of light and shadow, not lines.
 ### Cards & File Items
 *   **Rule:** Forbid the use of divider lines between list items. Use 8px of vertical spacing (`md`) to separate rows. 
 *   **Visuals:** File icons should use soft `secondary` (#0f6784) and `primary` (#48664c) tones rather than harsh multi-color sets.
+*   **Inline validation:** Invalid editable filenames keep the editor in place, use a 2px `error_container` interaction outline, and show a compact `error_container` message directly below the field. Validation must happen before submit; do not defer a duplicate-name error to an execute-time toast.
 
 ### Confidence Indicators (Chips)
 *   Small, pill-shaped (`full` roundedness) containers. Use the Tier colors defined in Section 2.

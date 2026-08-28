@@ -43,7 +43,7 @@ use tidyup_domain::migration::{
 use tidyup_domain::{BundleProposal, ClassifierConfig, FolderProfile, Phase, ProfileCache};
 use uuid::Uuid;
 
-use crate::naming::{propose_rename, RenameProposal, RenameSource};
+use crate::naming::{propose_rename, uniquify_bundle_member_names, RenameProposal};
 use crate::scanner::{self, DetectedBundle};
 use crate::text_util::char_prefix;
 use crate::yake;
@@ -747,14 +747,7 @@ async fn gate_rename(
             mismatch_score: None,
         });
     }
-    let ocr_evidence = matches!(
-        &proposal,
-        RenameProposal::Rename {
-            source: RenameSource::Ocr,
-            ..
-        }
-    );
-    if classification_confidence < config.rename.min_classification_confidence && !ocr_evidence {
+    if classification_confidence < config.rename.min_classification_confidence {
         return Ok(GatedRename {
             proposal: RenameProposal::Keep,
             mismatch_score: None,
@@ -770,7 +763,7 @@ async fn gate_rename(
     let content_vec = embeddings.embed_text(content_text).await?;
     let cos = cosine(&filename_vec, &content_vec);
     let mismatch = 1.0_f32 - cos;
-    if mismatch < config.rename.min_mismatch_score && !ocr_evidence {
+    if mismatch < config.rename.min_mismatch_score {
         return Ok(GatedRename {
             proposal: RenameProposal::Keep,
             mismatch_score: Some(mismatch),
@@ -904,6 +897,7 @@ async fn build_content_bundle_proposal(
         proposal.reasoning = format!("{}; {}", bundle.reasoning, proposal.reasoning);
         proposals.push(proposal);
     }
+    uniquify_bundle_member_names(&mut proposals);
 
     let count = u16::try_from(proposals.len()).unwrap_or(u16::MAX);
     let confidence = if count == 0 {
@@ -1371,6 +1365,26 @@ mod tests {
         }
     }
 
+    struct ConstantEmbeddings;
+    #[async_trait]
+    impl EmbeddingBackend for ConstantEmbeddings {
+        async fn embed_text(&self, _text: &str) -> Result<Vec<f32>> {
+            Ok(vec![1.0])
+        }
+
+        async fn embed_texts(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            Ok(vec![vec![1.0]; texts.len()])
+        }
+
+        fn dimensions(&self) -> usize {
+            1
+        }
+
+        fn model_id(&self) -> &'static str {
+            "constant"
+        }
+    }
+
     #[tokio::test]
     async fn loose_file_classified_into_leaf_folder() {
         let src = TempDir::new().unwrap();
@@ -1632,6 +1646,29 @@ mod tests {
         .unwrap();
         assert_eq!(out.proposals.len(), 0);
         assert_eq!(out.unclassified.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ocr_rename_must_clear_filename_mismatch_gate() {
+        let metadata = serde_json::json!({
+            "ocr_text": "README.MD\nTESTBENCH\nLEADERBOARD"
+        });
+        let gated = gate_rename(
+            Path::new("/source/Screenshot.png"),
+            &metadata,
+            &[],
+            None,
+            1.0,
+            &ConstantEmbeddings,
+            Some("README.MD TESTBENCH LEADERBOARD"),
+            "Screenshot.png",
+            &ClassifierConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(gated.proposal, RenameProposal::Keep);
+        assert_eq!(gated.mismatch_score, Some(0.0));
     }
 
     /// Stub `TextBackend` for Tier 3 tests. Returns a fixed

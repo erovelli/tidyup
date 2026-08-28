@@ -241,10 +241,13 @@ Directory bundles remain **opaque** to per-file classification and route from ag
 Rename proposals come from an extractive cascade. Each step is strictly higher-signal than the one below; the first that fires produces the proposal.
 
 1. **Embedded metadata.** PDF `/Title`, DOCX `core.xml` title, ID3 `TIT2`, EXIF `ImageDescription`, Office core properties. If present and non-trivially different from the current filename, this is the rename.
-2. **Keyword-template fill.** Extract top-k keyphrases from content — n-grams up to 3 words (inlined YAKE — see below). The target folder's siblings are analysed for a naming pattern via regex inference. Top keyphrases fill the `<topic>` slot, flattened into a word-deduplicated stem (`"tax return"` + `"tax form"` → `tax_return_form`); dates come from EXIF or file mtime.
-3. **No signal → no rename.** Keep the filename; just move.
+2. **Local OCR evidence.** On supported macOS builds, Vision-recognized text is available as extractive image content and may supply a rename candidate. `RenameSource::Ocr` is provenance only: OCR candidates must clear the same configured classification-confidence and filename-mismatch gates as metadata and keyword candidates.
+3. **Keyword-template fill.** Extract top-k keyphrases from content — n-grams up to 3 words (inlined YAKE — see below). The target folder's siblings are analysed for a naming pattern via regex inference. Top keyphrases fill the `<topic>` slot, flattened into a word-deduplicated stem (`"tax return"` + `"tax form"` → `tax_return_form`); dates come from EXIF or file mtime.
+4. **No signal → no rename.** Keep the filename; just move.
 
 The rename policy (`CLAUDE.md`) says renames never auto-apply and two signals — classification confidence and filename-content mismatch — must clear configured thresholds. Structural bundle members never rename; formerly loose members in a semantic collection may carry extractive renames, but the whole collection must then be reviewed explicitly. This cascade is **structurally incapable of fabricating a rename without extractive evidence**.
+
+Before an atomic collection is constructed, proposed member basenames are de-duplicated case-insensitively. Unchanged move-only names reserve their basenames first; repeated extractive rename candidates receive deterministic `_2`, `_3`, … suffixes so one collision cannot invalidate the entire collection. The desktop editor enforces the same sibling-uniqueness rule inline before review is submitted.
 
 Filename-content mismatch: `1.0 - cos(embed(filename_as_text), content_embedding)`. `taxes_2023.pdf` with tax-return content scores low (name matches content); `DSC_0481.jpg` of a wedding scores high.
 

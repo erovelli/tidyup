@@ -1457,6 +1457,7 @@ fn BundleReviewCard(bundle: BundleProposal, signals: SignalBundle) -> Element {
 
 #[component]
 fn SemanticMemberEditor(bundle_id: Uuid, member: ChangeProposal, signals: SignalBundle) -> Element {
+    let mut validation_error = use_signal(|| None::<String>);
     let member_id = member.id;
     let original = member
         .original_path
@@ -1466,7 +1467,18 @@ fn SemanticMemberEditor(bundle_id: Uuid, member: ChangeProposal, signals: Signal
         .to_string();
     let proposed = member.proposed_name.clone();
     let on_input = move |event: Event<FormData>| {
-        update_semantic_member_name(signals, bundle_id, member_id, &event.value());
+        validation_error.set(
+            update_semantic_member_name(signals, bundle_id, member_id, &event.value())
+                .err()
+                .map(str::to_string),
+        );
+    };
+    let validation_message = validation_error.read().clone();
+    let invalid = validation_message.is_some();
+    let input_class = if invalid {
+        "path-input input-error"
+    } else {
+        "path-input"
     };
     rsx! {
         label {
@@ -1476,10 +1488,18 @@ fn SemanticMemberEditor(bundle_id: Uuid, member: ChangeProposal, signals: Signal
             span { "→" }
             input {
                 r#type: "text",
-                class: "path-input",
+                class: "{input_class}",
                 value: "{proposed}",
                 oninput: on_input,
                 aria_label: "Proposed filename for {original}",
+                aria_invalid: invalid,
+            }
+            if let Some(ref message) = validation_message {
+                span {
+                    class: "field-error",
+                    style: "grid-column: 3;",
+                    "{message}"
+                }
             }
         }
     }
@@ -1490,17 +1510,18 @@ fn update_semantic_member_name(
     bundle_id: Uuid,
     member_id: Uuid,
     raw_name: &str,
-) {
-    let Some(name) = Path::new(raw_name)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(ToString::to_string)
-    else {
-        return;
+) -> Result<(), &'static str> {
+    let bundles = signals.bundles;
+    let items = bundles.read();
+    let name = {
+        let bundle = items
+            .iter()
+            .find(|bundle| bundle.id == bundle_id)
+            .ok_or("This collection is no longer available.")?;
+        validate_semantic_member_name(bundle, member_id, raw_name)?
     };
-    let mut bundles = signals.bundles;
+    drop(items);
+    let mut bundles = bundles;
     bundles.with_mut(|items| {
         let Some(bundle) = items.iter_mut().find(|bundle| bundle.id == bundle_id) else {
             return;
@@ -1525,6 +1546,29 @@ fn update_semantic_member_name(
             ChangeType::RenameAndMove
         };
     });
+    Ok(())
+}
+
+fn validate_semantic_member_name(
+    bundle: &BundleProposal,
+    member_id: Uuid,
+    raw_name: &str,
+) -> Result<String, &'static str> {
+    let name = Path::new(raw_name)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToString::to_string)
+        .ok_or("Filename cannot be empty.")?;
+    if bundle
+        .members
+        .iter()
+        .any(|member| member.id != member_id && member.proposed_name.eq_ignore_ascii_case(&name))
+    {
+        return Err("Another file in this collection already uses that name.");
+    }
+    Ok(name)
 }
 
 // ---------------------------------------------------------------------------
@@ -2401,5 +2445,32 @@ mod tests {
             matches!(row, TreeRow::Folder { name, depth: 1, .. } if name == "Career")
         }));
         assert_eq!(count_folders(&model.left_rows), 2);
+    }
+
+    #[test]
+    fn semantic_member_editor_rejects_duplicate_sibling_name() {
+        let first = move_proposal("first.png");
+        let first_id = first.id;
+        let second = move_proposal("second.png");
+        let bundle = BundleProposal::new(
+            PathBuf::from("/Users/example/Desktop"),
+            tidyup_domain::BundleKind::SemanticCollection {
+                label: "project".to_string(),
+            },
+            PathBuf::from("/Users/example/Desktop/Work"),
+            vec![first, second],
+            0.8,
+            "shared project evidence".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            validate_semantic_member_name(&bundle, first_id, "SECOND.PNG"),
+            Err("Another file in this collection already uses that name."),
+        );
+        assert_eq!(
+            validate_semantic_member_name(&bundle, first_id, "renamed.png").unwrap(),
+            "renamed.png",
+        );
     }
 }

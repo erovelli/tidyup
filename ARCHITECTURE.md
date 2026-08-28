@@ -122,6 +122,8 @@ Rename proposals are driven by two independent signals. Both must clear configur
 
 Both thresholds are config-tunable (`[rename] min_classification_confidence`, `[rename] min_mismatch_score`) with conservative defaults (0.85 / 0.60).
 
+All extractive sources, including local Vision OCR, pass through these same two gates. Within semantic collections, case-insensitive basename collisions are resolved deterministically with numeric suffixes before the aggregate crosses the review boundary; the desktop editor refuses duplicate sibling names inline as a second layer.
+
 **Renames never auto-apply.** `--yes` auto-approves *moves* above a threshold; rename decisions always surface in the review flow explicitly. The risk of silently breaking external references (symlinks, docs pointing at paths, git history) is too high for auto-apply.
 
 **Structural bundle members never receive rename proposals.** The internal structure of a project is load-bearing; renaming files inside a crate breaks meaning. Semantic collections are the narrow exception: formerly loose members may receive extractive renames, are displayed in bundle review, and remain atomic.

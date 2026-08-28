@@ -30,6 +30,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use serde_json::Value;
+use tidyup_domain::{ChangeProposal, ChangeType};
 
 use crate::yake::Keyword;
 
@@ -129,6 +130,56 @@ pub fn propose_rename(
     }
 
     RenameProposal::Keep
+}
+
+/// Make proposed member filenames unique within one atomic collection.
+///
+/// Existing move-only names are reserved first so a generated rename cannot
+/// claim a sibling's unchanged basename. Colliding rename proposals receive a
+/// deterministic numeric suffix while retaining their extracted stem and
+/// extension. Comparisons are case-insensitive to stay safe on the default
+/// macOS and Windows filesystems.
+pub(crate) fn uniquify_bundle_member_names(proposals: &mut [ChangeProposal]) {
+    let mut claimed = proposals
+        .iter()
+        .filter(|proposal| proposal.change_type == ChangeType::Move)
+        .map(|proposal| proposal.proposed_name.to_lowercase())
+        .collect::<HashSet<_>>();
+
+    for proposal in proposals.iter_mut().filter(|proposal| {
+        matches!(
+            proposal.change_type,
+            ChangeType::Rename | ChangeType::RenameAndMove
+        )
+    }) {
+        let original = proposal.proposed_name.clone();
+        if claimed.insert(original.to_lowercase()) {
+            continue;
+        }
+
+        for sequence in 2_u32.. {
+            let candidate = filename_with_sequence(&original, sequence);
+            if claimed.insert(candidate.to_lowercase()) {
+                proposal.proposed_name.clone_from(&candidate);
+                proposal.proposed_path.set_file_name(candidate);
+                break;
+            }
+        }
+    }
+}
+
+fn filename_with_sequence(filename: &str, sequence: u32) -> String {
+    let path = Path::new(filename);
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or(filename);
+    path.extension()
+        .and_then(|value| value.to_str())
+        .map_or_else(
+            || format!("{stem}_{sequence}"),
+            |extension| format!("{stem}_{sequence}.{extension}"),
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -350,8 +401,11 @@ fn is_trivial_rename(candidate_raw: &str, original_stem: &str) -> bool {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use chrono::Utc;
     use serde_json::json;
     use std::path::PathBuf;
+    use tidyup_domain::ChangeStatus;
+    use uuid::Uuid;
 
     use crate::yake::Keyword;
 
@@ -359,6 +413,27 @@ mod tests {
         Keyword {
             term: term.to_string(),
             score,
+        }
+    }
+
+    fn renamed_member(original: &str, proposed_name: String) -> ChangeProposal {
+        ChangeProposal {
+            id: Uuid::new_v4(),
+            file_id: None,
+            change_type: ChangeType::RenameAndMove,
+            original_path: PathBuf::from("/source").join(original),
+            proposed_path: PathBuf::from("/target/collection").join(&proposed_name),
+            proposed_name,
+            confidence: 0.95,
+            reasoning: "metadata rename".to_string(),
+            needs_review: false,
+            status: ChangeStatus::Pending,
+            created_at: Utc::now(),
+            applied_at: None,
+            bundle_id: None,
+            classification_confidence: Some(0.95),
+            rename_mismatch_score: Some(0.9),
+            content_hash: None,
         }
     }
 
@@ -429,6 +504,34 @@ mod tests {
             RenameProposal::Rename { name, .. } => assert_eq!(name, "canon_eos_r5.jpg"),
             RenameProposal::Keep => panic!("expected rename"),
         }
+    }
+
+    #[test]
+    fn bundle_member_names_suffix_colliding_metadata_renames() {
+        let metadata = json!({"exif": {"make": "Canon", "model": "EOS R5"}});
+        let proposed_names =
+            ["IMG_0001.jpg", "IMG_0002.jpg"].map(|original| {
+                match propose_rename(
+                    &PathBuf::from("/source").join(original),
+                    &metadata,
+                    &[],
+                    None,
+                ) {
+                    RenameProposal::Rename { name, .. } => name,
+                    RenameProposal::Keep => panic!("camera metadata should propose a rename"),
+                }
+            });
+        assert_eq!(proposed_names[0], proposed_names[1]);
+
+        let mut members = vec![
+            renamed_member("IMG_0001.jpg", proposed_names[0].clone()),
+            renamed_member("IMG_0002.jpg", proposed_names[1].clone()),
+        ];
+        uniquify_bundle_member_names(&mut members);
+
+        assert_eq!(members[0].proposed_name, "canon_eos_r5.jpg");
+        assert_eq!(members[1].proposed_name, "canon_eos_r5_2.jpg");
+        assert!(members[1].proposed_path.ends_with("canon_eos_r5_2.jpg"));
     }
 
     #[test]
