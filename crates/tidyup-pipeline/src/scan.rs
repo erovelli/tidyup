@@ -1,22 +1,21 @@
 //! Scan-mode pipeline — classify a source tree against a fixed taxonomy.
 //!
-//! The scan pipeline runs the three-tier cascade with a *taxonomy* as target:
-//! each file ends up proposed under a well-known category folder (`Finance/`,
-//! `Photos/`, `Code/`, …). Contrast with the migration pipeline in
+//! The scan pipeline uses a semantic cascade with a *taxonomy* as target:
+//! each file is compared against every candidate category. Contrast with the migration pipeline in
 //! [`crate::migration`], which classifies against an arbitrary existing
 //! folder hierarchy.
 //!
 //! # Cascade
 //!
 //! 1. **Bundle detection** (in the scanner) carves out opaque subtrees; scan
-//!    mode routes each [`BundleKind`] to a default taxonomy folder by kind.
-//! 2. **Tier 1 — heuristics** (`[crate::heuristics]`): extension / MIME /
-//!    marker filename. Fires at `heuristic_threshold` (default 0.60).
-//! 3. **Tier 2 — embeddings**: caller-supplied [`ScanCandidate`]s provide
+//!    mode preserves their internal paths while routing their aggregate
+//!    semantic evidence.
+//! 2. **Semantic embeddings**: caller-supplied [`ScanCandidate`]s provide
 //!    pre-computed description embeddings; the pipeline embeds the file
-//!    content and picks the highest-cosine candidate. Fires at
+//!    name, local context, and extracted content as independent evidence and
+//!    picks the highest-cosine candidate. Review is required below the
 //!    `embedding_threshold` (default 0.35) with `ambiguity_gap`.
-//! 4. **Tier 3 — LLM fallback** (optional): when a [`TextBackend`] is provided
+//! 3. **LLM fallback** (optional): when a [`TextBackend`] is provided
 //!    and Tier 2 lands in the review zone (below threshold or inside the
 //!    ambiguity gap), the LLM classifies the content and the resulting
 //!    `summary + category + tags` is re-embedded and re-ranked against the
@@ -24,7 +23,7 @@
 //!    we adopt it with [`Tier::Llm`] reasoning. The activation gate is the
 //!    caller passing `Some(text_backend)` — this module is feature-flag-free
 //!    by design.
-//! 5. **Below all tiers**: surface to review via `needs_review = true`.
+//! 4. **Uncertain results**: surface to review via `needs_review = true`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -38,11 +37,10 @@ use tidyup_core::inference::{
     AudioEmbeddingBackend, EmbeddingBackend, FileModality, ImageEmbeddingBackend, TextBackend,
 };
 use tidyup_domain::change::{ChangeProposal, ChangeStatus, ChangeType};
-use tidyup_domain::{BundleKind, BundleProposal, ClassifierConfig, Phase};
+use tidyup_domain::{BundleProposal, ClassifierConfig, Phase};
 use uuid::Uuid;
 
-use crate::heuristics::{self, HeuristicMatch};
-use crate::naming::{propose_rename, RenameProposal};
+use crate::naming::{propose_rename, RenameProposal, RenameSource};
 use crate::scanner::{self, DetectedBundle};
 use crate::yake;
 
@@ -103,9 +101,8 @@ pub struct AudioContext<'a> {
 pub struct ScanOutcome {
     pub proposals: Vec<ChangeProposal>,
     pub bundles: Vec<BundleProposal>,
-    /// Files the cascade couldn't classify at all (heuristic miss + no
-    /// extractable content). Listed here so callers can surface them rather
-    /// than silently drop.
+    /// Files the cascade couldn't classify at all. Listed here so callers can
+    /// surface them rather than silently drop.
     pub unclassified: Vec<PathBuf>,
 }
 
@@ -129,7 +126,7 @@ pub struct ScanOutcome {
 /// Propagates source-read and embedding-backend failures. Per-file extraction
 /// or classification errors are logged via `progress.message(Level::Warn, …)`
 /// and surfaced through [`ScanOutcome::unclassified`].
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn run_scan(
     source_root: &Path,
     output_root: &Path,
@@ -161,16 +158,44 @@ pub async fn run_scan(
         unclassified: Vec::new(),
     };
 
-    // Bundles first — they don't pass through Tier 2. Marker (directory)
-    // bundles from the scanner plus content clusters from the clustering pass.
-    for bundle in tree.bundles.iter().chain(content_bundles.iter()) {
-        match build_bundle_proposal(bundle, output_root) {
+    // Structural bundles preserve their internal layout and names.
+    for bundle in &tree.bundles {
+        match build_bundle_proposal(bundle, output_root, candidates, embeddings).await {
             Ok(bp) => outcome.bundles.push(bp),
             Err(e) => {
                 progress
                     .message(
                         Level::Warn,
                         &format!("bundle proposal failed for {}: {e}", bundle.root.display()),
+                    )
+                    .await;
+            }
+        }
+    }
+    // Content clusters classify each loose member so semantic collections can
+    // carry evidence-backed screenshot renames while remaining atomic.
+    for bundle in &content_bundles {
+        match build_content_bundle_proposal(
+            bundle,
+            output_root,
+            candidates,
+            embeddings,
+            multimodal,
+            text_backend,
+            extractors,
+            config,
+        )
+        .await
+        {
+            Ok(bp) => outcome.bundles.push(bp),
+            Err(e) => {
+                progress
+                    .message(
+                        Level::Warn,
+                        &format!(
+                            "content bundle proposal failed for {}: {e}",
+                            bundle.root.display()
+                        ),
                     )
                     .await;
             }
@@ -244,14 +269,13 @@ struct ClassifiedFile {
     rename_mismatch_score: Option<f32>,
 }
 
-/// Classify a single loose file through Tiers 1→2→3 and return the best verdict.
+/// Classify a single loose file using semantic evidence and optional LLM reranking.
 ///
 /// Tier 3 fires only when (a) Tier 2 produced a `needs_review` result, (b) a
 /// `text_backend` was supplied by the caller, and (c)
 /// `config.enable_llm_fallback` is true. Otherwise the cascade stops at Tier 2.
 ///
-/// Returns `Ok(None)` when no tier produced any signal (typically: unknown
-/// extension and extraction failure).
+/// Returns `Ok(None)` when there are no destination candidates.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn classify_file(
     path: &Path,
@@ -268,7 +292,7 @@ async fn classify_file(
         .unwrap_or_default()
         .to_string();
 
-    // Try to extract early — both Tier 1 (MIME) and Tier 2 (content) want it.
+    // Extract early so content can contribute semantic evidence.
     let mime = tidyup_extract::mime::detect(path).await;
     let extracted = match tidyup_extract::router::pick(extractors, path, mime.as_deref()) {
         Some(ext) => ext.extract(path).await.ok(),
@@ -279,41 +303,9 @@ async fn classify_file(
         .map(|e| e.mime.clone())
         .or_else(|| mime.clone());
 
-    // Tier 1 heuristic hit above the short-circuit threshold, if any.
-    let tier1_hit = heuristics::classify(path, effective_mime.as_deref())
-        .filter(|hit| hit.confidence >= config.heuristic_threshold);
-
-    // Ordering: for image/audio whose cross-modal backend is loaded (the
-    // multimodal bundle is installed), prefer content classification (SigLIP /
-    // CLAP) and use Tier 1 only as the fallback — otherwise a `.jpg`/`.mp3`
-    // would short-circuit at Tier 1 by extension and never reach Tier 2. When
-    // the backend is absent (the default install), Tier 1 wins first exactly as
-    // before, so this changes nothing on the default path.
+    // MIME/extension may select a compatible semantic backend, but never a
+    // destination. All destination choices below come from model similarity.
     let modality = file_modality(path, effective_mime.as_deref());
-    let media_backend_present = match modality {
-        FileModality::Image => multimodal.image.is_some(),
-        FileModality::Audio => multimodal.audio.is_some(),
-        _ => false,
-    };
-
-    if !media_backend_present {
-        if let Some(hit) = &tier1_hit {
-            return Ok(Some(
-                tier1_classified(
-                    path,
-                    hit,
-                    extracted.as_ref(),
-                    candidates,
-                    embeddings,
-                    &filename,
-                    config,
-                )
-                .await?,
-            ));
-        }
-    }
-
-    // Tier 2 — modality-aware cross-modal classification.
     if matches!(modality, FileModality::Image) {
         if let Some(img_ctx) = multimodal.image.as_ref() {
             if let Some(verdict) = classify_image(
@@ -344,43 +336,22 @@ async fn classify_file(
         }
     }
 
-    // Cross-modal missed (ambiguous, unreadable, or oversized) for media whose
-    // Tier 1 we deferred above — honor that confident hit now (a `.jpg` is still
-    // a photo) rather than dropping to the review path.
-    if media_backend_present {
-        if let Some(hit) = &tier1_hit {
-            return Ok(Some(
-                tier1_classified(
-                    path,
-                    hit,
-                    extracted.as_ref(),
-                    candidates,
-                    embeddings,
-                    &filename,
-                    config,
-                )
-                .await?,
-            ));
-        }
-    }
-
-    // Tier 2 text path. Requires extracted text.
-    let text = extracted.as_ref().and_then(|e| e.text.as_deref());
-    let Some(text) = text else {
-        // No text → no embedding → we can only report Tier 1 if it fired at
-        // any confidence, even below the threshold. Emit weak proposal flagged
-        // for review.
-        if let Some(hit) = heuristics::classify(path, effective_mime.as_deref()) {
-            return Ok(Some(weak_heuristic(&hit, path)));
-        }
-        return Ok(None);
-    };
-
-    // Embed the canonical Tier-2 query (filename + body) — the same construction
-    // the offline eval uses, so the eval measures this shipped path.
-    let query = tidyup_domain::classification_query(text, &filename);
-    let embedding = embeddings.embed_text(&query).await?;
-    let (best_idx, best_score, gap) = best_match(&embedding, candidates);
+    // General semantic fallback. Independent evidence channels prevent a long
+    // document body from drowning out a meaningful filename, while no channel
+    // maps directly to a folder. Missing content simply redistributes weight to
+    // the remaining filename/path/MIME evidence.
+    let text = extracted
+        .as_ref()
+        .and_then(|content| content.text.as_deref())
+        .unwrap_or_default();
+    let (best_idx, best_score, gap, semantic_query) = semantic_best_match(
+        path,
+        text,
+        effective_mime.as_deref(),
+        candidates,
+        embeddings,
+    )
+    .await?;
     if best_idx.is_none() {
         return Ok(None);
     }
@@ -398,7 +369,12 @@ async fn classify_file(
     // shows up on the hard cases.
     if needs_review && config.enable_llm_fallback {
         if let Some(backend) = text_backend {
-            match tier3_rerank(backend, embeddings, text, &filename, candidates).await {
+            let llm_evidence = if text.trim().is_empty() {
+                semantic_query.as_str()
+            } else {
+                text
+            };
+            match tier3_rerank(backend, embeddings, llm_evidence, &filename, candidates).await {
                 Ok(Some((llm_idx, llm_score, llm_gap, model_id))) if llm_score > chosen_score => {
                     chosen_idx = llm_idx;
                     chosen_score = llm_score;
@@ -420,8 +396,11 @@ async fn classify_file(
     let final_needs_review =
         chosen_score < config.embedding_threshold || chosen_gap < config.ambiguity_gap;
 
-    let year = year_from_path_and_text(path, Some(text));
-    let keywords = yake::extract_keywords(text, 8);
+    let content_text = (!text.trim().is_empty()).then_some(text);
+    let year = year_from_path_and_text(path, content_text);
+    let keywords = content_text
+        .map(|body| yake::extract_keywords(body, 8))
+        .unwrap_or_default();
     let metadata_json = extracted
         .as_ref()
         .map_or(serde_json::Value::Null, |e| e.metadata.clone());
@@ -438,7 +417,7 @@ async fn classify_file(
         year,
         best_score,
         embeddings,
-        Some(text),
+        content_text,
         &filename,
         config,
     )
@@ -472,6 +451,71 @@ async fn classify_file(
     }))
 }
 
+async fn semantic_best_match(
+    path: &Path,
+    body: &str,
+    mime: Option<&str>,
+    candidates: &[ScanCandidate],
+    embeddings: &dyn EmbeddingBackend,
+) -> Result<(Option<usize>, f32, f32, String)> {
+    if candidates.is_empty() {
+        return Ok((None, 0.0, 0.0, String::new()));
+    }
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let parent = path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let name_evidence = normalize_semantic_text(filename);
+    let context_evidence = format!(
+        "parent context {} media type {}",
+        normalize_semantic_text(parent),
+        mime.unwrap_or("unknown")
+    );
+    let mut evidence = vec![(name_evidence, 0.35_f32), (context_evidence, 0.10_f32)];
+    if !body.trim().is_empty() {
+        evidence.push((body.to_string(), 0.55_f32));
+    }
+    let total_weight: f32 = evidence.iter().map(|(_, weight)| *weight).sum();
+    let texts: Vec<&str> = evidence.iter().map(|(text, _)| text.as_str()).collect();
+    let vectors = embeddings.embed_texts(&texts).await?;
+    let mut ranked: Vec<(usize, f32)> = candidates
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| {
+            let score = vectors
+                .iter()
+                .zip(evidence.iter())
+                .map(|(vector, (_, weight))| cosine(vector, &candidate.embedding) * weight)
+                .sum::<f32>()
+                / total_weight.max(f32::EPSILON);
+            (index, score)
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let Some((index, score)) = ranked.first().copied() else {
+        return Ok((None, 0.0, 0.0, String::new()));
+    };
+    let gap = ranked.get(1).map_or(score, |(_, second)| score - second);
+    let query = evidence
+        .iter()
+        .map(|(text, _)| text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    Ok((Some(index), score, gap, query))
+}
+
+fn normalize_semantic_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| if ch.is_alphanumeric() { ch } else { ' ' })
+        .collect::<String>()
+}
+
 /// Tier 3: ask the LLM to classify the content, then re-embed its summary +
 /// category + tags as a richer query and re-rank the candidate list. Returns
 /// `(idx, score, gap, model_id)` for the new top, or `None` when the LLM
@@ -486,7 +530,11 @@ async fn tier3_rerank(
     filename: &str,
     candidates: &[ScanCandidate],
 ) -> Result<Option<(usize, f32, f32, String)>> {
-    let classification = text_backend.classify_text(text, filename).await?;
+    // Keep fallback prompts comfortably inside small local models' context
+    // windows. Extractors may return very long PDFs; truncating on a character
+    // boundary preserves deterministic, valid UTF-8 input.
+    let bounded_text = crate::text_util::char_prefix(text, 12_000);
+    let classification = text_backend.classify_text(bounded_text, filename).await?;
     let model_id = text_backend.model_id().to_string();
     let query = build_llm_query(&classification);
     if query.is_empty() {
@@ -515,7 +563,7 @@ fn build_llm_query(c: &tidyup_core::inference::ContentClassification) -> String 
 }
 
 /// File size in bytes, or `0` if it can't be stat'd (treated as "small enough";
-/// the subsequent read then fails closed to the Tier-1 fallback).
+/// the subsequent read then falls through safely).
 async fn file_len(path: &Path) -> u64 {
     tokio::fs::metadata(path).await.map_or(0, |m| m.len())
 }
@@ -573,8 +621,8 @@ async fn classify_image(
     if ctx.candidates.is_empty() {
         return Ok(None);
     }
-    // Bound the read: an oversized image is left to the Tier-1 fallback rather
-    // than slurped whole into memory for embedding.
+    // Bound the read: an oversized image falls through to other semantic
+    // evidence rather than being slurped whole into memory for embedding.
     if file_len(path).await > tidyup_extract::MAX_DOCUMENT_BYTES {
         return Ok(None);
     }
@@ -625,8 +673,8 @@ async fn classify_audio(
     if ctx.candidates.is_empty() {
         return Ok(None);
     }
-    // Bound the read: an oversized audio file is left to the Tier-1 fallback
-    // rather than slurped whole into memory for embedding.
+    // Bound the read: oversized audio falls through to other semantic evidence
+    // rather than being slurped whole into memory for embedding.
     if file_len(path).await > tidyup_extract::MAX_DOCUMENT_BYTES {
         return Ok(None);
     }
@@ -662,67 +710,6 @@ async fn classify_audio(
     }))
 }
 
-/// Build the Tier-1 (`needs_review = false`) result for a confident heuristic
-/// hit. Shared by the two call sites in `classify_file`: the normal Tier-1
-/// short-circuit, and the fallback when a media file's cross-modal Tier 2 was
-/// tried first and missed.
-async fn tier1_classified(
-    path: &Path,
-    hit: &HeuristicMatch,
-    extracted: Option<&tidyup_core::extractor::ExtractedContent>,
-    candidates: &[ScanCandidate],
-    embeddings: &dyn EmbeddingBackend,
-    filename: &str,
-    config: &ClassifierConfig,
-) -> Result<ClassifiedFile> {
-    let text = extracted.and_then(|e| e.text.as_deref());
-    let year = year_from_path_and_text(path, text);
-    let keywords = text
-        .map(|t| yake::extract_keywords(t, 8))
-        .unwrap_or_default();
-    let metadata_json = extracted.map_or(serde_json::Value::Null, |e| e.metadata.clone());
-    let rename = gate_rename(
-        path,
-        &metadata_json,
-        &keywords,
-        year,
-        hit.confidence,
-        embeddings,
-        text,
-        filename,
-        config,
-    )
-    .await?;
-    Ok(ClassifiedFile {
-        folder_path: hit.taxonomy_path.to_string(),
-        confidence: hit.confidence,
-        reasoning: format!("tier1 heuristic: {}", hit.reason),
-        needs_review: false,
-        year,
-        temporal: candidates
-            .iter()
-            .find(|c| c.folder_path == hit.taxonomy_path)
-            .is_some_and(|c| c.temporal),
-        rename: rename.proposal,
-        classification_confidence: Some(hit.confidence),
-        rename_mismatch_score: rename.mismatch_score,
-    })
-}
-
-fn weak_heuristic(hit: &HeuristicMatch, _path: &Path) -> ClassifiedFile {
-    ClassifiedFile {
-        folder_path: hit.taxonomy_path.to_string(),
-        confidence: hit.confidence,
-        reasoning: format!("tier1 heuristic (below threshold): {}", hit.reason),
-        needs_review: true,
-        year: None,
-        temporal: false,
-        rename: RenameProposal::Keep,
-        classification_confidence: Some(hit.confidence),
-        rename_mismatch_score: None,
-    }
-}
-
 struct GatedRename {
     proposal: RenameProposal,
     mismatch_score: Option<f32>,
@@ -754,7 +741,14 @@ async fn gate_rename(
         });
     }
 
-    if classification_confidence < config.rename.min_classification_confidence {
+    let ocr_evidence = matches!(
+        &proposal,
+        RenameProposal::Rename {
+            source: RenameSource::Ocr,
+            ..
+        }
+    );
+    if classification_confidence < config.rename.min_classification_confidence && !ocr_evidence {
         return Ok(GatedRename {
             proposal: RenameProposal::Keep,
             mismatch_score: None,
@@ -772,8 +766,7 @@ async fn gate_rename(
     let content_vec = embeddings.embed_text(content_text).await?;
     let cos = cosine(&filename_vec, &content_vec);
     let mismatch = 1.0_f32 - cos;
-
-    if mismatch < config.rename.min_mismatch_score {
+    if mismatch < config.rename.min_mismatch_score && !ocr_evidence {
         return Ok(GatedRename {
             proposal: RenameProposal::Keep,
             mismatch_score: Some(mismatch),
@@ -891,26 +884,36 @@ fn destination_dir(
     dest
 }
 
-/// Default taxonomy placement for a bundle kind in scan mode.
-const fn bundle_taxonomy(kind: &BundleKind) -> &'static str {
-    match kind {
-        BundleKind::GitRepository
-        | BundleKind::NodeProject
-        | BundleKind::RustCrate
-        | BundleKind::PythonProject
-        | BundleKind::XcodeProject
-        | BundleKind::AndroidStudioProject => "Code/Projects/",
-        BundleKind::JupyterNotebookSet => "Code/Notebooks/",
-        BundleKind::PhotoBurst => "Photos/Bursts/",
-        BundleKind::MusicAlbum => "Music/Albums/",
-        BundleKind::DocumentSeries { .. } => "Documents/Series/",
-        BundleKind::Generic => "Archives/",
-    }
-}
-
-fn build_bundle_proposal(bundle: &DetectedBundle, output_root: &Path) -> Result<BundleProposal> {
-    let taxonomy = bundle_taxonomy(&bundle.kind);
-    let target_parent = output_root.join(taxonomy.trim_end_matches('/'));
+async fn build_bundle_proposal(
+    bundle: &DetectedBundle,
+    output_root: &Path,
+    candidates: &[ScanCandidate],
+    embeddings: &dyn EmbeddingBackend,
+) -> Result<BundleProposal> {
+    let leaf = bundle
+        .root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("bundle");
+    let member_names = bundle
+        .members
+        .iter()
+        .take(24)
+        .filter_map(|member| member.file_name().and_then(|name| name.to_str()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let query = format!(
+        "atomic collection kind {} name {} members {}",
+        bundle.kind.as_str(),
+        normalize_semantic_text(leaf),
+        normalize_semantic_text(&member_names)
+    );
+    let embedding = embeddings.embed_text(&query).await?;
+    let (candidate_index, confidence, _) = best_match(&embedding, candidates);
+    let candidate = candidate_index
+        .and_then(|index| candidates.get(index))
+        .ok_or_else(|| anyhow::anyhow!("no semantic destination candidate for bundle {leaf}"))?;
+    let target_parent = output_root.join(candidate.folder_path.trim_end_matches('/'));
 
     // Directory bundles keep their subtree under a folder named after the root
     // (members relocate relative to the root). File-set clusters (photo bursts,
@@ -965,9 +968,133 @@ fn build_bundle_proposal(bundle: &DetectedBundle, output_root: &Path) -> Result<
         bundle.kind.clone(),
         target_parent,
         members,
-        0.90,
-        bundle.reasoning.clone(),
+        confidence,
+        format!("{}; semantic bundle routing", bundle.reasoning),
     )?)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build_content_bundle_proposal(
+    bundle: &DetectedBundle,
+    output_root: &Path,
+    candidates: &[ScanCandidate],
+    embeddings: &dyn EmbeddingBackend,
+    multimodal: &MultimodalContext<'_>,
+    text_backend: Option<&dyn TextBackend>,
+    extractors: &[Arc<dyn ContentExtractor>],
+    config: &ClassifierConfig,
+) -> Result<BundleProposal> {
+    let label = bundle.target_subdir.clone().unwrap_or_else(|| {
+        bundle
+            .root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("collection")
+            .to_string()
+    });
+    let allow_renames = bundle.kind.allows_member_renames();
+    let mut proposals = Vec::with_capacity(bundle.members.len());
+    let mut confidence_sum = 0.0_f32;
+
+    for member in &bundle.members {
+        let classified = classify_file(
+            member,
+            candidates,
+            embeddings,
+            multimodal,
+            text_backend,
+            extractors,
+            config,
+        )
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no classification for {}", member.display()))?;
+        let mut proposal = build_proposal(member, output_root, &classified);
+        confidence_sum += proposal.confidence;
+        if !allow_renames {
+            proposal.change_type = ChangeType::Move;
+            proposal.proposed_name = member
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_string();
+            proposal.rename_mismatch_score = None;
+        }
+        proposal.reasoning = format!("{}; {}", bundle.reasoning, proposal.reasoning);
+        proposals.push(proposal);
+    }
+
+    // Route the collection from its semantic identity and evidence-backed
+    // member names. Generic source names (timestamps, camera counters, etc.)
+    // are deliberately omitted once OCR has supplied a descriptive rename;
+    // otherwise formatting noise can overwhelm the meaning of a small set.
+    let member_evidence = proposals
+        .iter()
+        .map(|proposal| semantic_filename(&proposal.proposed_name))
+        .filter(|name| !name.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ");
+    let collection_query = format!(
+        "cohesive collection named {}; member artifacts: {}",
+        normalize_semantic_text(&label),
+        member_evidence
+    );
+    let collection_embedding = embeddings.embed_text(&collection_query).await?;
+    let (candidate_index, mut collection_confidence, mut collection_gap) =
+        best_match(&collection_embedding, candidates);
+    let mut chosen_index = candidate_index;
+    let mut routing_tier = "semantic embedding";
+    let uncertain =
+        collection_confidence < config.embedding_threshold || collection_gap < config.ambiguity_gap;
+    if uncertain && config.enable_llm_fallback {
+        if let Some(backend) = text_backend {
+            if let Ok(Some((llm_index, llm_score, llm_gap, _))) =
+                tier3_rerank(backend, embeddings, &collection_query, &label, candidates).await
+            {
+                if llm_score > collection_confidence {
+                    chosen_index = Some(llm_index);
+                    collection_confidence = llm_score;
+                    collection_gap = llm_gap;
+                    routing_tier = "LLM-refined semantic embedding";
+                }
+            }
+        }
+    }
+    let taxonomy = chosen_index
+        .and_then(|index| candidates.get(index))
+        .map(|candidate| candidate.folder_path.as_str())
+        .ok_or_else(|| anyhow::anyhow!("no semantic destination for collection {label}"))?;
+    let target_parent = output_root.join(taxonomy.trim_end_matches('/'));
+    let collection_root = target_parent.join(&label);
+    for proposal in &mut proposals {
+        proposal.proposed_path = collection_root.join(&proposal.proposed_name);
+    }
+
+    let count = u16::try_from(proposals.len()).unwrap_or(u16::MAX);
+    let member_confidence = if count == 0 {
+        0.0
+    } else {
+        confidence_sum / f32::from(count)
+    };
+    let confidence = member_confidence.min(collection_confidence);
+    Ok(BundleProposal::new(
+        bundle.root.clone(),
+        bundle.kind.clone(),
+        target_parent,
+        proposals,
+        confidence,
+        format!(
+            "{}; {routing_tier} collection routing: cos={collection_confidence:.3} gap={collection_gap:.3}",
+            bundle.reasoning
+        ),
+    )?)
+}
+
+fn semantic_filename(filename: &str) -> String {
+    let stem = Path::new(filename)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or(filename);
+    normalize_semantic_text(stem)
 }
 
 #[cfg(test)]
@@ -980,6 +1107,7 @@ mod tests {
     use tempfile::TempDir;
     use tidyup_core::extractor::ExtractedContent;
     use tidyup_core::frontend::Level;
+    use tidyup_domain::BundleKind;
 
     struct NullProgress;
     #[async_trait]
@@ -1069,8 +1197,136 @@ mod tests {
         out
     }
 
+    /// Semantic fixture with no suffix knowledge: dimensions represent topic
+    /// meaning only, so tests fail if routing starts depending on file type.
+    struct TopicEmbeddings;
+    #[async_trait]
+    impl EmbeddingBackend for TopicEmbeddings {
+        async fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
+            let lower = text.to_ascii_lowercase();
+            Ok(vec![
+                if lower.contains("tax") || lower.contains("invoice") {
+                    1.0
+                } else {
+                    0.0
+                },
+                if lower.contains("vacation") || lower.contains("portrait") {
+                    1.0
+                } else {
+                    0.0
+                },
+                if lower.contains("software") || lower.contains("project") {
+                    1.0
+                } else {
+                    0.0
+                },
+            ])
+        }
+
+        async fn embed_texts(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            let mut vectors = Vec::with_capacity(texts.len());
+            for text in texts {
+                vectors.push(self.embed_text(text).await?);
+            }
+            Ok(vectors)
+        }
+
+        fn dimensions(&self) -> usize {
+            3
+        }
+
+        fn model_id(&self) -> &'static str {
+            "topic-fixture"
+        }
+    }
+
+    async fn topic_candidates(embeddings: &TopicEmbeddings) -> Vec<ScanCandidate> {
+        let specs = [
+            ("Money/", "tax invoice", false),
+            ("Memories/", "vacation portrait", false),
+            ("Builds/", "software project", false),
+        ];
+        let mut candidates = Vec::new();
+        for (path, description, temporal) in specs {
+            candidates.push(ScanCandidate {
+                folder_path: path.to_string(),
+                description: description.to_string(),
+                temporal,
+                embedding: embeddings.embed_text(description).await.unwrap(),
+            });
+        }
+        candidates
+    }
+
     #[tokio::test]
-    async fn heuristic_resolves_rust_source() {
+    async fn identical_suffixes_route_by_semantics_not_type() {
+        let td = TempDir::new().unwrap();
+        fs::write(td.path().join("first.blob"), b"tax invoice statement").unwrap();
+        fs::write(td.path().join("second.blob"), b"software project milestone").unwrap();
+
+        let embeddings = TopicEmbeddings;
+        let candidates = topic_candidates(&embeddings).await;
+        let extractors: Vec<Arc<dyn ContentExtractor>> = vec![Arc::new(PlainExtractor)];
+        let out = run_scan(
+            td.path(),
+            td.path(),
+            &candidates,
+            &embeddings,
+            &MultimodalContext::default(),
+            None,
+            &extractors,
+            &ClassifierConfig::default(),
+            &NullProgress,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.proposals.len(), 2);
+        let first = out
+            .proposals
+            .iter()
+            .find(|proposal| proposal.original_path.ends_with("first.blob"))
+            .unwrap();
+        let second = out
+            .proposals
+            .iter()
+            .find(|proposal| proposal.original_path.ends_with("second.blob"))
+            .unwrap();
+        assert!(first.proposed_path.starts_with(td.path().join("Money")));
+        assert!(second.proposed_path.starts_with(td.path().join("Builds")));
+    }
+
+    #[tokio::test]
+    async fn different_suffixes_converge_on_shared_semantics() {
+        let td = TempDir::new().unwrap();
+        fs::write(td.path().join("alpha.odd"), b"vacation portrait").unwrap();
+        fs::write(td.path().join("beta.weird"), b"vacation portrait").unwrap();
+
+        let embeddings = TopicEmbeddings;
+        let candidates = topic_candidates(&embeddings).await;
+        let extractors: Vec<Arc<dyn ContentExtractor>> = vec![Arc::new(PlainExtractor)];
+        let out = run_scan(
+            td.path(),
+            td.path(),
+            &candidates,
+            &embeddings,
+            &MultimodalContext::default(),
+            None,
+            &extractors,
+            &ClassifierConfig::default(),
+            &NullProgress,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.proposals.len(), 2);
+        assert!(out.proposals.iter().all(|proposal| proposal
+            .proposed_path
+            .starts_with(td.path().join("Memories"))));
+    }
+
+    #[tokio::test]
+    async fn semantic_ranking_resolves_source_without_extension_routing() {
         let td = TempDir::new().unwrap();
         // Loose file, not bundled (no Cargo.toml at root).
         fs::write(td.path().join("helpers.rs"), b"fn main() {}").unwrap();
@@ -1094,7 +1350,7 @@ mod tests {
         assert_eq!(out.proposals.len(), 1);
         let p = &out.proposals[0];
         assert!(p.proposed_path.to_string_lossy().contains("Code"));
-        assert!(p.reasoning.contains("tier1"));
+        assert!(p.reasoning.contains("tier2 embedding"));
     }
 
     #[tokio::test]
@@ -1128,6 +1384,16 @@ mod tests {
         let bundle = &out.bundles[0];
         assert_eq!(bundle.kind, BundleKind::RustCrate);
         assert_eq!(bundle.members.len(), 2);
+        assert!(bundle.members.iter().any(|member| {
+            member.original_path.ends_with("myproj/src/main.rs")
+                && member.proposed_path.ends_with("myproj/src/main.rs")
+                && member.change_type == ChangeType::Move
+        }));
+        assert!(bundle.members.iter().any(|member| {
+            member.original_path.ends_with("myproj/Cargo.toml")
+                && member.proposed_path.ends_with("myproj/Cargo.toml")
+                && member.change_type == ChangeType::Move
+        }));
         // Bundles bypass per-file classification.
         assert!(out.proposals.is_empty());
     }
@@ -1138,7 +1404,7 @@ mod tests {
         fs::write(td.path().join("2024_tax_return.pdf"), b"form 1040 taxes").unwrap();
 
         // Use synthetic tax candidate that matches the file content by bucket.
-        // .pdf extension isn't in heuristics, so this routes through Tier 2.
+        // Destination selection is semantic; the suffix only selects extraction.
         let eb = BucketEmbeddings;
         let candidates = sample_candidates(&eb).await;
         let ex: Vec<Arc<dyn ContentExtractor>> = vec![Arc::new(PlainExtractor)];
@@ -1289,12 +1555,8 @@ mod tests {
         };
 
         let eb = BucketEmbeddings;
-        // Empty text candidates so we know any proposal came from the image
-        // path. Tier 1 will fire (PNG → Photos/) — verify the proposal is
-        // produced even with that path; the modality routing kicks in only
-        // when Tier 1 misses or the heuristic threshold isn't cleared.
+        // Empty text candidates ensure any proposal came from the image path.
         let cfg = ClassifierConfig {
-            heuristic_threshold: 0.99, // force Tier 1 to miss
             embedding_threshold: 0.0,
             ambiguity_gap: 0.0,
             ..ClassifierConfig::default()
@@ -1329,11 +1591,8 @@ mod tests {
 
     #[tokio::test]
     async fn image_reaches_tier2_at_default_threshold_when_backend_present() {
-        // WP-7 regression signal: under the SHIPPED default heuristic_threshold
-        // (0.60), a `.png` whose Tier-1 heuristic (Photos/ @ 0.75) would
-        // normally short-circuit must instead route through the image backend
-        // when the SigLIP bundle is loaded. Before the fix, common media never
-        // reached cross-modal Tier 2 in scan mode.
+        // Regression signal: a recognized image reaches the image embedding
+        // backend without any extension-to-destination short circuit.
         let td = TempDir::new().unwrap();
         let img_path = td.path().join("snapshot.png");
         image::RgbImage::new(4, 4).save(&img_path).unwrap();
@@ -1356,7 +1615,6 @@ mod tests {
 
         let eb = BucketEmbeddings;
         let cfg = ClassifierConfig {
-            heuristic_threshold: 0.6, // shipped default — Tier 1 (0.75) WOULD short-circuit
             embedding_threshold: 0.0,
             ambiguity_gap: 0.0,
             ..ClassifierConfig::default()
@@ -1378,7 +1636,7 @@ mod tests {
         assert_eq!(out.proposals.len(), 1);
         assert!(
             out.proposals[0].reasoning.contains("tier2 image"),
-            "at the default threshold the image must reach SigLIP, not Tier 1; got {}",
+            "the image must reach the semantic image backend; got {}",
             out.proposals[0].reasoning,
         );
     }
@@ -1423,25 +1681,6 @@ mod tests {
         assert_eq!(year_from_path_and_text(&path, Some(&text)), Some(2021));
         // A purely multibyte body with no year returns None, still no panic.
         assert_eq!(year_from_path_and_text(&path, Some(&filler)), None);
-    }
-
-    #[test]
-    fn bundle_taxonomy_maps_each_kind() {
-        assert_eq!(bundle_taxonomy(&BundleKind::RustCrate), "Code/Projects/");
-        assert_eq!(bundle_taxonomy(&BundleKind::NodeProject), "Code/Projects/");
-        assert_eq!(
-            bundle_taxonomy(&BundleKind::JupyterNotebookSet),
-            "Code/Notebooks/",
-        );
-        assert_eq!(bundle_taxonomy(&BundleKind::PhotoBurst), "Photos/Bursts/");
-        assert_eq!(bundle_taxonomy(&BundleKind::MusicAlbum), "Music/Albums/");
-        assert_eq!(
-            bundle_taxonomy(&BundleKind::DocumentSeries {
-                pattern: "x".into(),
-            }),
-            "Documents/Series/",
-        );
-        assert_eq!(bundle_taxonomy(&BundleKind::Generic), "Archives/");
     }
 
     #[test]

@@ -39,16 +39,13 @@ pub enum Phase {
     Rollback,
 }
 
-/// Build the text that Tier-2 embeds to classify a file, from its extracted
+/// Build the semantic text embedded to classify a file, from its extracted
 /// body and filename.
 ///
-/// This is the **single** canonical construction shared by the shipped scan
-/// pipeline and the offline eval harness, so the eval measures the same query
-/// the product embeds (previously they diverged — the product embedded the raw
-/// body while the eval embedded `filename + first-500-chars`, so the eval
-/// measured a different system). The model token-truncates internally, so no
-/// char cap is applied here. Prepending the filename gives Tier 2 the same
-/// naming signal Tier 1 keys on. An empty body falls back to the filename alone.
+/// This is the canonical construction used by the standalone embedding
+/// classifier and its offline evaluation harness. The runtime scan pipeline
+/// keeps name and body as separately weighted evidence channels. The model
+/// token-truncates internally, so no character cap is applied here.
 #[must_use]
 pub fn classification_query(body: &str, filename: &str) -> String {
     let body = body.trim();

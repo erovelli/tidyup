@@ -462,8 +462,7 @@ fn is_month_token(s: &str) -> bool {
 
 /// Compose the natural-language description fed into the folder name embedding.
 ///
-/// Shape: `"<segments joined with /> — folder containing <N> files; dominant
-/// extensions: .ext, .ext, .ext."`. Empty folders drop the extension clause.
+/// Shape: `"<segments joined with /> — folder containing <N> files"`.
 ///
 /// The description is deliberately descriptive, not imperative — it's encoded
 /// by the same BGE model that embeds file content, and symmetric phrasing
@@ -477,19 +476,10 @@ pub fn synthesize_description(node: &FolderNode) -> String {
     };
 
     let count = node.metadata.file_count;
-    let ext_clause = if node.metadata.dominant_extensions.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "; dominant extensions: {}",
-            node.metadata.dominant_extensions.join(", "),
-        )
-    };
-
     if count == 0 {
         format!("{path_display} — folder")
     } else {
-        format!("{path_display} — folder containing {count} files{ext_clause}")
+        format!("{path_display} — folder containing {count} files")
     }
 }
 
@@ -816,7 +806,7 @@ fn l2_normalize_in_place(v: &mut [f32]) {
     }
 }
 
-/// Heuristic profile confidence in `[0.0, 1.0]` used as a tiebreaker during
+/// Estimated profile confidence in `[0.0, 1.0]` used as a tiebreaker during
 /// classification. A folder with many files and a descriptive name gives a
 /// strong signal; a nearly-empty folder gives a weak one.
 #[must_use]
@@ -1090,7 +1080,7 @@ mod tests {
         let desc = synthesize_description(node);
         assert!(desc.contains("Finance"));
         assert!(desc.contains("Taxes"));
-        assert!(desc.contains(".pdf"));
+        assert!(!desc.contains(".pdf"));
         assert!(desc.contains("1 files"));
     }
 

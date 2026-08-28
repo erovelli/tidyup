@@ -23,7 +23,7 @@
 //!
 //! [`scanner`]: crate::scanner
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -73,6 +73,7 @@ const IMAGE_EXTS: &[&str] = &[
 const AUDIO_EXTS: &[&str] = &[
     "mp3", "flac", "m4a", "wav", "ogg", "opus", "aiff", "aif", "ape", "wma", "alac", "aac",
 ];
+const MODEL_EXTS: &[&str] = &["stl", "obj", "3mf", "step", "stp", "fbx"];
 
 fn modality(path: &Path) -> Modality {
     let ext = path
@@ -121,18 +122,22 @@ async fn cluster_dir(
     extractors: &[Arc<dyn ContentExtractor>],
     config: &ClusterConfig,
 ) -> (Vec<DetectedBundle>, Vec<PathBuf>) {
+    // High-precision semantic collections run before modality-specific passes:
+    // a shared rare entity stem is meaningful across extensions (for example
+    // `atomsnotelectrons_submission.txt` + `atomsnotelectrons_testbench.png`).
+    // OCR-similar generic screenshots can then attach to that anchored set.
+    let (mut bundles, semantic_left) = cluster_semantic_collections(dir, files, extractors).await;
+
     let mut images = Vec::new();
     let mut audio = Vec::new();
     let mut others = Vec::new();
-    for f in files {
+    for f in &semantic_left {
         match modality(f) {
             Modality::Image => images.push(f.clone()),
             Modality::Audio => audio.push(f.clone()),
             Modality::Other => others.push(f.clone()),
         }
     }
-
-    let mut bundles = Vec::new();
 
     let (burst_bundles, burst_left) = cluster_photo_bursts(dir, &images, extractors, config).await;
     bundles.extend(burst_bundles);
@@ -143,15 +148,284 @@ async fn cluster_dir(
     // Document series runs over NON-media loose files only. Media that failed
     // burst/album clustering — EXIF-less photos, untagged audio — must NOT be
     // swept into a DocumentSeries by filename family (e.g. IMG_0001.jpg,
-    // IMG_0002.jpg): those belong in Photos/Music via the Tier-1 heuristic, not
-    // Documents/Series. Excluding them by modality is the guard; they fall
-    // through as individual leftover files.
+    // IMG_0002.jpg): format-sequential media names are not semantic evidence
+    // of a document series. Excluding them by modality is the structural guard;
+    // they fall through for individual semantic classification.
     let (series_bundles, mut leftover) = cluster_document_series(dir, &others, config);
     bundles.extend(series_bundles);
     leftover.extend(burst_left);
     leftover.extend(album_left);
 
     (bundles, leftover)
+}
+
+// ---------------------------------------------------------------------------
+// Semantic collections (cross-format filename + OCR evidence)
+// ---------------------------------------------------------------------------
+
+async fn cluster_semantic_collections(
+    dir: &Path,
+    files: &[PathBuf],
+    extractors: &[Arc<dyn ContentExtractor>],
+) -> (Vec<DetectedBundle>, Vec<PathBuf>) {
+    // Directory cohesion outranks repeated stems inside an assembly. A CAD
+    // directory commonly contains the same part in multiple formats
+    // (`Middle Piece.stl` + `Middle Piece.3mf`); grouping those pairs first
+    // would fragment the assembly and could drop an unsupported format if its
+    // smaller bundle later failed classification.
+    if let Some(bundle) = cohesive_model_bundle(dir, files) {
+        return (vec![bundle], Vec::new());
+    }
+
+    let by_entity = semantic_entity_groups(files);
+
+    let mut consumed = HashSet::new();
+    let mut bundles = Vec::new();
+    for (key, mut members) in by_entity {
+        if members.len() < 2 {
+            continue;
+        }
+        members.sort();
+        for member in &members {
+            consumed.insert(member.clone());
+        }
+
+        // Expand an anchored entity group with generic screenshots whose
+        // locally recognised text overlaps the group's image/text evidence.
+        let mut evidence_tokens = HashSet::new();
+        for member in &members {
+            if let Some(content) = extract(member, extractors).await {
+                if let Some(text) = content.text {
+                    evidence_tokens.extend(semantic_tokens(&text));
+                }
+            }
+        }
+        let mut screenshot_candidates: Vec<PathBuf> = files
+            .iter()
+            .filter(|path| !consumed.contains(*path) && is_generic_screenshot(path))
+            .cloned()
+            .collect();
+        screenshot_candidates.sort();
+        for screenshot in screenshot_candidates {
+            let Some(content) = extract(&screenshot, extractors).await else {
+                continue;
+            };
+            let Some(text) = content.text else {
+                continue;
+            };
+            let tokens = semantic_tokens(&text);
+            if token_overlap(&evidence_tokens, &tokens) >= 0.22 {
+                evidence_tokens.extend(tokens);
+                consumed.insert(screenshot.clone());
+                members.push(screenshot);
+            }
+        }
+
+        let label = display_collection_label(&key);
+        let reasoning = format!(
+            "{} related artifacts share the entity stem \"{key}\"; generic screenshots were attached only when local OCR evidence overlapped",
+            members.len()
+        );
+        bundles.push(make_bundle(
+            dir,
+            BundleKind::SemanticCollection {
+                label: label.clone(),
+            },
+            members,
+            &label,
+            reasoning,
+        ));
+    }
+
+    // Preserve cohesive 3D assemblies found inside a named source directory.
+    // This intentionally does not fire at a broad source root such as Desktop:
+    // every member must share a model extension and the directory must itself
+    // have a non-generic name.
+    let remaining: Vec<PathBuf> = files
+        .iter()
+        .filter(|path| !consumed.contains(*path))
+        .cloned()
+        .collect();
+    if is_cohesive_model_directory(dir, &remaining) {
+        let label = dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("3d-model")
+            .to_string();
+        for member in &remaining {
+            consumed.insert(member.clone());
+        }
+        bundles.push(make_bundle(
+            dir,
+            BundleKind::SemanticCollection {
+                label: label.clone(),
+            },
+            remaining,
+            &label,
+            format!("cohesive 3D assembly preserved from source directory \"{label}\""),
+        ));
+    }
+
+    let leftovers = files
+        .iter()
+        .filter(|path| !consumed.contains(*path))
+        .cloned()
+        .collect();
+    (bundles, leftovers)
+}
+
+fn cohesive_model_bundle(dir: &Path, files: &[PathBuf]) -> Option<DetectedBundle> {
+    if !is_cohesive_model_directory(dir, files) {
+        return None;
+    }
+    let label = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("3d-model")
+        .to_string();
+    Some(make_bundle(
+        dir,
+        BundleKind::SemanticCollection {
+            label: label.clone(),
+        },
+        files.to_vec(),
+        &label,
+        format!("cohesive 3D assembly preserved from source directory \"{label}\""),
+    ))
+}
+
+fn semantic_entity_groups(files: &[PathBuf]) -> BTreeMap<String, Vec<PathBuf>> {
+    let mut candidates: BTreeMap<String, HashSet<PathBuf>> = BTreeMap::new();
+    for (index, left) in files.iter().enumerate() {
+        for right in files.iter().skip(index.saturating_add(1)) {
+            let Some(key) = shared_entity_key(left, right) else {
+                continue;
+            };
+            let members = candidates.entry(key).or_default();
+            members.insert(left.clone());
+            members.insert(right.clone());
+        }
+    }
+
+    // Prefer the largest, most specific groups and assign each file once.
+    let mut ranked: Vec<(String, HashSet<PathBuf>)> = candidates.into_iter().collect();
+    ranked.sort_by(|(left_key, left), (right_key, right)| {
+        right
+            .len()
+            .cmp(&left.len())
+            .then_with(|| right_key.len().cmp(&left_key.len()))
+            .then_with(|| left_key.cmp(right_key))
+    });
+    let mut consumed = HashSet::new();
+    let mut groups = BTreeMap::new();
+    for (key, members) in ranked {
+        let mut available: Vec<PathBuf> = members
+            .into_iter()
+            .filter(|path| !consumed.contains(path))
+            .collect();
+        if available.len() < 2 {
+            continue;
+        }
+        available.sort();
+        consumed.extend(available.iter().cloned());
+        groups.insert(key, available);
+    }
+    groups
+}
+
+fn shared_entity_key(left: &Path, right: &Path) -> Option<String> {
+    if is_generic_screenshot(left) || is_generic_screenshot(right) {
+        return None;
+    }
+    let left_tokens = filename_tokens(left)?;
+    let right_tokens = filename_tokens(right)?;
+    let shared = left_tokens
+        .iter()
+        .zip(right_tokens.iter())
+        .take_while(|(left, right)| left == right)
+        .count();
+    if shared == 0 {
+        return None;
+    }
+    let key = left_tokens.get(..shared)?.join("_");
+    let first_token_len = left_tokens.first()?.len();
+    // A long unique token or a multi-token prefix is stable across arbitrary
+    // project vocabularies without enumerating roles such as "submission".
+    (key.len() >= 8 && (shared > 1 || first_token_len >= 8)).then_some(key)
+}
+
+fn filename_tokens(path: &Path) -> Option<Vec<String>> {
+    let stem = path.file_stem()?.to_str()?.to_ascii_lowercase();
+    let tokens: Vec<String> = stem
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    (!tokens.is_empty()).then_some(tokens)
+}
+
+fn is_generic_screenshot(path: &Path) -> bool {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem.to_ascii_lowercase().starts_with("screenshot "))
+}
+
+fn semantic_tokens(text: &str) -> HashSet<String> {
+    const STOP: &[&str] = &[
+        "the", "and", "for", "with", "from", "this", "that", "your", "you", "are", "all", "back",
+        "home", "what", "have", "has", "into", "not", "but", "was", "were",
+    ];
+    text.split(|ch: char| !ch.is_ascii_alphanumeric())
+        .map(str::to_ascii_lowercase)
+        .filter(|token| token.len() >= 3 && !STOP.contains(&token.as_str()))
+        .collect()
+}
+
+fn token_overlap(anchor: &HashSet<String>, candidate: &HashSet<String>) -> f32 {
+    if anchor.is_empty() || candidate.is_empty() {
+        return 0.0;
+    }
+    let shared = anchor.intersection(candidate).count();
+    let denominator = anchor.len().min(candidate.len());
+    let Ok(shared_u16) = u16::try_from(shared) else {
+        return 0.0;
+    };
+    let Ok(denominator_u16) = u16::try_from(denominator) else {
+        return 0.0;
+    };
+    f32::from(shared_u16) / f32::from(denominator_u16)
+}
+
+fn display_collection_label(key: &str) -> String {
+    key.split('_')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            chars.next().map_or_else(String::new, |first| {
+                format!("{}{}", first.to_ascii_uppercase(), chars.as_str())
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn is_cohesive_model_directory(dir: &Path, files: &[PathBuf]) -> bool {
+    if files.len() < 2 {
+        return false;
+    }
+    let generic_dir = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_ascii_lowercase)
+        .is_none_or(|name| matches!(name.as_str(), "desktop" | "downloads" | "documents"));
+    if generic_dir {
+        return false;
+    }
+    files.iter().all(|path| {
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| MODEL_EXTS.contains(&ext.to_ascii_lowercase().as_str()))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -540,11 +814,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn semantic_collection_links_cross_format_shared_entity() {
+        let files = vec![
+            p("/desktop/atomsnotelectrons_submission.txt"),
+            p("/desktop/atomsnotelectrons_testbench.png"),
+            p("/desktop/unrelated.pdf"),
+        ];
+        let (bundles, leftover) = cluster_loose(&files, &[], &ClusterConfig::default()).await;
+        assert_eq!(bundles.len(), 1);
+        assert!(matches!(
+            bundles[0].kind,
+            BundleKind::SemanticCollection { .. }
+        ));
+        assert_eq!(bundles[0].members.len(), 2);
+        assert_eq!(leftover, vec![p("/desktop/unrelated.pdf")]);
+    }
+
+    #[tokio::test]
+    async fn semantic_collection_does_not_require_known_role_words() {
+        let files = vec![
+            p("/desktop/quasarforge_lantern.alpha"),
+            p("/desktop/quasarforge_velvet.omega"),
+            p("/desktop/unrelated.data"),
+        ];
+        let (bundles, leftover) = cluster_loose(&files, &[], &ClusterConfig::default()).await;
+        assert_eq!(bundles.len(), 1);
+        assert_eq!(bundles[0].target_subdir.as_deref(), Some("Quasarforge"));
+        assert_eq!(bundles[0].members.len(), 2);
+        assert_eq!(leftover, vec![p("/desktop/unrelated.data")]);
+    }
+
+    #[tokio::test]
+    async fn cohesive_model_directory_is_preserved() {
+        let files = vec![
+            p("/desktop/zprint/Back Piece.stl"),
+            p("/desktop/zprint/Front Piece.stl"),
+            p("/desktop/zprint/Middle Piece.stl"),
+            p("/desktop/zprint/Middle Piece.3mf"),
+            p("/desktop/zprint/Side Piece.stl"),
+            p("/desktop/zprint/Side Piece.3mf"),
+        ];
+        let (bundles, leftover) = cluster_loose(&files, &[], &ClusterConfig::default()).await;
+        assert_eq!(bundles.len(), 1);
+        assert!(leftover.is_empty());
+        assert_eq!(bundles[0].target_subdir.as_deref(), Some("zprint"));
+        assert_eq!(bundles[0].members.len(), 6);
+    }
+
+    #[tokio::test]
     async fn exif_less_photos_do_not_become_a_document_series() {
         // IMG_0001.jpg / _0002 / _0003 with no EXIF (no extractors → no capture
         // time) must NOT be swept into a DocumentSeries by filename family —
-        // they belong in Photos via the Tier-1 heuristic. The MIME-class guard
-        // excludes image leftovers from the series pass; they fall through loose.
+        // their counter pattern alone is not semantic evidence of a document
+        // series. The modality guard excludes them from that structural pass.
         let files = vec![
             p("/dcim/IMG_0001.jpg"),
             p("/dcim/IMG_0002.jpg"),

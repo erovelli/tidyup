@@ -131,7 +131,7 @@ mod tests {
     fn image_taxonomy_descriptions_are_sentences() {
         for entry in default_image_taxonomy() {
             // Sanity-check: SigLIP wants natural-language captions, not
-            // keyword lists. A heuristic threshold is "starts with `a `".
+            // keyword lists. A simple validation rule is "starts with `a `".
             let lower = entry.description.to_ascii_lowercase();
             assert!(
                 lower.starts_with("a ") || lower.starts_with("an "),

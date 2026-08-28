@@ -221,7 +221,6 @@ pub struct ScoreBreakdown {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Tier {
-    Heuristic,
     Embedding,
     Llm,
 }
@@ -232,11 +231,9 @@ pub enum Tier {
 
 #[derive(Debug, Clone)]
 pub struct ClassifierConfig {
-    /// Tier 1 auto-classify threshold.
-    pub heuristic_threshold: f32,
-    /// Tier 2 auto-classify threshold.
+    /// Semantic embedding auto-classify threshold.
     pub embedding_threshold: f32,
-    /// Tier 2 ambiguity gap threshold.
+    /// Semantic ambiguity gap threshold.
     pub ambiguity_gap: f32,
     /// Whether to invoke Tier 3 (LLM) for ambiguous files. Defaults to `false`
     /// (privacy-preserving): activation is materialised from the layered config
@@ -274,7 +271,6 @@ pub struct RenameConfig {
 impl Default for ClassifierConfig {
     fn default() -> Self {
         Self {
-            heuristic_threshold: 0.60,
             embedding_threshold: 0.35,
             ambiguity_gap: 0.05,
             // Privacy default: Tier 3 stays off unless the layered config +
@@ -369,7 +365,7 @@ mod tests {
 
     #[test]
     fn tier_serde_roundtrip() {
-        for t in [Tier::Heuristic, Tier::Embedding, Tier::Llm] {
+        for t in [Tier::Embedding, Tier::Llm] {
             let json = serde_json::to_string(&t).unwrap();
             let back: Tier = serde_json::from_str(&json).unwrap();
             assert_eq!(t, back);
@@ -379,7 +375,6 @@ mod tests {
     #[test]
     fn default_classifier_config() {
         let config = ClassifierConfig::default();
-        assert!((config.heuristic_threshold - 0.60).abs() < f32::EPSILON);
         assert!((config.embedding_threshold - 0.35).abs() < f32::EPSILON);
         let w = &config.weights;
         let total = w.name + w.centroid + w.metadata + w.hierarchy;

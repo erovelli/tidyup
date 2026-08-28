@@ -21,7 +21,7 @@ blake3  = { workspace = true }
 dirs    = { workspace = true }
 indicatif = { workspace = true }
 
-# `eval` harness: runs the real cascade (heuristics + optional embeddings) over
+# `eval` harness: runs semantic classification over
 # the golden corpus. xtask is a dev-only, never-published binary, so pulling in
 # the pipeline + embedding crates here keeps the eval tool out of the shipping
 # graph entirely.

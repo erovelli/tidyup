@@ -57,12 +57,14 @@ impl Default for StorageConfig {
     }
 }
 
-/// Classification tier cascade. Default is heuristics + embeddings only — no LLM.
+/// Classification cascade. Semantic embeddings are always the primary path;
+/// the optional LLM is activated separately by the privacy gates below.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ClassifierConfig {
-    /// Ordered list of tier IDs to run. Recognised: `"heuristics"`, `"embeddings"`,
-    /// `"llm"`. The `"llm"` tier requires `--features llm-fallback` at build time
+    /// Legacy ordered tier list retained for config-file compatibility. New
+    /// configs contain only `"embeddings"`; unknown old IDs are ignored.
+    /// The `"llm"` tier requires `--features llm-fallback` at build time
     /// *and* `inference.llm_fallback = true` *and* a per-invocation activation flag.
     pub tiers: Vec<String>,
     /// Fallback auto-classify threshold for the composite score. Used when a tier
@@ -73,7 +75,7 @@ pub struct ClassifierConfig {
 impl Default for ClassifierConfig {
     fn default() -> Self {
         Self {
-            tiers: vec!["heuristics".to_string(), "embeddings".to_string()],
+            tiers: vec!["embeddings".to_string()],
             min_confidence: 0.75,
         }
     }
@@ -339,6 +341,7 @@ mod tests {
             !cfg.classifier.tiers.iter().any(|t| t == "llm"),
             "default tiers must not include llm"
         );
+        assert_eq!(cfg.classifier.tiers, ["embeddings"]);
         assert!(
             !cfg.inference
                 .backends

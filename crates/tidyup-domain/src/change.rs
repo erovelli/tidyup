@@ -79,8 +79,8 @@ impl ChangeStatus {
 ///
 /// Bundle membership: when `bundle_id` is `Some`, this proposal moves a single member of a
 /// `BundleProposal` and is never approved, applied, or rolled back independently of its bundle.
-/// Members always have `change_type == ChangeType::Move` — bundle members never receive rename
-/// suggestions.
+/// Structural bundle members always use `Move`. Semantic-collection members may carry an
+/// evidence-backed `RenameAndMove`, but are still reviewed and applied with their collection.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChangeProposal {
     pub id: Uuid,
@@ -99,7 +99,7 @@ pub struct ChangeProposal {
     #[serde(default)]
     pub bundle_id: Option<Uuid>,
     /// Tier-2 classification sub-score used (with `rename_mismatch_score`) to gate rename
-    /// proposals. `None` when classification wasn't run (e.g. bundle members, heuristic-only).
+    /// proposals. `None` when classification wasn't run (for example, opaque bundle members).
     #[serde(default)]
     pub classification_confidence: Option<f32>,
     /// `1.0 - cosine(embed(filename_as_text), content_embedding)`. Drives rename proposals

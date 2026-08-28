@@ -143,6 +143,7 @@ fn config_subcommand_prints_parsed_defaults() {
     let out = Command::new(bin())
         .args(["config"])
         .env("TIDYUP_DATA_DIR", data.path())
+        .env("TIDYUP_CONFIG_PATH", data.path().join("config.toml"))
         .output()
         .expect("binary runs");
     assert!(out.status.success());

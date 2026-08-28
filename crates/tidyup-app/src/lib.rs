@@ -41,8 +41,8 @@ pub use scan::{ScanReport, ScanService};
 ///   activated (`text_present`): [`ServiceContext::text`] is `Some` only when
 ///   the three-gate model passed (cargo feature + config bool + per-invocation
 ///   flag), so this ties Tier 3 to activation while keeping it off by default.
-/// - The scoring thresholds (`heuristic_threshold`, `embedding_threshold`,
-///   `ambiguity_gap`), weights, and calibration keep their pipeline-tuned
+/// - The semantic scoring thresholds (`embedding_threshold`, `ambiguity_gap`),
+///   weights, and calibration keep their pipeline-tuned
 ///   domain defaults — the app-config `[classifier]` section's `min_confidence`
 ///   drives the `--yes` auto-approve threshold at the CLI, not these.
 #[must_use]
