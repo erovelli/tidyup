@@ -18,6 +18,9 @@
 //! any extractor implementations and must register their own.
 
 pub mod mime;
+
+#[cfg(all(target_os = "macos", feature = "image"))]
+mod macos_ocr;
 pub mod router;
 
 /// Upper bound on the size of a document handed to an in-memory parser.

@@ -56,19 +56,25 @@ impl ContentExtractor for ImageExtractor {
         let ImageProbe {
             dimensions,
             exif,
+            ocr_text,
             error,
         } = probe;
 
-        let text = if exif.is_empty() {
-            None
-        } else {
-            Some(
+        let mut text_parts = Vec::new();
+        if !exif.is_empty() {
+            text_parts.push(
                 exif.iter()
                     .map(|(k, v)| format!("{k}: {v}"))
                     .collect::<Vec<_>>()
                     .join(", "),
-            )
-        };
+            );
+        }
+        if let Some(ocr) = &ocr_text {
+            if !ocr.is_empty() {
+                text_parts.push(ocr.clone());
+            }
+        }
+        let text = (!text_parts.is_empty()).then(|| text_parts.join("\n"));
 
         let mut exif_obj = serde_json::Map::new();
         for (k, v) in &exif {
@@ -84,6 +90,9 @@ impl ContentExtractor for ImageExtractor {
             },
         );
         metadata.insert("exif".to_string(), serde_json::Value::Object(exif_obj));
+        if let Some(ocr) = ocr_text {
+            metadata.insert("ocr_text".to_string(), serde_json::Value::String(ocr));
+        }
         if let Some(e) = error {
             metadata.insert("error".to_string(), serde_json::Value::String(e));
         }
@@ -99,11 +108,19 @@ impl ContentExtractor for ImageExtractor {
 struct ImageProbe {
     dimensions: Option<(u32, u32)>,
     exif: Vec<(&'static str, String)>,
+    ocr_text: Option<String>,
     error: Option<String>,
 }
 
 fn probe(path: &Path) -> ImageProbe {
     let dimensions = image::image_dimensions(path).ok();
+
+    #[cfg(target_os = "macos")]
+    let ocr_text = crate::macos_ocr::recognize(path)
+        .ok()
+        .filter(|text| !text.is_empty());
+    #[cfg(not(target_os = "macos"))]
+    let ocr_text = None;
 
     let (exif, error) = match extract_exif(path) {
         Ok(tags) => (tags, None),
@@ -113,6 +130,7 @@ fn probe(path: &Path) -> ImageProbe {
     ImageProbe {
         dimensions,
         exif,
+        ocr_text,
         error,
     }
 }

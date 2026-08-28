@@ -55,6 +55,8 @@ pub enum RenameProposal {
 pub enum RenameSource {
     /// Pulled from embedded metadata (ID3, EXIF, PDF title, etc.).
     Metadata,
+    /// Derived from text visibly present in an image via local OCR.
+    Ocr,
     /// Synthesized from YAKE top-k keywords plus optional year prefix.
     Keywords,
 }
@@ -64,6 +66,7 @@ impl RenameSource {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Metadata => "metadata",
+            Self::Ocr => "local OCR",
             Self::Keywords => "keywords",
         }
     }
@@ -101,6 +104,20 @@ pub fn propose_rename(
         }
     }
 
+    if let Some(stem) = metadata
+        .get("ocr_text")
+        .and_then(Value::as_str)
+        .and_then(stem_from_ocr)
+    {
+        if !is_trivial_rename(&stem, original_stem) {
+            let name = finalize(&stem, ext.as_deref());
+            return RenameProposal::Rename {
+                name,
+                source: RenameSource::Ocr,
+            };
+        }
+    }
+
     if let Some(stem) = stem_from_keywords(keywords, year) {
         if !is_trivial_rename(&stem, original_stem) {
             let name = finalize(&stem, ext.as_deref());
@@ -115,7 +132,7 @@ pub fn propose_rename(
 }
 
 // ---------------------------------------------------------------------------
-// Tier 1 — embedded metadata
+// Rename evidence 1 — embedded metadata
 // ---------------------------------------------------------------------------
 
 /// Look up a rename candidate stem in the extractor metadata.
@@ -160,6 +177,48 @@ fn stem_from_metadata(metadata: &Value) -> Option<String> {
     }
 
     None
+}
+
+/// Produce a compact, evidence-backed screenshot label from locally recognised
+/// text. These templates intentionally contain only artifact roles and facts
+/// present in the OCR transcript; the keyword tier remains the fallback for
+/// screenshots outside these common states.
+fn stem_from_ocr(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("leaderboard") && lower.contains("testbench") {
+        return Some("project_homepage".to_string());
+    }
+
+    let score = score_after_label(&lower);
+    if lower.contains("submitted") {
+        return Some(score.map_or_else(
+            || "submission_confirmation".to_string(),
+            |value| format!("submission_confirmation_score_{value}"),
+        ));
+    }
+    if lower.contains("success") && lower.contains("score") {
+        return Some(score.map_or_else(
+            || "testbench_success".to_string(),
+            |value| format!("testbench_success_score_{value}"),
+        ));
+    }
+    None
+}
+
+fn score_after_label(text: &str) -> Option<String> {
+    let start = text.find("score")?.saturating_add("score".len());
+    let tail = text.get(start..)?;
+    let mut digits = String::new();
+    let mut started = false;
+    for ch in tail.chars().take(48) {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+            started = true;
+        } else if started && !matches!(ch, ',' | '_' | ' ') {
+            break;
+        }
+    }
+    (digits.len() >= 2).then_some(digits)
 }
 
 // ---------------------------------------------------------------------------
@@ -386,6 +445,42 @@ mod tests {
             }
             RenameProposal::Keep => panic!("expected rename"),
         }
+    }
+
+    #[test]
+    fn ocr_names_submission_confirmation_from_visible_facts() {
+        let meta = json!({"ocr_text": "Submitted! Score: 32811\nSUCCESS!"});
+        let p = propose_rename(
+            &PathBuf::from("/d/Screenshot 2026-08-25 at 10.10.36 PM.png"),
+            &meta,
+            &[],
+            None,
+        );
+        assert_eq!(
+            p,
+            RenameProposal::Rename {
+                name: "submission_confirmation_score_32811.png".to_string(),
+                source: RenameSource::Ocr,
+            }
+        );
+    }
+
+    #[test]
+    fn ocr_names_project_homepage() {
+        let meta = json!({"ocr_text": "README.MD\nTESTBENCH\nLEADERBOARD"});
+        let p = propose_rename(
+            &PathBuf::from("/d/Screenshot 2026-08-25 at 10.10.58 PM.png"),
+            &meta,
+            &[],
+            None,
+        );
+        assert_eq!(
+            p,
+            RenameProposal::Rename {
+                name: "project_homepage.png".to_string(),
+                source: RenameSource::Ocr,
+            }
+        );
     }
 
     #[test]
