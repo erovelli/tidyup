@@ -153,7 +153,7 @@ pub async fn apply_loose_decisions(
 /// stays pending).
 pub async fn apply_bundles(
     bundles: &[BundleProposal],
-    auto_apply: &[Uuid],
+    approved: &[BundleProposal],
     deps: &ExecutorDeps<'_>,
     dry_run: bool,
 ) -> Result<ApplyReport> {
@@ -161,11 +161,13 @@ pub async fn apply_bundles(
     if bundles.is_empty() {
         return Ok(report);
     }
-    for bundle in bundles {
-        if !auto_apply.contains(&bundle.id) {
+    let approved_by_id: HashMap<Uuid, &BundleProposal> =
+        approved.iter().map(|bundle| (bundle.id, bundle)).collect();
+    for original in bundles {
+        let Some(bundle) = approved_by_id.get(&original.id).copied() else {
             report.bundles_skipped = report.bundles_skipped.saturating_add(1);
             continue;
-        }
+        };
         // Two atomic strategies: directory bundles (code projects, etc.) move by
         // a single root rename; file-set bundles (photo bursts, music albums,
         // document series) are clustered loose siblings with no shared root, so
@@ -653,14 +655,14 @@ pub fn select_auto_applied_bundles(
     bundles: &[BundleProposal],
     auto_approve_all: bool,
     min_confidence: f32,
-) -> Vec<Uuid> {
+) -> Vec<BundleProposal> {
     if !auto_approve_all {
         return Vec::new();
     }
     bundles
         .iter()
         .filter(|b| b.confidence >= min_confidence)
-        .map(|b| b.id)
+        .cloned()
         .collect()
 }
 
@@ -685,7 +687,7 @@ pub async fn select_bundle_decisions(
     auto_approve_all: bool,
     min_confidence: f32,
     review: &dyn ReviewHandler,
-) -> Result<Vec<Uuid>> {
+) -> Result<Vec<BundleProposal>> {
     if bundles.is_empty() {
         return Ok(Vec::new());
     }
@@ -1167,7 +1169,10 @@ mod tests {
 
         assert_eq!(select_auto_applied_bundles(&bundles, false, 0.5).len(), 0);
         let ids = select_auto_applied_bundles(&bundles, true, 0.5);
-        assert_eq!(ids, vec![high.id]);
+        assert_eq!(
+            ids.iter().map(|bundle| bundle.id).collect::<Vec<_>>(),
+            vec![high.id]
+        );
     }
 
     fn sample_bundle(confidence: f32) -> BundleProposal {
@@ -1196,12 +1201,18 @@ mod tests {
         async fn review(&self, _p: Vec<ChangeProposal>) -> CoreResult<Vec<ReviewDecision>> {
             Ok(Vec::new())
         }
-        async fn review_bundles(&self, bundles: Vec<BundleProposal>) -> CoreResult<Vec<Uuid>> {
+        async fn review_bundles(
+            &self,
+            bundles: Vec<BundleProposal>,
+        ) -> CoreResult<Vec<BundleProposal>> {
             self.seen
                 .lock()
                 .unwrap()
                 .extend(bundles.iter().map(|b| b.id));
-            Ok(self.approve.clone())
+            Ok(bundles
+                .into_iter()
+                .filter(|bundle| self.approve.contains(&bundle.id))
+                .collect())
         }
     }
 
@@ -1221,7 +1232,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            ids,
+            ids.iter().map(|bundle| bundle.id).collect::<Vec<_>>(),
             vec![high.id],
             "only the high-confidence bundle clears the threshold"
         );
@@ -1247,7 +1258,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(ids, vec![a.id]);
+        assert_eq!(
+            ids.iter().map(|bundle| bundle.id).collect::<Vec<_>>(),
+            vec![a.id]
+        );
         assert_eq!(
             reviewer.seen.lock().unwrap().len(),
             2,
@@ -1325,9 +1339,14 @@ mod tests {
             progress: &NullProgress,
         };
 
-        let report = apply_bundles(std::slice::from_ref(&bundle), &[bundle.id], &deps, false)
-            .await
-            .unwrap();
+        let report = apply_bundles(
+            std::slice::from_ref(&bundle),
+            std::slice::from_ref(&bundle),
+            &deps,
+            false,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(report.bundles_applied, 1);
         assert!(!src1.exists() && !src2.exists(), "originals must be moved");
@@ -1367,9 +1386,14 @@ mod tests {
             backup_store: &NoopBackup::new(),
             progress: &NullProgress,
         };
-        let report = apply_bundles(std::slice::from_ref(&bundle), &[bundle.id], &deps, false)
-            .await
-            .unwrap();
+        let report = apply_bundles(
+            std::slice::from_ref(&bundle),
+            std::slice::from_ref(&bundle),
+            &deps,
+            false,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(report.bundles_failed, 1);
         // All-or-nothing: neither member moved, no partial state.
@@ -1407,9 +1431,14 @@ mod tests {
             progress: &NullProgress,
         };
 
-        let report = apply_bundles(std::slice::from_ref(&bundle), &[bundle.id], &deps, false)
-            .await
-            .unwrap();
+        let report = apply_bundles(
+            std::slice::from_ref(&bundle),
+            std::slice::from_ref(&bundle),
+            &deps,
+            false,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(report.bundles_failed, 1, "the bundle apply fails");
         assert_eq!(report.bundles_applied, 0);
@@ -1444,9 +1473,14 @@ mod tests {
             backup_store: &NoopBackup::new(),
             progress: &NullProgress,
         };
-        let report = apply_bundles(std::slice::from_ref(&bundle), &[bundle.id], &deps, false)
-            .await
-            .unwrap();
+        let report = apply_bundles(
+            std::slice::from_ref(&bundle),
+            std::slice::from_ref(&bundle),
+            &deps,
+            false,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(report.bundles_failed, 1);
         assert_eq!(report.bundles_applied, 0);
@@ -1479,9 +1513,14 @@ mod tests {
             backup_store: &NoopBackup::new(),
             progress: &NullProgress,
         };
-        let report = apply_bundles(std::slice::from_ref(&bundle), &[bundle.id], &deps, false)
-            .await
-            .unwrap();
+        let report = apply_bundles(
+            std::slice::from_ref(&bundle),
+            std::slice::from_ref(&bundle),
+            &deps,
+            false,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(report.bundles_failed, 1, "changed member fails the bundle");
         assert_eq!(report.bundles_applied, 0);
@@ -1505,9 +1544,14 @@ mod tests {
             backup_store: &NoopBackup::new(),
             progress: &NullProgress,
         };
-        let report = apply_bundles(std::slice::from_ref(&bundle), &[bundle.id], &deps, true)
-            .await
-            .unwrap();
+        let report = apply_bundles(
+            std::slice::from_ref(&bundle),
+            std::slice::from_ref(&bundle),
+            &deps,
+            true,
+        )
+        .await
+        .unwrap();
         assert_eq!(report.bundles_applied, 1);
         assert!(src.exists(), "dry-run must not move the source");
         assert!(!dst.exists(), "dry-run must not create the target");

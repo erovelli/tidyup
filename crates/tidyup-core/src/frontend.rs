@@ -7,7 +7,6 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tidyup_domain::{BundleProposal, ChangeProposal, Phase, ReviewDecision};
-use uuid::Uuid;
 
 use crate::Result;
 
@@ -26,6 +25,14 @@ pub enum Level {
     Info,
     Warn,
     Error,
+}
+
+/// Decisions returned from a single review surface containing both loose
+/// changes and atomic bundles.
+#[derive(Debug, Clone, Default)]
+pub struct ReviewOutcome {
+    pub decisions: Vec<ReviewDecision>,
+    pub approved_bundles: Vec<BundleProposal>,
 }
 
 /// Streaming progress reporter. CLI wraps `indicatif`; UI updates Dioxus signals.
@@ -54,19 +61,32 @@ pub trait ReviewHandler: Send + Sync {
     /// The contract is the same from the service's perspective.
     async fn review(&self, proposals: Vec<ChangeProposal>) -> Result<Vec<ReviewDecision>>;
 
-    /// Present detected bundles for atomic approve/reject and return the ids of
-    /// the bundles the user approved. Bundles are all-or-nothing aggregates:
-    /// there is no per-member decision and no `Override` (members carry their
-    /// own paths and never receive rename proposals), so the decision is binary
-    /// per bundle — hence a plain id list rather than a `ReviewDecision` vec.
+    /// Present detected bundles for atomic approve/reject and return the approved
+    /// bundles. Returning the proposals themselves lets a frontend edit semantic
+    /// collection labels/member filenames while structural bundles remain binary.
     ///
     /// The default implementation approves nothing (every bundle stays pending),
     /// which preserves the pre-bundle-review behaviour for frontends that have
     /// not yet grown an interactive bundle surface. Returning a bundle id that
     /// isn't in `bundles` is harmless — the executor ignores unmatched ids.
-    async fn review_bundles(&self, bundles: Vec<BundleProposal>) -> Result<Vec<Uuid>> {
+    async fn review_bundles(&self, bundles: Vec<BundleProposal>) -> Result<Vec<BundleProposal>> {
         let _ = bundles;
         Ok(Vec::new())
+    }
+
+    /// Present loose proposals and bundles as one complete plan. Frontends that
+    /// do not provide a unified surface retain the established sequential flow.
+    async fn review_all(
+        &self,
+        proposals: Vec<ChangeProposal>,
+        bundles: Vec<BundleProposal>,
+    ) -> Result<ReviewOutcome> {
+        let decisions = self.review(proposals).await?;
+        let approved_bundles = self.review_bundles(bundles).await?;
+        Ok(ReviewOutcome {
+            decisions,
+            approved_bundles,
+        })
     }
 }
 

@@ -87,13 +87,16 @@ impl ReviewHandler for ApproveEverything {
             .map(|p| ReviewDecision::Approve(p.id))
             .collect())
     }
-    async fn review_bundles(&self, bundles: Vec<BundleProposal>) -> CoreResult<Vec<uuid::Uuid>> {
+    async fn review_bundles(
+        &self,
+        bundles: Vec<BundleProposal>,
+    ) -> CoreResult<Vec<BundleProposal>> {
         let ids: Vec<_> = bundles.iter().map(|b| b.id).collect();
         self.bundles_seen
             .lock()
             .unwrap()
             .extend(ids.iter().copied());
-        Ok(ids)
+        Ok(bundles)
     }
 }
 
@@ -758,10 +761,17 @@ async fn file_set_bundle_applies_atomically_and_rollback_restores_it() {
     for n in ["invoice-01.pdf", "invoice-02.pdf", "invoice-03.pdf"] {
         assert!(!src_root.join(n).exists(), "{n} original must be moved");
     }
-    let moved = src_root.join("Documents/Series/invoice/invoice-01.pdf");
+    let applied = store.applied_bundles_for_run(report.run_id).await.unwrap();
+    let moved = applied[0]
+        .members
+        .iter()
+        .find(|member| member.original_path.ends_with("invoice-01.pdf"))
+        .unwrap()
+        .proposed_path
+        .clone();
     assert!(
         moved.exists(),
-        "members land flat under the cluster subfolder"
+        "members land flat under the semantically selected cluster subfolder"
     );
 
     // Atomic restore — every member comes back to its original path.

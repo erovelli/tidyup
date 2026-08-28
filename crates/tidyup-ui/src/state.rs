@@ -29,7 +29,7 @@ use std::sync::Arc;
 use dioxus::prelude::*;
 use dioxus_core::ScopeId;
 use tidyup_app::{MigrationReport, RollbackReport, ScanReport};
-use tidyup_core::frontend::Level;
+use tidyup_core::frontend::{Level, ReviewOutcome};
 use tidyup_domain::{BundleProposal, ChangeProposal, Phase, ReviewDecision, RunRecord};
 use tokio::sync::{oneshot, Mutex};
 use uuid::Uuid;
@@ -84,8 +84,9 @@ pub(crate) struct SignalBundle {
     pub(crate) error: SyncSignal<Option<String>>,
     pub(crate) model_ready: SyncSignal<Option<bool>>,
     /// Per-invocation Tier 3 (LLM fallback) activation — the third privacy gate,
-    /// toggled from Settings. `false` by default; only togglable when the
-    /// `llm-fallback` feature is compiled and `[inference] llm_fallback = true`.
+    /// toggled from Settings or explicitly requested at process launch through
+    /// `TIDYUP_LLM_FALLBACK`. It can become true only when the feature is
+    /// compiled and `[inference] llm_fallback = true`.
     pub(crate) llm_fallback_active: SyncSignal<bool>,
 }
 
@@ -98,7 +99,10 @@ pub(crate) type ReviewSlot = Arc<Mutex<Option<oneshot::Sender<Vec<ReviewDecision
 /// Non-signal state: the pending bundle review's sender, carrying the ids of the
 /// bundles the user approved. Separate from [`ReviewSlot`] because the service
 /// reviews loose proposals and bundles in two distinct `ReviewHandler` calls.
-pub(crate) type BundleReviewSlot = Arc<Mutex<Option<oneshot::Sender<Vec<Uuid>>>>>;
+pub(crate) type BundleReviewSlot = Arc<Mutex<Option<oneshot::Sender<Vec<BundleProposal>>>>>;
+
+/// Sender used by the desktop's unified loose-change + bundle review surface.
+pub(crate) type CombinedReviewSlot = Arc<Mutex<Option<oneshot::Sender<ReviewOutcome>>>>;
 
 /// Top-level shared state provided at the app root and consumed by every page.
 ///
@@ -111,6 +115,7 @@ pub(crate) struct SharedState {
     pub(crate) signals: SignalBundle,
     pub(crate) review_slot: ReviewSlot,
     pub(crate) bundle_review_slot: BundleReviewSlot,
+    pub(crate) combined_review_slot: CombinedReviewSlot,
 }
 
 impl PartialEq for SharedState {
@@ -118,6 +123,7 @@ impl PartialEq for SharedState {
         self.signals == other.signals
             && Arc::ptr_eq(&self.review_slot, &other.review_slot)
             && Arc::ptr_eq(&self.bundle_review_slot, &other.bundle_review_slot)
+            && Arc::ptr_eq(&self.combined_review_slot, &other.combined_review_slot)
     }
 }
 
@@ -135,6 +141,9 @@ impl SharedState {
     /// an App-scope signal from that same task trips dioxus'
     /// `copy_value_hoisted` warning and risks dropped updates.
     pub(crate) fn new_at_root() -> Self {
+        let llm_fallback_active = cfg!(feature = "llm-fallback")
+            && boolish_env("TIDYUP_LLM_FALLBACK")
+            && tidyup_app::config::load().is_ok_and(|cfg| cfg.inference.llm_fallback);
         let signals = SignalBundle {
             phase: Signal::new_maybe_sync_in_scope(None, ScopeId::ROOT),
             progress_current: Signal::new_maybe_sync_in_scope(0_u64, ScopeId::ROOT),
@@ -151,12 +160,25 @@ impl SharedState {
             runs: Signal::new_maybe_sync_in_scope(Vec::new(), ScopeId::ROOT),
             error: Signal::new_maybe_sync_in_scope(None, ScopeId::ROOT),
             model_ready: Signal::new_maybe_sync_in_scope(None, ScopeId::ROOT),
-            llm_fallback_active: Signal::new_maybe_sync_in_scope(false, ScopeId::ROOT),
+            llm_fallback_active: Signal::new_maybe_sync_in_scope(
+                llm_fallback_active,
+                ScopeId::ROOT,
+            ),
         };
         Self {
             signals,
             review_slot: Arc::new(Mutex::new(None)),
             bundle_review_slot: Arc::new(Mutex::new(None)),
+            combined_review_slot: Arc::new(Mutex::new(None)),
         }
     }
+}
+
+fn boolish_env(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }

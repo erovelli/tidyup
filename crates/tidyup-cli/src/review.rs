@@ -26,6 +26,7 @@ use async_trait::async_trait;
 use console::{style, Key, Term};
 use tidyup_core::{frontend::ReviewHandler, Result};
 use tidyup_domain::{BundleProposal, ChangeProposal, ChangeType, ReviewDecision};
+#[cfg(test)]
 use uuid::Uuid;
 
 pub(crate) struct AutoApproveHandler {
@@ -67,7 +68,7 @@ impl ReviewHandler for InteractiveHandler {
             .map_err(|e| anyhow::anyhow!("interactive review task: {e}"))?
     }
 
-    async fn review_bundles(&self, bundles: Vec<BundleProposal>) -> Result<Vec<Uuid>> {
+    async fn review_bundles(&self, bundles: Vec<BundleProposal>) -> Result<Vec<BundleProposal>> {
         if bundles.is_empty() {
             return Ok(Vec::new());
         }
@@ -253,7 +254,7 @@ fn render_proposal(term: &Term, idx: usize, total: usize, p: &ChangeProposal) {
 /// reject (leave it pending). There is no per-member decision and no override —
 /// members carry their own paths and never receive rename proposals. `Enter`
 /// defaults to reject, the safe choice, mirroring the loose-proposal prompt.
-fn prompt_each_bundle(bundles: Vec<BundleProposal>) -> Result<Vec<Uuid>> {
+fn prompt_each_bundle(bundles: Vec<BundleProposal>) -> Result<Vec<BundleProposal>> {
     let term = Term::stdout();
     ensure_interactive_terminal(&term)?;
     let total = bundles.len();
@@ -274,7 +275,7 @@ fn prompt_each_bundle(bundles: Vec<BundleProposal>) -> Result<Vec<Uuid>> {
         }
         // Bundle members never carry renames, so bulk-approve is unconditional.
         if approve_rest {
-            approved.push(b.id);
+            approved.push(b);
             continue;
         }
         render_bundle(&term, i.saturating_add(1), total, &b);
@@ -286,12 +287,12 @@ fn prompt_each_bundle(bundles: Vec<BundleProposal>) -> Result<Vec<Uuid>> {
             };
             match key {
                 Key::Char('a') => {
-                    approved.push(b.id);
+                    approved.push(b.clone());
                     let _ = term.write_line(&style(" → approved").green().to_string());
                     break;
                 }
                 Key::Char('A') => {
-                    approved.push(b.id);
+                    approved.push(b.clone());
                     approve_rest = true;
                     let _ =
                         term.write_line(&style(" → approving all remaining").green().to_string());

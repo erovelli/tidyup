@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tidyup_core::frontend::Level;
-use tidyup_core::{ProgressReporter, Result, ReviewHandler};
+use tidyup_core::{ProgressReporter, Result, ReviewHandler, ReviewOutcome};
 use tidyup_domain::{RunMode, RunRecord, RunState};
 use tidyup_pipeline::migration::{run_migration, MigrationMultimodal};
 use tidyup_pipeline::profiler::{self, MultimodalProfilers};
@@ -171,18 +171,31 @@ impl MigrationService {
                 .record_proposal(proposal, Some(run_id))
                 .await?;
         }
-        for bundle in &outcome.bundles {
-            self.ctx
-                .change_log
-                .record_bundle(bundle, Some(run_id))
-                .await?;
-        }
 
-        let decisions = if outcome.proposals.is_empty() {
-            Vec::new()
+        let review_outcome = if request.auto_approve_bundles {
+            let decisions = if outcome.proposals.is_empty() {
+                Vec::new()
+            } else {
+                review.review(outcome.proposals.clone()).await?
+            };
+            let approved_bundles = select_bundle_decisions(
+                &outcome.bundles,
+                true,
+                request.bundle_min_confidence,
+                review,
+            )
+            .await?;
+            ReviewOutcome {
+                decisions,
+                approved_bundles,
+            }
         } else {
-            review.review(outcome.proposals.clone()).await?
+            review
+                .review_all(outcome.proposals.clone(), outcome.bundles.clone())
+                .await?
         };
+        let decisions = review_outcome.decisions;
+        let approved_bundles = review_outcome.approved_bundles;
         let approved = decisions
             .iter()
             .filter(|d| {
@@ -206,14 +219,7 @@ impl MigrationService {
             apply_loose_decisions(&outcome.proposals, &decisions, &deps, request.dry_run).await?
         };
 
-        let auto_apply_ids = select_bundle_decisions(
-            &outcome.bundles,
-            request.auto_approve_bundles,
-            request.bundle_min_confidence,
-            review,
-        )
-        .await?;
-        if !outcome.bundles.is_empty() && auto_apply_ids.is_empty() {
+        if !outcome.bundles.is_empty() && approved_bundles.is_empty() {
             let held = outcome.bundles.len();
             let detail = if request.auto_approve_bundles {
                 format!(
@@ -227,8 +233,18 @@ impl MigrationService {
                 .message(Level::Info, &format!("{held} bundle(s) held; {detail}"))
                 .await;
         }
+        for original in &outcome.bundles {
+            let reviewed = approved_bundles
+                .iter()
+                .find(|bundle| bundle.id == original.id)
+                .unwrap_or(original);
+            self.ctx
+                .change_log
+                .record_bundle(reviewed, Some(run_id))
+                .await?;
+        }
         let bundle_report =
-            apply_bundles(&outcome.bundles, &auto_apply_ids, &deps, request.dry_run).await?;
+            apply_bundles(&outcome.bundles, &approved_bundles, &deps, request.dry_run).await?;
 
         Ok(MigrationReport {
             proposed: outcome.proposals.len(),
