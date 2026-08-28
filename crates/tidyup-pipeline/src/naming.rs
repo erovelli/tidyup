@@ -257,15 +257,34 @@ fn stem_from_ocr(text: &str) -> Option<String> {
 }
 
 fn score_after_label(text: &str) -> Option<String> {
-    let start = text.find("score")?.saturating_add("score".len());
+    let start = text.match_indices("score").find_map(|(index, label)| {
+        let before = text.get(..index)?.chars().next_back();
+        let after_index = index.saturating_add(label.len());
+        let after = text.get(after_index..)?.chars().next();
+        let bounded_before = before.is_none_or(|ch| !ch.is_ascii_alphanumeric());
+        let bounded_after = after.is_none_or(|ch| !ch.is_ascii_alphanumeric());
+        (bounded_before && bounded_after).then_some(after_index)
+    })?;
     let tail = text.get(start..)?;
     let mut digits = String::new();
     let mut started = false;
-    for ch in tail.chars().take(48) {
+    let mut chars = tail.chars().take(48);
+    while let Some(ch) = chars.next() {
         if ch.is_ascii_digit() {
             digits.push(ch);
             started = true;
-        } else if started && !matches!(ch, ',' | '_' | ' ') {
+        } else if started && ch == ',' {
+            // A comma is numeric punctuation only when followed by an exact
+            // three-digit thousands group. Whitespace and underscores always
+            // terminate the number instead of merging unrelated runs.
+            let mut lookahead = chars.clone();
+            let group: String = lookahead.by_ref().take(3).collect();
+            let group_ends = lookahead.next().is_none_or(|next| !next.is_ascii_digit());
+            if group.len() != 3 || !group.chars().all(|digit| digit.is_ascii_digit()) || !group_ends
+            {
+                break;
+            }
+        } else if started {
             break;
         }
     }
@@ -565,6 +584,26 @@ mod tests {
                 name: "submission_confirmation_score_32811.png".to_string(),
                 source: RenameSource::Ocr,
             }
+        );
+    }
+
+    #[test]
+    fn score_parser_requires_a_label_boundary() {
+        assert_eq!(score_after_label("scoreboard 9999"), None);
+        assert_eq!(score_after_label("high-scorer 9999"), None);
+    }
+
+    #[test]
+    fn score_parser_does_not_merge_separate_digit_runs() {
+        assert_eq!(score_after_label("score 12 34"), Some("12".to_string()));
+        assert_eq!(score_after_label("score 12_34"), Some("12".to_string()));
+    }
+
+    #[test]
+    fn score_parser_accepts_thousands_grouping() {
+        assert_eq!(
+            score_after_label("score: 32,811 points"),
+            Some("32811".to_string())
         );
     }
 

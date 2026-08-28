@@ -179,6 +179,21 @@ async fn cluster_semantic_collections(
 
     let by_entity = semantic_entity_groups(files);
 
+    // OCR-capable extraction is comparatively expensive. Build the generic
+    // screenshot evidence once, before considering any anchored entity group,
+    // so G groups and S screenshots cost S extractions rather than G * S.
+    let mut screenshot_evidence = Vec::new();
+    for path in files.iter().filter(|path| is_generic_screenshot(path)) {
+        let Some(content) = extract(path, extractors).await else {
+            continue;
+        };
+        let Some(text) = content.text else {
+            continue;
+        };
+        screenshot_evidence.push((path.clone(), semantic_tokens(&text)));
+    }
+    screenshot_evidence.sort_by(|(left, _), (right, _)| left.cmp(right));
+
     let mut consumed = HashSet::new();
     let mut bundles = Vec::new();
     for (key, mut members) in by_entity {
@@ -200,24 +215,14 @@ async fn cluster_semantic_collections(
                 }
             }
         }
-        let mut screenshot_candidates: Vec<PathBuf> = files
-            .iter()
-            .filter(|path| !consumed.contains(*path) && is_generic_screenshot(path))
-            .cloned()
-            .collect();
-        screenshot_candidates.sort();
-        for screenshot in screenshot_candidates {
-            let Some(content) = extract(&screenshot, extractors).await else {
+        for (screenshot, tokens) in &screenshot_evidence {
+            if consumed.contains(screenshot) {
                 continue;
-            };
-            let Some(text) = content.text else {
-                continue;
-            };
-            let tokens = semantic_tokens(&text);
-            if token_overlap(&evidence_tokens, &tokens) >= 0.22 {
-                evidence_tokens.extend(tokens);
+            }
+            if token_overlap(&evidence_tokens, tokens) >= 0.22 {
+                evidence_tokens.extend(tokens.iter().cloned());
                 consumed.insert(screenshot.clone());
-                members.push(screenshot);
+                members.push(screenshot.clone());
             }
         }
 
@@ -295,10 +300,17 @@ fn cohesive_model_bundle(dir: &Path, files: &[PathBuf]) -> Option<DetectedBundle
 }
 
 fn semantic_entity_groups(files: &[PathBuf]) -> BTreeMap<String, Vec<PathBuf>> {
+    // Tokenization allocates lowercase strings. Do it once per file rather
+    // than twice for every pair (which became prohibitive for large folders).
+    let tokenized: Vec<Option<Vec<String>>> =
+        files.iter().map(|path| filename_tokens(path)).collect();
     let mut candidates: BTreeMap<String, HashSet<PathBuf>> = BTreeMap::new();
-    for (index, left) in files.iter().enumerate() {
-        for right in files.iter().skip(index.saturating_add(1)) {
-            let Some(key) = shared_entity_key(left, right) else {
+    for (index, (left, left_tokens)) in files.iter().zip(&tokenized).enumerate() {
+        for (right, right_tokens) in files.iter().zip(&tokenized).skip(index.saturating_add(1)) {
+            let (Some(left_tokens), Some(right_tokens)) = (left_tokens, right_tokens) else {
+                continue;
+            };
+            let Some(key) = shared_entity_key(left_tokens, right_tokens) else {
                 continue;
             };
             let members = candidates.entry(key).or_default();
@@ -333,12 +345,10 @@ fn semantic_entity_groups(files: &[PathBuf]) -> BTreeMap<String, Vec<PathBuf>> {
     groups
 }
 
-fn shared_entity_key(left: &Path, right: &Path) -> Option<String> {
-    if is_generic_screenshot(left) || is_generic_screenshot(right) {
+fn shared_entity_key(left_tokens: &[String], right_tokens: &[String]) -> Option<String> {
+    if is_generic_screenshot_tokens(left_tokens) || is_generic_screenshot_tokens(right_tokens) {
         return None;
     }
-    let left_tokens = filename_tokens(left)?;
-    let right_tokens = filename_tokens(right)?;
     let shared = left_tokens
         .iter()
         .zip(right_tokens.iter())
@@ -347,7 +357,16 @@ fn shared_entity_key(left: &Path, right: &Path) -> Option<String> {
     if shared == 0 {
         return None;
     }
-    let key = left_tokens.get(..shared)?.join("_");
+    let shared_tokens = left_tokens.get(..shared)?;
+    // Dates, counters, and timestamps are correlation in naming convention,
+    // not semantic evidence that files belong in one atomic collection.
+    if shared_tokens
+        .iter()
+        .all(|token| token.chars().all(|ch| ch.is_ascii_digit()))
+    {
+        return None;
+    }
+    let key = shared_tokens.join("_");
     let first_token_len = left_tokens.first()?.len();
     // A long unique token or a multi-token prefix is stable across arbitrary
     // project vocabularies without enumerating roles such as "submission".
@@ -365,9 +384,12 @@ fn filename_tokens(path: &Path) -> Option<Vec<String>> {
 }
 
 fn is_generic_screenshot(path: &Path) -> bool {
-    path.file_stem()
-        .and_then(|stem| stem.to_str())
-        .is_some_and(|stem| stem.to_ascii_lowercase().starts_with("screenshot "))
+    filename_tokens(path).is_some_and(|tokens| is_generic_screenshot_tokens(&tokens))
+}
+
+fn is_generic_screenshot_tokens(tokens: &[String]) -> bool {
+    tokens.first().is_some_and(|token| token == "screenshot")
+        || matches!(tokens, [first, second, ..] if first == "screen" && second == "shot")
 }
 
 fn semantic_tokens(text: &str) -> HashSet<String> {
@@ -842,6 +864,42 @@ mod tests {
         assert_eq!(bundles[0].target_subdir.as_deref(), Some("Quasarforge"));
         assert_eq!(bundles[0].members.len(), 2);
         assert_eq!(leftover, vec![p("/desktop/unrelated.data")]);
+    }
+
+    #[tokio::test]
+    async fn generic_screenshot_variants_do_not_form_entity_collections() {
+        for files in [
+            vec![
+                p("/desktop/screenshot_1.png"),
+                p("/desktop/screenshot_2.png"),
+            ],
+            vec![
+                p("/desktop/Screen_Shot_1.png"),
+                p("/desktop/Screen-Shot-2.png"),
+            ],
+        ] {
+            let (bundles, leftover) = cluster_loose(&files, &[], &ClusterConfig::default()).await;
+            assert!(bundles.is_empty());
+            assert_eq!(leftover.len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn numeric_and_date_prefixes_do_not_form_entity_collections() {
+        for files in [
+            vec![
+                p("/desktop/20240101_report.pdf"),
+                p("/desktop/20240101_notes.pdf"),
+            ],
+            vec![
+                p("/desktop/2026-08-25_notes.txt"),
+                p("/desktop/2026-08-25_photo.png"),
+            ],
+        ] {
+            let (bundles, leftover) = cluster_loose(&files, &[], &ClusterConfig::default()).await;
+            assert!(bundles.is_empty());
+            assert_eq!(leftover.len(), 2);
+        }
     }
 
     #[tokio::test]

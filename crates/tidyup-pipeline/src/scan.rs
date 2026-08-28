@@ -12,7 +12,7 @@
 //!    semantic evidence.
 //! 2. **Semantic embeddings**: caller-supplied [`ScanCandidate`]s provide
 //!    pre-computed description embeddings; the pipeline embeds the file
-//!    name, local context, and extracted content as independent evidence and
+//!    name/local context and extracted content as independent evidence and
 //!    picks the highest-cosine candidate. Review is required below the
 //!    `embedding_threshold` (default 0.35) with `ambiguity_gap`.
 //! 3. **LLM fallback** (optional): when a [`TextBackend`] is provided
@@ -338,10 +338,10 @@ async fn classify_file(
         }
     }
 
-    // General semantic fallback. Independent evidence channels prevent a long
-    // document body from drowning out a meaningful filename, while no channel
-    // maps directly to a folder. Missing content simply redistributes weight to
-    // the remaining filename/path/MIME evidence.
+    // General semantic fallback. Independent name and content evidence prevent
+    // a long document body from drowning out a meaningful filename, while no
+    // channel maps directly to a folder. Missing content redistributes its
+    // configured weight to the remaining name/path/MIME evidence.
     let text = extracted
         .as_ref()
         .and_then(|content| content.text.as_deref())
@@ -352,6 +352,7 @@ async fn classify_file(
         effective_mime.as_deref(),
         candidates,
         embeddings,
+        &config.weights,
     )
     .await?;
     if best_idx.is_none() {
@@ -459,6 +460,7 @@ async fn semantic_best_match(
     mime: Option<&str>,
     candidates: &[ScanCandidate],
     embeddings: &dyn EmbeddingBackend,
+    weights: &tidyup_domain::ScoreWeights,
 ) -> Result<(Option<usize>, f32, f32, String)> {
     if candidates.is_empty() {
         return Ok((None, 0.0, 0.0, String::new()));
@@ -472,15 +474,15 @@ async fn semantic_best_match(
         .and_then(Path::file_name)
         .and_then(|name| name.to_str())
         .unwrap_or_default();
-    let name_evidence = normalize_semantic_text(filename);
-    let context_evidence = format!(
-        "parent context {} media type {}",
+    let name_evidence = format!(
+        "{} parent context {} media type {}",
+        normalize_semantic_text(filename),
         normalize_semantic_text(parent),
         mime.unwrap_or("unknown")
     );
-    let mut evidence = vec![(name_evidence, 0.35_f32), (context_evidence, 0.10_f32)];
+    let mut evidence = vec![(name_evidence, weights.name)];
     if !body.trim().is_empty() {
-        evidence.push((body.to_string(), 0.55_f32));
+        evidence.push((body.to_string(), weights.centroid));
     }
     let total_weight: f32 = evidence.iter().map(|(_, weight)| *weight).sum();
     let texts: Vec<&str> = evidence.iter().map(|(text, _)| text.as_str()).collect();

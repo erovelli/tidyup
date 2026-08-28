@@ -64,8 +64,8 @@ impl BundleKind {
         }
     }
 
-    /// Parse the discriminator produced by `as_str`. Payload-carrying variants require explicit
-    /// rehydration by the caller (only the discriminator is on the wire).
+    /// Parse the discriminator produced by `as_str`. Payload-carrying variants use an empty
+    /// payload because only the stable discriminator is on the wire; callers may rehydrate it.
     pub fn parse(s: &str) -> Result<Self, ParseError> {
         match s {
             "GitRepository" => Ok(Self::GitRepository),
@@ -77,9 +77,9 @@ impl BundleKind {
             "JupyterNotebookSet" => Ok(Self::JupyterNotebookSet),
             "PhotoBurst" => Ok(Self::PhotoBurst),
             "MusicAlbum" => Ok(Self::MusicAlbum),
-            "SemanticCollection" => Err(ParseError::UnknownBundleKind(
-                "SemanticCollection requires its persisted label payload".to_string(),
-            )),
+            "SemanticCollection" => Ok(Self::SemanticCollection {
+                label: String::new(),
+            }),
             "Generic" => Ok(Self::Generic),
             other => Err(ParseError::UnknownBundleKind(other.to_string())),
         }
@@ -236,6 +236,9 @@ mod tests {
             BundleKind::JupyterNotebookSet,
             BundleKind::PhotoBurst,
             BundleKind::MusicAlbum,
+            BundleKind::SemanticCollection {
+                label: String::new(),
+            },
             BundleKind::Generic,
         ];
         for k in kinds {
