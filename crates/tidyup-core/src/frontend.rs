@@ -67,8 +67,10 @@ pub trait ReviewHandler: Send + Sync {
     ///
     /// The default implementation approves nothing (every bundle stays pending),
     /// which preserves the pre-bundle-review behaviour for frontends that have
-    /// not yet grown an interactive bundle surface. Returning a bundle id that
-    /// isn't in `bundles` is harmless — the executor ignores unmatched ids.
+    /// not yet grown an interactive bundle surface. The executor reconciles
+    /// every returned aggregate against its original: semantic labels and
+    /// member basenames are editable, while identities, sources, hashes,
+    /// destination parents, and member sets are immutable.
     async fn review_bundles(&self, bundles: Vec<BundleProposal>) -> Result<Vec<BundleProposal>> {
         let _ = bundles;
         Ok(Vec::new())

@@ -111,6 +111,8 @@ The domain models this as a `BundleProposal` aggregate: `{ root, kind, members: 
 
 The SQL schema reflects this: a `bundles` table plus a `bundle_id` foreign key on `change_proposals`. Review, approval, and rollback operate on bundles, not members.
 
+`ReviewHandler::review_bundles` returns proposals rather than ids so a frontend can edit a semantic collection's label and member basenames. That does not transfer authority over the aggregate: immediately before apply, the executor reconciles the returned proposal with the original ids, member set, source paths, hashes, and destination parent. Any divergence is rejected before shelving; allowed edits are copied onto a fresh clone of the original in original member order.
+
 Every scanned file remains visible even when proposal construction fails: clustered members return through the run's `unclassified` bucket. Empty-target migration preserves atomic bundles at the target root with zero confidence rather than dropping them or inventing a kind-based taxonomy.
 
 ## Rename policy

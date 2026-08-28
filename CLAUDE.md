@@ -148,6 +148,8 @@ Files are not always independent. A coding project, photo burst, or music album 
 
 **Bundle review is per-bundle, never per-member.** `ReviewHandler::review_bundles` returns the approved `BundleProposal`s so a frontend can edit a semantic-collection label or member filename without adding a per-member approval path. The default impl approves nothing, so a frontend without a bundle surface holds every bundle. `--yes` skips the handler and applies the raw-cosine confidence threshold only to move-only bundles; collections containing renames remain pending for explicit review.
 
+**The executor owns review-boundary integrity.** Frontend-returned bundles are untrusted. `apply_bundles` reconciles each one against the original by bundle/member id and rejects additions, removals, duplicate ids, changed roots/source paths/content hashes, a changed destination parent, or any member target outside the semantic collection's `target_parent/label/filename` shape. Only a `SemanticCollection` label and member basenames are editable; the executor rebuilds the approved aggregate from original immutable fields before applying it.
+
 **Do not** introduce partial-bundle apply paths or any code that lets some members move while others don't. (File-set bundles necessarily move members one at a time, but the executor reverses every completed move on any failure and rollback restores every member — still strictly all-or-nothing.) This invariant has no exceptions.
 
 ## Rename policy

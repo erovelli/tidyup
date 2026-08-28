@@ -27,7 +27,8 @@ use tidyup_core::frontend::{Level, ProgressItem, ProgressReporter, ReviewHandler
 use tidyup_core::storage::{BackupStore, ChangeLog};
 use tidyup_core::Result;
 use tidyup_domain::{
-    BundleProposal, ChangeProposal, ChangeType, FileId, IndexedFile, Phase, ReviewDecision,
+    BundleKind, BundleProposal, ChangeProposal, ChangeType, FileId, IndexedFile, Phase,
+    ReviewDecision,
 };
 use uuid::Uuid;
 use walkdir::WalkDir;
@@ -174,18 +175,34 @@ pub async fn apply_bundles(
     let approved_by_id: HashMap<Uuid, &BundleProposal> =
         approved.iter().map(|bundle| (bundle.id, bundle)).collect();
     for original in bundles {
-        let Some(bundle) = approved_by_id.get(&original.id).copied() else {
+        let Some(reviewed) = approved_by_id.get(&original.id).copied() else {
             report.bundles_skipped = report.bundles_skipped.saturating_add(1);
             continue;
+        };
+        let bundle = match reconcile_reviewed_bundle(original, reviewed) {
+            Ok(bundle) => bundle,
+            Err(e) => {
+                report.bundles_failed = report.bundles_failed.saturating_add(1);
+                deps.progress
+                    .message(
+                        Level::Warn,
+                        &format!(
+                            "bundle review rejected for {}: {e}",
+                            original.root.display()
+                        ),
+                    )
+                    .await;
+                continue;
+            }
         };
         // Two atomic strategies: directory bundles (code projects, etc.) move by
         // a single root rename; file-set bundles (photo bursts, music albums,
         // document series) are clustered loose siblings with no shared root, so
         // each member moves individually with all-or-nothing rollback.
         let result = if bundle.kind.moves_as_file_set() {
-            apply_file_set_bundle(bundle, deps, dry_run).await
+            apply_file_set_bundle(&bundle, deps, dry_run).await
         } else {
-            apply_bundle_atomic(bundle, deps, dry_run).await
+            apply_bundle_atomic(&bundle, deps, dry_run).await
         };
         match result {
             Ok(()) => report.bundles_applied = report.bundles_applied.saturating_add(1),
@@ -201,6 +218,207 @@ pub async fn apply_bundles(
         }
     }
     Ok(report)
+}
+
+/// Reconcile a frontend-returned bundle with the persisted proposal.
+///
+/// A semantic-collection label and its member basenames are editable. Every
+/// identity, source, hash, score, status, and destination-parent field remains
+/// authoritative from `original`; structural bundles have no editable fields.
+/// The returned aggregate is rebuilt in original member order so a frontend
+/// cannot add, drop, substitute, or reorder execution inputs.
+fn reconcile_reviewed_bundle(
+    original: &BundleProposal,
+    reviewed: &BundleProposal,
+) -> Result<BundleProposal> {
+    validate_immutable_bundle_fields(original, reviewed)?;
+
+    let reviewed_label = match (&original.kind, &reviewed.kind) {
+        (BundleKind::SemanticCollection { .. }, BundleKind::SemanticCollection { label }) => {
+            validate_path_component(label, "collection label")?;
+            Some(label.as_str())
+        }
+        (original_kind, reviewed_kind) if original_kind == reviewed_kind => None,
+        _ => {
+            return Err(anyhow!(
+                "frontend changed immutable bundle kind for {}",
+                original.id
+            ));
+        }
+    };
+
+    if reviewed.members.len() != original.members.len() {
+        return Err(anyhow!(
+            "frontend changed bundle member count for {} (expected {}, received {})",
+            original.id,
+            original.members.len(),
+            reviewed.members.len()
+        ));
+    }
+    let reviewed_by_id: HashMap<Uuid, &ChangeProposal> = reviewed
+        .members
+        .iter()
+        .map(|member| (member.id, member))
+        .collect();
+    if reviewed_by_id.len() != reviewed.members.len() {
+        return Err(anyhow!(
+            "frontend returned duplicate member ids for bundle {}",
+            original.id
+        ));
+    }
+
+    let mut reconciled = original.clone();
+    reconciled.kind = reviewed.kind.clone();
+    let mut members = Vec::with_capacity(original.members.len());
+    for original_member in &original.members {
+        let reviewed_member = reviewed_by_id
+            .get(&original_member.id)
+            .copied()
+            .ok_or_else(|| {
+                anyhow!(
+                    "frontend replaced or removed member {} from bundle {}",
+                    original_member.id,
+                    original.id
+                )
+            })?;
+        members.push(reconcile_reviewed_member(
+            original_member,
+            reviewed_member,
+            original,
+            reviewed_label,
+        )?);
+    }
+    reconciled.members = members;
+    Ok(reconciled)
+}
+
+fn validate_immutable_bundle_fields(
+    original: &BundleProposal,
+    reviewed: &BundleProposal,
+) -> Result<()> {
+    if reviewed.id != original.id
+        || reviewed.root != original.root
+        || reviewed.target_parent != original.target_parent
+        || reviewed.confidence.to_bits() != original.confidence.to_bits()
+        || reviewed.reasoning != original.reasoning
+        || reviewed.status != original.status
+        || reviewed.created_at != original.created_at
+        || reviewed.applied_at != original.applied_at
+    {
+        return Err(anyhow!(
+            "frontend changed immutable bundle fields for {}",
+            original.id
+        ));
+    }
+    Ok(())
+}
+
+fn reconcile_reviewed_member(
+    original_member: &ChangeProposal,
+    reviewed_member: &ChangeProposal,
+    original_bundle: &BundleProposal,
+    reviewed_label: Option<&str>,
+) -> Result<ChangeProposal> {
+    validate_immutable_member_fields(original_member, reviewed_member, original_bundle.id)?;
+    let Some(label) = reviewed_label else {
+        if reviewed_member.change_type != original_member.change_type
+            || reviewed_member.proposed_name != original_member.proposed_name
+            || reviewed_member.proposed_path != original_member.proposed_path
+        {
+            return Err(anyhow!(
+                "frontend edited a structural bundle member in bundle {}",
+                original_bundle.id
+            ));
+        }
+        return Ok(original_member.clone());
+    };
+
+    validate_path_component(&reviewed_member.proposed_name, "member filename")?;
+    let expected_path = original_bundle
+        .target_parent
+        .join(label)
+        .join(&reviewed_member.proposed_name);
+    if !reviewed_member
+        .proposed_path
+        .starts_with(&original_bundle.target_parent)
+    {
+        return Err(anyhow!(
+            "reviewed member target escapes bundle parent: {}",
+            reviewed_member.proposed_path.display()
+        ));
+    }
+    if reviewed_member.proposed_path != expected_path {
+        return Err(anyhow!(
+            "reviewed member target must be collection label plus filename: expected {}, received {}",
+            expected_path.display(),
+            reviewed_member.proposed_path.display()
+        ));
+    }
+    let original_name = original_member
+        .original_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let expected_change = if original_name == reviewed_member.proposed_name {
+        ChangeType::Move
+    } else {
+        ChangeType::RenameAndMove
+    };
+    if reviewed_member.change_type != expected_change {
+        return Err(anyhow!(
+            "reviewed member change type does not match its edited filename"
+        ));
+    }
+
+    let mut member = original_member.clone();
+    member.change_type = expected_change;
+    member
+        .proposed_name
+        .clone_from(&reviewed_member.proposed_name);
+    member
+        .proposed_path
+        .clone_from(&reviewed_member.proposed_path);
+    Ok(member)
+}
+
+fn validate_immutable_member_fields(
+    original: &ChangeProposal,
+    reviewed: &ChangeProposal,
+    bundle_id: Uuid,
+) -> Result<()> {
+    if reviewed.id != original.id
+        || reviewed.file_id != original.file_id
+        || reviewed.original_path != original.original_path
+        || reviewed.confidence.to_bits() != original.confidence.to_bits()
+        || reviewed.reasoning != original.reasoning
+        || reviewed.needs_review != original.needs_review
+        || reviewed.status != original.status
+        || reviewed.created_at != original.created_at
+        || reviewed.applied_at != original.applied_at
+        || reviewed.bundle_id != original.bundle_id
+        || reviewed.classification_confidence.map(f32::to_bits)
+            != original.classification_confidence.map(f32::to_bits)
+        || reviewed.rename_mismatch_score.map(f32::to_bits)
+            != original.rename_mismatch_score.map(f32::to_bits)
+        || reviewed.content_hash != original.content_hash
+    {
+        return Err(anyhow!(
+            "frontend changed immutable fields for member {} in bundle {bundle_id}",
+            original.id
+        ));
+    }
+    Ok(())
+}
+
+fn validate_path_component(value: &str, field: &str) -> Result<()> {
+    let path = Path::new(value);
+    if value.trim().is_empty()
+        || path.file_name().and_then(|name| name.to_str()) != Some(value)
+        || path.components().count() != 1
+    {
+        return Err(anyhow!("{field} must be one non-empty path component"));
+    }
+    Ok(())
 }
 
 async fn apply_single(
@@ -1171,7 +1389,7 @@ mod tests {
         let low = BundleProposal {
             id: Uuid::new_v4(),
             root: PathBuf::from("/a"),
-            kind: tidyup_domain::BundleKind::Generic,
+            kind: BundleKind::Generic,
             target_parent: PathBuf::from("/target"),
             members: vec![],
             confidence: 0.3,
@@ -1218,7 +1436,7 @@ mod tests {
         BundleProposal {
             id: Uuid::new_v4(),
             root: PathBuf::from("/a"),
-            kind: tidyup_domain::BundleKind::Generic,
+            kind: BundleKind::Generic,
             target_parent: PathBuf::from("/target"),
             members: vec![],
             confidence,
@@ -1345,7 +1563,7 @@ mod tests {
     fn file_set_bundle(members: Vec<ChangeProposal>, target_parent: PathBuf) -> BundleProposal {
         BundleProposal::new(
             PathBuf::from("/src/cluster"),
-            tidyup_domain::BundleKind::PhotoBurst,
+            BundleKind::PhotoBurst,
             target_parent,
             members,
             0.9,
@@ -1399,6 +1617,86 @@ mod tests {
         assert!(shelved.contains(&bundle.members[0].id));
         assert!(shelved.contains(&bundle.members[1].id));
         assert!(log.applied_bundles.lock().unwrap().contains(&bundle.id));
+    }
+
+    #[tokio::test]
+    async fn apply_bundles_refuses_frontend_that_drops_a_member() {
+        let dir = TempDir::new().unwrap();
+        let src1 = dir.path().join("a.jpg");
+        let src2 = dir.path().join("b.jpg");
+        std::fs::write(&src1, b"a").unwrap();
+        std::fs::write(&src2, b"b").unwrap();
+        let dst1 = dir.path().join("out/a.jpg");
+        let dst2 = dir.path().join("out/b.jpg");
+        let original = file_set_bundle(
+            vec![
+                sample_proposal(src1.clone(), &dst1),
+                sample_proposal(src2.clone(), &dst2),
+            ],
+            dir.path().join("out"),
+        );
+        let mut reviewed = original.clone();
+        reviewed.members.pop();
+        let shelf = NoopBackup::new();
+        let deps = ExecutorDeps {
+            change_log: &RecordingLog::new(),
+            backup_store: &shelf,
+            progress: &NullProgress,
+        };
+
+        let report = apply_bundles(&[original], &[reviewed], &deps, false)
+            .await
+            .unwrap();
+
+        assert_eq!(report.bundles_failed, 1);
+        assert_eq!(report.bundles_applied, 0);
+        assert!(src1.exists() && src2.exists(), "no member may move");
+        assert!(!dst1.exists() && !dst2.exists());
+        assert!(
+            shelf.shelved.lock().unwrap().is_empty(),
+            "reconciliation must fail before shelving"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_bundles_accepts_semantic_label_and_filename_edits() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("Screenshot.png");
+        std::fs::write(&src, b"screen").unwrap();
+        let target_parent = dir.path().join("out");
+        let original_target = target_parent.join("screenshots/Screenshot.png");
+        let original = BundleProposal::new(
+            dir.path().to_path_buf(),
+            BundleKind::SemanticCollection {
+                label: "screenshots".to_string(),
+            },
+            target_parent.clone(),
+            vec![sample_proposal(src.clone(), &original_target)],
+            0.8,
+            "shared OCR evidence".to_string(),
+        )
+        .unwrap();
+        let mut reviewed = original.clone();
+        reviewed.kind = BundleKind::SemanticCollection {
+            label: "project".to_string(),
+        };
+        reviewed.members[0].change_type = ChangeType::RenameAndMove;
+        reviewed.members[0].proposed_name = "project_homepage.png".to_string();
+        let edited_target = target_parent.join("project/project_homepage.png");
+        reviewed.members[0].proposed_path.clone_from(&edited_target);
+        let deps = ExecutorDeps {
+            change_log: &RecordingLog::new(),
+            backup_store: &NoopBackup::new(),
+            progress: &NullProgress,
+        };
+
+        let report = apply_bundles(&[original], &[reviewed], &deps, false)
+            .await
+            .unwrap();
+
+        assert_eq!(report.bundles_applied, 1);
+        assert!(!src.exists());
+        assert_eq!(std::fs::read(edited_target).unwrap(), b"screen");
     }
 
     #[tokio::test]

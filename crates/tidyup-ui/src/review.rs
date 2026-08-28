@@ -101,9 +101,10 @@ impl ReviewHandler for DioxusReviewHandler {
 
     /// Atomic per-bundle review. Mirrors [`review`](Self::review): stash the
     /// bundles, park a oneshot, flip `review_pending`, and await the user's
-    /// approve/reject decisions. Returns the ids of the approved bundles —
-    /// there is no per-member decision and no override, since bundle members
-    /// carry their own paths and never receive rename proposals.
+    /// approve/reject decisions. Returns the approved bundle proposals so the
+    /// review surface can carry semantic-label and member-filename edits. The
+    /// executor reconciles those edits against the original aggregate before
+    /// any filesystem operation; approval remains one atomic bundle decision.
     ///
     /// The default trait impl approves nothing; implementing it here is what
     /// turns the desktop UI's bundles from "held" into reviewable.
@@ -157,10 +158,6 @@ impl ReviewHandler for DioxusReviewHandler {
                 approved_bundles: Vec::new(),
             });
         }
-        if proposals.is_empty() && bundles.is_empty() {
-            return Ok(ReviewOutcome::default());
-        }
-
         let mut decisions_sig = self.signals.decisions;
         decisions_sig.with_mut(std::collections::HashMap::clear);
         let mut approvals_sig = self.signals.bundle_approvals;
