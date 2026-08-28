@@ -144,9 +144,9 @@ Files are not always independent. A coding project, photo burst, or music album 
 - *Directory bundles* — same-volume: a single `std::fs::rename()` on the bundle root (POSIX `rename(2)` / NTFS `MoveFile`, atomic on one volume, no intermediate state). Cross-volume: copy-verify-delete the whole subtree (verify by content hash), then delete the original; any failure discards staged data, originals untouched.
 - *File-set bundles* — pre-flight (every source present, no target occupied), then shelve + move each member individually, keyed by the member's **own** proposal id. **Any member failure reverses all completed moves** (LIFO), so the cluster relocates whole or not at all. Rollback restores each member from its shelf record by the same id.
 
-**Domain shape.** Bundles are a first-class aggregate: `BundleProposal { root, kind, members: Vec<ChangeProposal>, target_parent, confidence, status }`. Individual member proposals are never approved, applied, or rolled back independently. Member proposals cannot carry rename suggestions. The SQL schema: a `bundles` table plus a `bundle_id` foreign key on `change_proposals`.
+**Domain shape.** Bundles are a first-class aggregate: `BundleProposal { root, kind, members: Vec<ChangeProposal>, target_parent, confidence, status }`. Individual member proposals are never approved, applied, or rolled back independently. Structural bundle members preserve their names; `SemanticCollection` members may carry extractive `RenameAndMove` proposals while remaining atomic. The SQL schema: a `bundles` table plus a `bundle_id` foreign key on `change_proposals`.
 
-**Bundle review is per-bundle, never per-member.** `ReviewHandler::review_bundles` returns the ids of approved *bundles* (not `ReviewDecision`s and no `Override` — members carry their own paths). The default impl approves nothing, so a frontend without a bundle surface holds every bundle. `--yes` skips the handler and applies the confidence threshold directly. Don't add a per-member bundle decision path.
+**Bundle review is per-bundle, never per-member.** `ReviewHandler::review_bundles` returns the approved `BundleProposal`s so a frontend can edit a semantic-collection label or member filename without adding a per-member approval path. The default impl approves nothing, so a frontend without a bundle surface holds every bundle. `--yes` skips the handler and applies the raw-cosine confidence threshold only to move-only bundles; collections containing renames remain pending for explicit review.
 
 **Do not** introduce partial-bundle apply paths or any code that lets some members move while others don't. (File-set bundles necessarily move members one at a time, but the executor reverses every completed move on any failure and rollback restores every member — still strictly all-or-nothing.) This invariant has no exceptions.
 
@@ -159,7 +159,7 @@ Rename proposals require two signals, both above config thresholds:
 
 Both thresholds are user-tunable via `[rename]` config section. Log the sub-scores in the proposal's `reasoning` field for post-hoc calibration.
 
-**Renames never auto-apply.** `--yes` auto-approves moves above a threshold; rename decisions always surface in review explicitly. Bundle members never receive rename proposals.
+**Renames never auto-apply.** `--yes` auto-approves moves above a threshold; rename decisions always surface in review explicitly. This includes semantic collections: if any member carries a rename, the whole collection is held for explicit atomic review.
 
 ## Two operational modes
 

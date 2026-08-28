@@ -107,7 +107,7 @@ Two apply paths:
 1. **Same-volume bundle moves** use a single `std::fs::rename()` on the bundle root. POSIX `rename(2)` on the same filesystem is atomic; NTFS `MoveFile` is atomic. One syscall, no intermediate state.
 2. **Cross-volume bundle moves** use copy-verify-delete: copy the entire subtree directly to the destination, verify by BLAKE3 content hash, then delete the original. Any failure at any step discards the partially-copied data at the destination; the originals remain untouched.
 
-The domain models this as a `BundleProposal` aggregate: `{ root, kind, members: Vec<ChangeProposal>, target_parent, confidence, status }`. Individual member proposals are never approved, applied, or rolled back independently. Member proposals cannot carry rename suggestions — bundle identity depends on internal structure.
+The domain models this as a `BundleProposal` aggregate: `{ root, kind, members: Vec<ChangeProposal>, target_parent, confidence, status }`. Individual member proposals are never approved, applied, or rolled back independently. Structural bundles preserve every member name because their internal paths are load-bearing. A `SemanticCollection` is assembled from formerly loose files and may carry extractive member renames, but the collection still has one all-or-nothing review/apply decision.
 
 The SQL schema reflects this: a `bundles` table plus a `bundle_id` foreign key on `change_proposals`. Review, approval, and rollback operate on bundles, not members.
 
@@ -122,7 +122,7 @@ Both thresholds are config-tunable (`[rename] min_classification_confidence`, `[
 
 **Renames never auto-apply.** `--yes` auto-approves *moves* above a threshold; rename decisions always surface in the review flow explicitly. The risk of silently breaking external references (symlinks, docs pointing at paths, git history) is too high for auto-apply.
 
-**Bundle members never receive rename proposals.** The internal structure of a project is load-bearing; renaming files inside a crate or photo burst breaks meaning.
+**Structural bundle members never receive rename proposals.** The internal structure of a project is load-bearing; renaming files inside a crate breaks meaning. Semantic collections are the narrow exception: formerly loose members may receive extractive renames, are displayed in bundle review, and remain atomic.
 
 ## Storage interchange
 

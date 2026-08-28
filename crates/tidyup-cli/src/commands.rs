@@ -18,8 +18,8 @@ use crate::reporter::CliReporter;
 use crate::review::{AutoApproveHandler, InteractiveHandler};
 use crate::{Cli, Command};
 
-/// Confidence threshold for auto-applying bundles under `--yes`.
-const YES_BUNDLE_MIN_CONFIDENCE: f32 = 0.85;
+/// Confidence threshold for auto-applying move-only bundles under `--yes`.
+const YES_BUNDLE_MIN_CONFIDENCE: f32 = tidyup_app::executor::DEFAULT_BUNDLE_MIN_CONFIDENCE;
 
 /// Interpret an environment variable as a boolean activation gate.
 ///

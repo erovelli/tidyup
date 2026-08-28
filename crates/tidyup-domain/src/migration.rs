@@ -213,10 +213,6 @@ pub struct ScoreBreakdown {
     pub name_similarity: f32,
     /// Similarity to folder content centroid.
     pub centroid_similarity: Option<f32>,
-    /// Metadata compatibility score.
-    pub metadata_score: f32,
-    /// Hierarchical coherence adjustment.
-    pub hierarchy_adjustment: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -253,8 +249,6 @@ pub struct ClassifierConfig {
 pub struct ScoreWeights {
     pub name: f32,
     pub centroid: f32,
-    pub metadata: f32,
-    pub hierarchy: f32,
 }
 
 /// Thresholds gating rename proposals. Both signals must clear their threshold before a
@@ -288,10 +282,10 @@ impl Default for ClassifierConfig {
 impl Default for ScoreWeights {
     fn default() -> Self {
         Self {
-            name: 0.25,
-            centroid: 0.55,
-            metadata: 0.10,
-            hierarchy: 0.10,
+            // Preserve the former 25:55 ratio while normalizing the two live
+            // semantic signals onto the full confidence scale.
+            name: 0.3125,
+            centroid: 0.6875,
         }
     }
 }
@@ -377,7 +371,7 @@ mod tests {
         let config = ClassifierConfig::default();
         assert!((config.embedding_threshold - 0.35).abs() < f32::EPSILON);
         let w = &config.weights;
-        let total = w.name + w.centroid + w.metadata + w.hierarchy;
+        let total = w.name + w.centroid;
         assert!((total - 1.0).abs() < 0.01);
     }
 

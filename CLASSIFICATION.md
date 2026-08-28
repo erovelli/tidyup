@@ -139,12 +139,11 @@ Text extracted via `tidyup-extract` → embedded with `bge-small-en-v1.5` (384-d
 ```
 score(v, folder) = w_cent · cos(v, folder.content_centroid)
                  + w_name · cos(v, folder.name_embedding)
-                 + w_meta · metadata_match(file, folder)
 ```
 
-Default weights (from `ClassifierConfig::ScoreWeights` in `tidyup-domain`): `w_cent = 0.55`, `w_name = 0.25`, `w_meta = 0.10`. Tunable per-config. (`ScoreWeights` also carries a `w_hier = 0.10` weight for a path-hierarchy prior, but that term is **reserved and currently inert** — `hierarchy_adjustment` is fixed at `0.0` pending an implementation — so it contributes nothing today.)
+Default weights (from `ClassifierConfig::ScoreWeights` in `tidyup-domain`): `w_cent = 0.6875`, `w_name = 0.3125`. They preserve the former 55:25 ratio but now sum to `1.0`. The removed metadata and hierarchy fields were permanently zero after generalized semantic routing replaced extension compatibility; deleting those dead terms is a deliberate breaking change to the domain scoring contract and prevents confidence from being capped at `0.80`.
 
-**Centroid-absent fallback.** The profiler populates `content_centroid` from a bounded sample of each folder's documents (see "Migration-mode multimodal centroids" below). A folder with no extractable text documents — an empty/cold target folder, or one holding only images/audio — keeps `content_centroid = None`. When the centroid is missing, the pipeline redistributes `w_cent` onto `w_name` (so the effective `w_name` is `0.80` and the centroid term is `0`), keeping the composite on the same `[0, 1]` scale rather than shrinking it. For a cold target, folder-name embedding similarity is what carries placements until the folder accumulates documents.
+**Centroid-absent fallback.** The profiler populates `content_centroid` from a bounded sample of each folder's documents (see "Migration-mode multimodal centroids" below). A folder with no extractable text documents — an empty/cold target folder, or one holding only images/audio — keeps `content_centroid = None`. When the centroid is missing, the pipeline redistributes `w_cent` onto `w_name` (so the effective `w_name` is `1.0` and the centroid term is `0`), keeping the composite on the same `[0, 1]` scale rather than shrinking it. For a cold target, folder-name embedding similarity is what carries placements until the folder accumulates documents.
 
 Decision per file:
 
@@ -235,7 +234,7 @@ Loose sibling files clustered by content metadata in `pipeline::clustering`. The
 
 HDBSCAN (density-based clustering) is the *planned* embedding-verification step — a textbook non-LLM AI technique, deterministic under a fixed `min_cluster_size`: clusters too small are rejected, and clusters whose embedding spread exceeds a threshold are rejected as accidental neighbours. **It is not wired yet.** Today all three soft-bundle kinds detect on metadata/filename signals only — `PhotoBurst` by EXIF capture-time window, `MusicAlbum` by shared ID3 `album` tag, `DocumentSeries` by filename family (all in `pipeline::clustering`) — without embedding verification, acceptable for the common cases. The SigLIP/CLAP encoders the image/audio embedding path needs have since landed (Phase 7), so the remaining work is the verification pass itself, not the encoders.
 
-Once a bundle is identified, its subtree is **opaque** to per-file classification, and the bundle is *placed* as a unit rather than scored per file. Scan mode routes it to a default taxonomy folder chosen by `BundleKind` at a fixed 0.90 confidence; migration mode places it by embedding the bundle-kind label plus the bundle's leaf directory name against the target folders' `name_embedding`s (also fixed 0.90), falling back to the kind default when the profile cache is empty. The result is a `BundleProposal` (not a per-file `ClassificationResult`); there is no pooled embedding of member contents. Bundle members never receive rename proposals (per the rename policy in `CLAUDE.md`).
+Directory bundles remain **opaque** to per-file classification and route from aggregate semantic evidence (kind, root label, and a bounded sample of member names). Their confidence is the raw cosine against taxonomy candidates in scan mode or target-folder name embeddings in migration mode. Semantic collections classify their loose members and report the weaker of collection-routing cosine and mean member confidence. `--yes` uses `0.50` on this raw-cosine scale, but only for move-only bundles; a semantic collection containing any rename is always held for explicit review.
 
 ## Rename strategy: extractive cascade
 
@@ -245,7 +244,7 @@ Rename proposals come from an extractive cascade. Each step is strictly higher-s
 2. **Keyword-template fill.** Extract top-k keyphrases from content — n-grams up to 3 words (inlined YAKE — see below). The target folder's siblings are analysed for a naming pattern via regex inference. Top keyphrases fill the `<topic>` slot, flattened into a word-deduplicated stem (`"tax return"` + `"tax form"` → `tax_return_form`); dates come from EXIF or file mtime.
 3. **No signal → no rename.** Keep the filename; just move.
 
-The rename policy (`CLAUDE.md`) says renames never auto-apply, bundle members never rename, and two signals — classification confidence and filename-content mismatch — must clear configured thresholds. This cascade is **structurally incapable of fabricating a rename without extractive evidence**.
+The rename policy (`CLAUDE.md`) says renames never auto-apply and two signals — classification confidence and filename-content mismatch — must clear configured thresholds. Structural bundle members never rename; formerly loose members in a semantic collection may carry extractive renames, but the whole collection must then be reviewed explicitly. This cascade is **structurally incapable of fabricating a rename without extractive evidence**.
 
 Filename-content mismatch: `1.0 - cos(embed(filename_as_text), content_embedding)`. `taxes_2023.pdf` with tax-return content scores low (name matches content); `DSC_0481.jpg` of a wedding scores high.
 

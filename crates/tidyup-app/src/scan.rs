@@ -30,6 +30,7 @@ use uuid::Uuid;
 
 use crate::executor::{
     apply_bundles, apply_loose_decisions, select_bundle_decisions, ApplyReport, ExecutorDeps,
+    DEFAULT_BUNDLE_MIN_CONFIDENCE,
 };
 use crate::ServiceContext;
 
@@ -55,7 +56,7 @@ pub struct ScanRequest {
 }
 
 const fn default_bundle_confidence() -> f32 {
-    0.85
+    DEFAULT_BUNDLE_MIN_CONFIDENCE
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -35,7 +35,7 @@ use crate::reporter::CliReporter;
 use crate::review::AutoApproveHandler;
 
 /// Bundle confidence threshold for the "would organize" tally.
-const WATCH_BUNDLE_MIN_CONFIDENCE: f32 = 0.85;
+const WATCH_BUNDLE_MIN_CONFIDENCE: f32 = tidyup_app::executor::DEFAULT_BUNDLE_MIN_CONFIDENCE;
 
 /// Run the advisory watch loop. Builds the context + scan candidates once,
 /// performs an initial dry-run scan, then re-scans on each debounced batch of

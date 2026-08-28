@@ -26,9 +26,19 @@ use anyhow::{anyhow, Context};
 use tidyup_core::frontend::{Level, ProgressItem, ProgressReporter, ReviewHandler};
 use tidyup_core::storage::{BackupStore, ChangeLog};
 use tidyup_core::Result;
-use tidyup_domain::{BundleProposal, ChangeProposal, FileId, IndexedFile, Phase, ReviewDecision};
+use tidyup_domain::{
+    BundleProposal, ChangeProposal, ChangeType, FileId, IndexedFile, Phase, ReviewDecision,
+};
 use uuid::Uuid;
 use walkdir::WalkDir;
+
+/// Minimum raw semantic cosine for non-interactive bundle approval.
+///
+/// Structural bundles use their aggregate semantic routing cosine. Semantic
+/// collections use the weaker of aggregate routing and mean member confidence.
+/// `0.50` remains above the pipeline's `0.35` review boundary while matching
+/// the raw-cosine scale produced for short bundle descriptions.
+pub const DEFAULT_BUNDLE_MIN_CONFIDENCE: f32 = 0.50;
 
 /// Summary of what the executor did during an apply pass.
 #[derive(Debug, Clone, Copy, Default)]
@@ -649,7 +659,8 @@ fn indexed_stub(source: &Path, file_id: Option<FileId>) -> anyhow::Result<Indexe
 ///
 /// Bundles are atomic aggregates, so the decision is binary per bundle — there
 /// is no per-member selection and no `Override` (members carry their own paths
-/// and never receive rename proposals).
+/// and are never selected independently). Bundles containing member renames
+/// require interactive review and are excluded from this path.
 #[must_use]
 pub fn select_auto_applied_bundles(
     bundles: &[BundleProposal],
@@ -661,7 +672,15 @@ pub fn select_auto_applied_bundles(
     }
     bundles
         .iter()
-        .filter(|b| b.confidence >= min_confidence)
+        .filter(|b| {
+            b.confidence >= min_confidence
+                && !b.members.iter().any(|member| {
+                    matches!(
+                        member.change_type,
+                        ChangeType::Rename | ChangeType::RenameAndMove
+                    )
+                })
+        })
         .cloned()
         .collect()
 }
@@ -677,8 +696,9 @@ pub fn select_auto_applied_bundles(
 ///   (UI today, test stubs) approves nothing, so every bundle stays pending —
 ///   exactly the pre-bundle-review behaviour.
 ///
-/// Returns the ids the user (or threshold) approved. Renames are never involved:
-/// bundle members move as-is, so there is nothing to surface for rename review.
+/// Returns the proposals the user (or threshold) approved. The threshold path
+/// applies move-only bundles; any bundle containing a rename remains pending
+/// until a frontend reviews it explicitly.
 ///
 /// # Errors
 /// Propagates errors from the review handler.
@@ -707,7 +727,7 @@ mod tests {
     use tempfile::TempDir;
     use tidyup_core::frontend::Level;
     use tidyup_core::Result as CoreResult;
-    use tidyup_domain::{ChangeStatus, ChangeType};
+    use tidyup_domain::ChangeStatus;
 
     #[test]
     fn copy_verify_delete_relocates_file_and_removes_original() {
@@ -1160,19 +1180,38 @@ mod tests {
             created_at: chrono::Utc::now(),
             applied_at: None,
         };
-        let high = BundleProposal {
-            confidence: 0.9,
+        let typical_raw_cosine = BundleProposal {
+            confidence: 0.55,
             id: Uuid::new_v4(),
             ..low.clone()
         };
-        let bundles = vec![low, high.clone()];
+        let bundles = vec![low, typical_raw_cosine.clone()];
 
-        assert_eq!(select_auto_applied_bundles(&bundles, false, 0.5).len(), 0);
-        let ids = select_auto_applied_bundles(&bundles, true, 0.5);
+        assert_eq!(
+            select_auto_applied_bundles(&bundles, false, DEFAULT_BUNDLE_MIN_CONFIDENCE).len(),
+            0
+        );
+        let ids = select_auto_applied_bundles(&bundles, true, DEFAULT_BUNDLE_MIN_CONFIDENCE);
         assert_eq!(
             ids.iter().map(|bundle| bundle.id).collect::<Vec<_>>(),
-            vec![high.id]
+            vec![typical_raw_cosine.id],
+            "a typical semantic bundle cosine must clear the auto-approve threshold",
         );
+    }
+
+    #[test]
+    fn select_auto_applied_bundles_holds_member_renames() {
+        let mut renamed = sample_bundle(0.95);
+        let mut member = sample_proposal(
+            PathBuf::from("/a/screenshot.png"),
+            Path::new("/target/project_homepage.png"),
+        );
+        member.change_type = ChangeType::RenameAndMove;
+        member.proposed_name = "project_homepage.png".to_string();
+        member.bundle_id = Some(renamed.id);
+        renamed.members.push(member);
+
+        assert!(select_auto_applied_bundles(&[renamed], true, 0.50).is_empty());
     }
 
     fn sample_bundle(confidence: f32) -> BundleProposal {

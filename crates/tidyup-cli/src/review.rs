@@ -248,12 +248,13 @@ fn render_proposal(term: &Term, idx: usize, total: usize, p: &ChangeProposal) {
     }
 }
 
-/// Prompt per bundle, returning the ids of the bundles the user approved.
+/// Prompt per bundle, returning the bundles the user approved.
 ///
 /// Bundles are atomic: the only choices are approve (move the whole subtree) or
 /// reject (leave it pending). There is no per-member decision and no override —
-/// members carry their own paths and never receive rename proposals. `Enter`
-/// defaults to reject, the safe choice, mirroring the loose-proposal prompt.
+/// members carry their own paths. Semantic collections may include member
+/// renames, which are displayed and always require explicit per-bundle review.
+/// `Enter` defaults to reject, the safe choice, mirroring the loose-proposal prompt.
 fn prompt_each_bundle(bundles: Vec<BundleProposal>) -> Result<Vec<BundleProposal>> {
     let term = Term::stdout();
     ensure_interactive_terminal(&term)?;
@@ -273,8 +274,9 @@ fn prompt_each_bundle(bundles: Vec<BundleProposal>) -> Result<Vec<BundleProposal
         if reject_rest {
             continue;
         }
-        // Bundle members never carry renames, so bulk-approve is unconditional.
-        if approve_rest {
+        // Bulk-approve covers move-only bundles. A semantic collection with a
+        // member rename still surfaces for an explicit keystroke.
+        if approve_rest && !bundle_has_renames(&b) {
             approved.push(b);
             continue;
         }
@@ -294,8 +296,11 @@ fn prompt_each_bundle(bundles: Vec<BundleProposal>) -> Result<Vec<BundleProposal
                 Key::Char('A') => {
                     approved.push(b.clone());
                     approve_rest = true;
-                    let _ =
-                        term.write_line(&style(" → approving all remaining").green().to_string());
+                    let _ = term.write_line(
+                        &style(" → approving all remaining move-only bundles")
+                            .green()
+                            .to_string(),
+                    );
                     break;
                 }
                 Key::Char('r' | 'R') => {
@@ -349,7 +354,32 @@ fn render_bundle(term: &Term, idx: usize, total: usize, b: &BundleProposal) {
     let _ = term.write_line(&style(header).bold().to_string());
     let _ = term.write_line(&format!("  root: {}", b.root.display()));
     let _ = term.write_line(&format!("  to:   {}/", b.target_parent.display()));
+    for member in &b.members {
+        if matches!(
+            member.change_type,
+            ChangeType::Rename | ChangeType::RenameAndMove
+        ) {
+            let original = member
+                .original_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            let _ = term.write_line(&format!(
+                "  rename: {original} -> {}",
+                style(&member.proposed_name).italic()
+            ));
+        }
+    }
     let _ = term.write_line(&format!("  why:  {}", b.reasoning));
+}
+
+fn bundle_has_renames(bundle: &BundleProposal) -> bool {
+    bundle.members.iter().any(|member| {
+        matches!(
+            member.change_type,
+            ChangeType::Rename | ChangeType::RenameAndMove
+        )
+    })
 }
 
 #[cfg(test)]

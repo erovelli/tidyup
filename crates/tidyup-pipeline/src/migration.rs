@@ -4,7 +4,7 @@
 //! Contrast with [`crate::scan`]: scan-mode routes into a fixed taxonomy;
 //! migration-mode routes into whatever structure the user has already built.
 //! Composite semantic scoring combines similarity to each folder's
-//! `name_embedding` and `content_centroid` plus a hierarchy adjustment. File
+//! `name_embedding` and `content_centroid`. File
 //! type may select a compatible inference backend, but never a destination.
 //!
 //! # Composite score
@@ -406,14 +406,11 @@ async fn classify_file(
         )
     } else {
         format!(
-            "tier2 composite: top={chosen_score:.3} gap={chosen_gap:.3} name={:.3} centroid={} \
-             metadata={:.3} hierarchy={:.3}",
+            "tier2 composite: top={chosen_score:.3} gap={chosen_gap:.3} name={:.3} centroid={}",
             chosen_breakdown.name_similarity,
             chosen_breakdown
                 .centroid_similarity
                 .map_or_else(|| "n/a".to_string(), |v| format!("{v:.3}")),
-            chosen_breakdown.metadata_score,
-            chosen_breakdown.hierarchy_adjustment,
         )
     };
 
@@ -616,8 +613,6 @@ fn rank_centroids(
             score_breakdown: ScoreBreakdown {
                 name_similarity: 0.0,
                 centroid_similarity: Some(*s),
-                metadata_score: 0.0,
-                hierarchy_adjustment: 0.0,
             },
         })
         .collect();
@@ -712,8 +707,6 @@ fn score_profile(
     ScoreBreakdown {
         name_similarity,
         centroid_similarity,
-        metadata_score: 0.0,
-        hierarchy_adjustment: 0.0,
     }
 }
 
@@ -725,9 +718,7 @@ fn composite(b: &ScoreBreakdown, w: &ScoreWeights) -> f32 {
     let (name_w, centroid_term) = b
         .centroid_similarity
         .map_or((w.name + w.centroid, 0.0), |c| (w.name, w.centroid * c));
-    let metadata_term = w.metadata.mul_add(b.metadata_score, centroid_term);
-    let hierarchy_term = w.hierarchy.mul_add(b.hierarchy_adjustment, metadata_term);
-    name_w.mul_add(b.name_similarity, hierarchy_term)
+    name_w.mul_add(b.name_similarity, centroid_term)
 }
 
 struct GatedRename {
@@ -1603,20 +1594,32 @@ mod tests {
         let with_centroid = ScoreBreakdown {
             name_similarity: 0.5,
             centroid_similarity: Some(0.5),
-            metadata_score: 0.0,
-            hierarchy_adjustment: 0.0,
         };
         let without_centroid = ScoreBreakdown {
             name_similarity: 0.5,
             centroid_similarity: None,
-            metadata_score: 0.0,
-            hierarchy_adjustment: 0.0,
         };
         let a = composite(&with_centroid, &w);
         let b = composite(&without_centroid, &w);
-        // With centroid: 0.25*0.5 + 0.55*0.5 = 0.4
-        // Without centroid: (0.25+0.55)*0.5 = 0.4
+        // Both live weights sum to one, and the absent centroid weight moves
+        // onto the name signal.
         assert!((a - b).abs() < 1e-6, "{a} vs {b}");
+    }
+
+    #[test]
+    fn composite_ceiling_can_clear_default_rename_gate() {
+        let ceiling = composite(
+            &ScoreBreakdown {
+                name_similarity: 1.0,
+                centroid_similarity: Some(1.0),
+            },
+            &ScoreWeights::default(),
+        );
+        assert!(
+            ceiling >= tidyup_domain::RenameConfig::default().min_classification_confidence,
+            "composite ceiling {ceiling} must reach the rename confidence gate",
+        );
+        assert!((ceiling - 1.0).abs() < f32::EPSILON);
     }
 
     // -----------------------------------------------------------------------
