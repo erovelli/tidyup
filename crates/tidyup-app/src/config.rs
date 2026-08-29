@@ -26,6 +26,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
+const DEFAULT_MAX_OCR_BYTES: u64 = 20 * 1024 * 1024;
+
 /// Top-level config. Every sub-section has `Default`, and `#[serde(default)]` lets
 /// partial TOML files merge without erroring on missing sections.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -34,8 +36,29 @@ pub struct TidyupConfig {
     pub storage: StorageConfig,
     pub classifier: ClassifierConfig,
     pub inference: InferenceConfig,
+    pub extraction: ExtractionConfig,
     pub rename: RenameConfig,
     pub bundle_detection: BundleDetectionConfig,
+}
+
+/// Resource bounds for local content extraction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExtractionConfig {
+    /// Run Apple's local Vision OCR for plausible screenshot files on supported
+    /// macOS builds. Dimensions and EXIF extraction are unaffected.
+    pub ocr_enabled: bool,
+    /// Maximum screenshot size handed whole to the OCR helper.
+    pub ocr_max_bytes: u64,
+}
+
+impl Default for ExtractionConfig {
+    fn default() -> Self {
+        Self {
+            ocr_enabled: true,
+            ocr_max_bytes: DEFAULT_MAX_OCR_BYTES,
+        }
+    }
 }
 
 /// Where we keep the sqlite DB + shelved backups + downloaded models.
@@ -144,8 +167,8 @@ impl Default for EmbeddingConfig {
 /// Thresholds gating rename proposals.
 ///
 /// Both signals must clear their threshold before a rename is surfaced to review.
-/// Renames never auto-apply, even under `--yes`. Bundle members never receive
-/// rename proposals.
+/// Renames never auto-apply, even under `--yes`. Semantic-collection members
+/// may receive rename proposals, but the entire bundle then requires review.
 ///
 /// Mirrors [`tidyup_domain::migration::RenameConfig`] on the TOML side; the pipeline
 /// materialises the domain type from this when services are wired up.
@@ -382,6 +405,7 @@ backup_retention_days = 90
         assert_eq!(cfg.storage.backup_retention_days, 90);
         // Unspecified sections should match defaults.
         assert_eq!(cfg.classifier, ClassifierConfig::default());
+        assert_eq!(cfg.extraction, ExtractionConfig::default());
         assert_eq!(cfg.rename, RenameConfig::default());
         assert_eq!(cfg.bundle_detection, BundleDetectionConfig::default());
         assert!((cfg.rename.min_classification_confidence - 0.85).abs() < f32::EPSILON);
@@ -395,6 +419,17 @@ backup_retention_days = 90
         assert!(s.contains("[rename]"));
         assert!(s.contains("min_classification_confidence = 0.85"));
         assert!(s.contains("min_mismatch_score = 0.6"));
+    }
+
+    #[test]
+    fn extraction_section_round_trips_at_bounded_defaults() {
+        let cfg = TidyupConfig::default();
+        let serialised = toml::to_string_pretty(&cfg).unwrap();
+        assert!(serialised.contains("[extraction]"));
+        assert!(serialised.contains("ocr_enabled = true"));
+        assert!(serialised.contains("ocr_max_bytes = 20971520"));
+        let back: TidyupConfig = toml::from_str(&serialised).unwrap();
+        assert_eq!(back.extraction, ExtractionConfig::default());
     }
 
     #[test]

@@ -6,11 +6,11 @@ Guidance for Claude Code (claude.ai/code) when working in this repository.
 
 `tidyup` is a CLI-first, open-source Rust tool that auto-sorts a source directory recursively into a preexisting target hierarchy. It classifies files by their **contents** (not just filename/extension) using deterministic embedding similarity running entirely on-device, preserves logical file groupings (coding projects, photo bursts, music albums) as atomic bundles, and proposes rename-and-move operations for review. **Nothing moves without explicit approval.**
 
-The workspace is past its scaffolding stage: every crate (`domain` through `cli`/`ui`) is substantively implemented and the default CLI runs end-to-end (`migrate`/`scan`/`watch`/`rollback`/`prune`/`status`). Remaining work is post-Phase-7 — video Tier 2, calibrated-confidence-by-default, embedding-verified soft bundles, and packaging; see the roadmap in `README.md`. Status is still **pre-alpha**: confidence thresholds are not calibrated against a real corpus by default.
+The workspace is past its scaffolding stage: every crate (`domain` through `cli`/`ui`) is substantively implemented and the default CLI runs end-to-end (`migrate`/`scan`/`watch`/`rollback`/`prune`/`status`). Remaining work includes video content embeddings, calibrated-confidence-by-default, embedding-verified soft bundles, and packaging; see the roadmap in `README.md`. Status is still **pre-alpha**: confidence thresholds are not calibrated against a real corpus by default.
 
 **Core product promises** (design constraints — never violate):
 
-1. **Local-first, LLM-optional classification.** The default binary has no network code path AND no LLM inference. Both remote backends and LLM fallback are compile-time + runtime opt-ins for power users only. See `CLASSIFICATION.md` for the tier cascade.
+1. **Local-first, LLM-optional classification.** The default binary has no network code path AND no LLM inference. Semantic embeddings are the sole destination-routing spine; both remote backends and LLM fallback are compile-time + runtime opt-ins for power users only. See `CLASSIFICATION.md`.
 2. **Per-bundle atomicity.** Bundles move all-or-nothing. Partial bundle state is never allowed to persist.
 3. **Content-based renames with tuned thresholds.** Rename proposals combine classification confidence and filename-content mismatch; both must clear config thresholds. Never auto-applied. Rename generation is extractive only — no fabrication.
 4. **Every move is reversible.** Originals are shelved, never deleted.
@@ -29,8 +29,8 @@ cargo xtask deny            # requires: cargo install cargo-deny
 cargo xtask feature-matrix  # requires: cargo install cargo-hack
 
 # Classification accuracy over the labeled golden corpus (xtask/corpus/).
-# Model-free Tier-1 always runs; Tier-2 needs the bge-small bundle installed.
-# Calibration tool — NOT part of `ci`, which must stay model-free.
+# Classification entries need the bge-small bundle; without it they defer.
+# The eval/calibration tool is NOT part of `ci`, which stays model-free.
 cargo xtask eval
 cargo xtask eval --json
 cargo xtask eval --calibrate  # fit Platt calibration over the corpus (shipped default stays uncalibrated)
@@ -105,7 +105,7 @@ Two patterns are architectural contracts, not suggestions:
 
 1. **Frontend seam.** `tidyup-app` services take `&dyn ProgressReporter` and `&dyn ReviewHandler`. Never embed a frontend impl in a service. Two live implementations already exercise this seam — `tidyup-cli` (indicatif + interactive prompts) and `tidyup-ui` (Dioxus signal-backed progress + oneshot-channel review). Adding another frontend (web, TUI, MCP) = implementing two traits; it must not require a service-layer refactor. Note that `SyncStorage`-backed signals are the UI-side requirement to satisfy `Send + Sync` on those trait objects.
 
-2. **Inference backend registry.** Backends are *intended* to register by capability at runtime, driven by `InferenceConfig.backends` (ordered list of IDs: `"embeddings-ort"` (default), `"mistralrs"`, `"remote-openai"`, `"remote-anthropic"`, `"remote-ollama"`). **Reserved, not yet wired:** the `backends` list is read by serde for forward-compat but the context builder does not consult it — it selects Tier 3 directly from the `llm_fallback` bool / `[inference.remote]` section (see `ARCHITECTURE.md`). Runtime *selection* is config-driven — not a cargo feature flag. Adding a backend: new `tidyup-inference-*` crate + implement `TextBackend`/`VisionBackend`/`EmbeddingBackend` + register. No pipeline/app changes.
+2. **Inference backend registry.** Backends are *intended* to register by capability at runtime, driven by `InferenceConfig.backends` (ordered list of IDs: `"embeddings-ort"` (default), `"mistralrs"`, `"remote-openai"`, `"remote-anthropic"`, `"remote-ollama"`). **Reserved, not yet wired:** the `backends` list is read by serde for forward-compat but the context builder does not consult it — it selects the optional reranker directly from the `llm_fallback` bool / `[inference.remote]` section (see `ARCHITECTURE.md`). Runtime *selection* is config-driven — not a cargo feature flag. Adding a backend: new `tidyup-inference-*` crate + implement `TextBackend`/`VisionBackend`/`EmbeddingBackend` + register. No pipeline/app changes.
 
 Storage follows the same shape (`FileIndex`/`ChangeLog`/`BackupStore`/`RunLog` are traits, sqlite is the default impl) but we don't expect alternates pre-v0.1.
 
@@ -115,7 +115,7 @@ Storage follows the same shape (`FileIndex`/`ChangeLog`/`BackupStore`/`RunLog` a
 
 Default `cargo build -p tidyup-cli` produces a **network-silent, LLM-silent** binary. No HTTP client (no `reqwest`, `hyper`, `rustls`) AND no LLM inference (no `mistralrs`, `candle`, `hf-hub`, heavy tokenizer tree) — not linked, not present, not reachable.
 
-Verification: `cargo tree -p tidyup-cli -e normal | grep -E 'reqwest|hyper|rustls|mistralrs|candle|hf-hub'` returns empty. This is a CI-checked invariant for the default binary — break it and CI fails. `cargo xtask check-privacy` additionally asserts the default **`tidyup-ui`** graph is LLM-silent (no `mistralrs`/`candle-core`/`hf-hub`); the desktop UI surfaces Tier 3 LLM fallback behind the same triple gate (cargo feature `llm-fallback` → `[inference] llm_fallback = true` → a per-session Settings toggle) but deliberately does **not** wire the `remote` backend, so the default desktop build stays HTTP-client-free. Network-silence is enforced only for the CLI (a webview app is not an airplane-mode promise).
+Verification: `cargo tree -p tidyup-cli -e normal | grep -E 'reqwest|hyper|rustls|mistralrs|candle|hf-hub'` returns empty. This is a CI-checked invariant for the default binary — break it and CI fails. `cargo xtask check-privacy` additionally asserts the default **`tidyup-ui`** graph is LLM-silent; the desktop UI surfaces optional LLM reranking behind the same triple gate (cargo feature → config → session toggle) but deliberately does **not** wire the remote backend. `TIDYUP_LLM_FALLBACK=1` may pre-arm the session toggle only after an asynchronous config load confirms the other gates. Network-silence is enforced only for the CLI (a webview app is not an airplane-mode promise).
 
 **Two symmetric power-user opt-in features**, each gated identically. The shape is the same; the bans are different.
 
@@ -131,7 +131,7 @@ Verification: `cargo tree -p tidyup-cli -e normal | grep -E 'reqwest|hyper|rustl
 
 **Network surface of `--features llm-fallback`**: this feature transitively links `reqwest` through `hf-hub` (mistralrs's mandatory model-download dep). That network surface exists *only to fetch models from Hugging Face* — there is no classifier-time phone-home, no telemetry, no analytics. The default path (neither feature) remains fully network-silent. Treat "llm-fallback implies HTTP for model download" as a documented consequence, not a leak; users who want zero network code should not enable `--features llm-fallback`.
 
-First-run UX, onboarding, and default documentation never recommend either. The tool is designed to be excellent offline with **deterministic embedding classification** — `bge-small-en-v1.5` via ONNX Runtime handles Tier 2 on the default path (see `CLASSIFICATION.md`). LLM-fallback exists for sparse learned hierarchies and pathological extraction failures; a truly empty target has no candidates to rank, so bundles fall back to the target root at zero confidence for explicit review. Remote exists for users with a specific deployment need. Both inference backends are power-user features explicitly opted into at build + config + invocation.
+First-run UX, onboarding, and default documentation never recommend either. The tool is designed to be excellent offline with **deterministic embedding classification** via `bge-small-en-v1.5` and ONNX Runtime. LLM fallback exists for sparse learned hierarchies and pathological extraction failures; a truly empty target has no candidates to rank, so bundles fall back to the target root at zero confidence for explicit review. Remote exists for users with a specific deployment need. Both are power-user features explicitly opted into at build + config + invocation.
 
 ## Bundle detection and atomicity
 
@@ -165,13 +165,15 @@ Rename provenance never bypasses either gate. In particular, `RenameSource::Ocr`
 
 **Renames never auto-apply.** `--yes` auto-approves moves above a threshold; rename decisions always surface in review explicitly. This includes semantic collections: if any member carries a rename, the whole collection is held for explicit atomic review.
 
+**OCR is bounded and optional.** Image extraction must not launch OCR for an entire photo library. On supported macOS builds, Vision OCR is limited to plausible screenshot names, `[extraction] ocr_enabled`, and `ocr_max_bytes` (20 MiB default). A missing/incompatible Swift/Xcode toolchain degrades to a warning and compiles OCR out; it must never make the workspace unbuildable. The embedded helper is materialized as a private, automatically cleaned temporary file rather than written through a predictable path.
+
 ## Two operational modes
 
 Both produce `ChangeProposal`s and `BundleProposal`s that flow through the same review flow. Both run bundle detection first; only loose (non-bundle) files enter per-file classification.
 
-1. **Scan mode** (`tidyup-pipeline::scan`) — classify against a fixed taxonomy with a 3-tier cascade: Tier 1 heuristics (~1ms) → Tier 2 embeddings (~50ms, `bge-small-en-v1.5`) → **optional** Tier 3 LLM fallback (1–10s, only when `--features llm-fallback` is compiled and enabled at runtime). Each tier short-circuits above its confidence threshold. On default builds Tier 3 is absent entirely and low-confidence files surface directly to review.
+1. **Scan mode** (`tidyup-pipeline::scan`) — semantic embeddings rank each loose file against a fixed taxonomy using filename/path/MIME context plus extracted content. There is no extension/keyword destination router. An **optional** LLM fallback (1–10s, only when compiled and triple-gated at runtime) may rerank uncertain embedding results. Default builds exclude it and surface low-confidence files directly to review.
 
-2. **Migration mode** (`tidyup-pipeline::migration`) — classify against an *existing* target hierarchy. Embeddings rank pre-built `FolderProfile`s, with optional Tier 3 LLM fallback under the same feature gate. The profiler builds each folder's text `content_centroid` from its documents; when the SigLIP/CLAP bundles are present it also builds `image_centroid`/`audio_centroid`s, and source files route against the centroid in their own latent space. Review is the primary safety net for low-confidence cases. In a truly empty target, loose files are reported unclassified while atomic bundles are preserved at the target root with zero confidence and mandatory review; no file is silently omitted.
+2. **Migration mode** (`tidyup-pipeline::migration`) — classify against an *existing* target hierarchy. Embeddings rank pre-built `FolderProfile`s, with optional LLM reranking under the same feature gate. The profiler builds each folder's text `content_centroid` from its documents; when the SigLIP/CLAP bundles are present it also builds `image_centroid`/`audio_centroid`s, and source files route against the centroid in their own latent space. Review is the primary safety net for low-confidence cases. In a truly empty target, loose files are reported unclassified while atomic bundles are preserved at the target root with zero confidence and mandatory review; no file is silently omitted.
 
 **Hash-based dedup** is a *planned* pipeline concept, not yet wired. The `files` table stores a BLAKE3 `content_hash` (indexed, non-unique) but is keyed by `path`(unique)/`id`, and `FileIndex` exposes no by-hash lookup. The scan/migration pipelines currently classify each loose file independently and do **not** populate or read `FileIndex` (`index_directory` is exercised only in tests). The per-proposal `ChangeProposal.content_hash` exists solely for the apply-time TOCTOU guard. Real-world dedup on a home directory is 15–30%, so classify-once-per-unique-hash is worth building — but don't claim it works until the pipeline actually groups by hash.
 
@@ -205,10 +207,10 @@ Both produce `ChangeProposal`s and `BundleProposal`s that flow through the same 
 - **Taxonomy embedding cache invalidates by hash of taxonomy text**, not by version number.
 - **`ProfileCache` carries a `target_root` field** but is currently rebuilt in full on every migration run — not persisted to disk, not looked up by root, not incrementally rebuilt. `ScanDiff` / `diff_scans` (comparing BLAKE3 `FolderMetadata.content_hash`, not timestamps) exist and are unit-tested but are not yet called in production. Incremental rebuild is future work — don't claim it's wired.
 
-## Tier 3 LLM fallback
+## Optional LLM fallback
 
 The pipeline accepts `Option<&dyn TextBackend>` and only consults it when
-Tier 2 lands in the review zone (`needs_review = true`) AND
+embedding routing lands in the review zone (`needs_review = true`) AND
 `config.enable_llm_fallback` is true. Three invariants future work must
 preserve:
 
@@ -219,25 +221,25 @@ preserve:
   (`--llm-fallback` / `--remote` or `TIDYUP_LLM_FALLBACK=1` /
   `TIDYUP_REMOTE=1`). The CLI rejects activation without the cargo
   feature; default builds and default invocations stay LLM-silent and
-  network-silent. Don't shortcut the gate — don't auto-enable Tier 3 in
+  network-silent. Don't shortcut the gate — don't auto-enable the fallback in
   default invocations, don't read `[inference] llm_fallback = true` from
   config alone, don't infer activation from environment heuristics.
 - **`ServiceContext.text` is `Option`.** `None` is the privacy-preserving
   default. The pipeline's optional `text_backend` parameter is fed from
   `ctx.text.as_deref()`. A `NullTextBackend` stand-in is deliberately
   not used — absence is the signal, not a no-op trait object.
-- **Tier 3 never produces renames.** The cascade calls
+- **The LLM fallback never produces renames.** The pipeline calls
   `text_backend.classify_text(content, filename)` and re-embeds
   `category + tags + summary` for re-ranking, but the LLM's
   `suggested_name` field is deliberately dropped. The rename gate is
-  driven by Tier 2's confidence, not the post-Tier-3 rerank score, so
-  Tier 3 reroutes never produce renames — by design.
+  driven by the original embedding confidence, not the post-rerank score, so
+  LLM reroutes never produce renames — by design.
 
-## Multimodal Tier 2 (Phase 7)
+## Multimodal embeddings (Phase 7)
 
 Image and audio classification are cross-modal contrastive lookups (SigLIP /
 CLAP) — `tidyup-embeddings-ort::siglip` and `…::clap`. Three invariants
-beyond the text Tier 2 rules:
+beyond the text-embedding rules:
 
 - **Latent-space isolation.** `EmbeddingBackend`, `ImageEmbeddingBackend`,
   and `AudioEmbeddingBackend` produce vectors in disjoint latent spaces.
@@ -255,7 +257,8 @@ beyond the text Tier 2 rules:
   are pure-Rust ONNX with disjoint preprocessing). They are loaded only when
   their bundles exist on disk, via `verify_siglip_model` /
   `verify_clap_model`. Missing bundles are NOT an error — image/audio files
-  fall back to the text Tier 2 path, which falls back to Tier 1. Don't add a
+  fall back to the general text-embedding path; uncertain results remain for
+  review. Don't add a
   `--multimodal` runtime flag; presence of the artifacts is the gate.
 - **Per-modality natural-language taxonomies.** The text taxonomy in
   `default_taxonomy()` is keyword-soup tuned for `bge-small`. The image and
@@ -272,7 +275,7 @@ beyond the text Tier 2 rules:
 - **Don't add generative rename paths.** Rename proposals are extractive only (embedded metadata → keyword-template fill → no-rename). No LLM-fabricated names, even under `--features llm-fallback`.
 - **Don't introduce partial-bundle apply paths.** Bundles are atomic. No code that allows some members to move while others don't.
 - **Don't auto-apply rename proposals.** Even under `--yes`, renames always surface in review.
-- **Don't propose renames for bundle members.** Their internal structure is load-bearing.
+- **Don't propose renames for structural bundle members.** Their internal structure is load-bearing. `SemanticCollection` is the narrow exception for formerly loose files, and remains atomic.
 - **Don't descend into detected bundles for per-file classification.** Bundle subtrees are opaque to the classifier.
 - **Don't claim calibrated confidence by default.** The default `Calibration::Identity` reports raw weighted-cosine. The Platt-scaling mechanism (`tidyup_domain::Calibration`, applied in the scan/migration pipelines) and the fitting tool (`cargo xtask eval --calibrate` over the golden corpus, `tidyup_pipeline::calibration`) now exist — but shipping a *fitted* non-Identity default needs a held-out corpus that doesn't yet exist. Don't change the default or claim calibrated probabilities until it does.
 - **Don't add a `tidyup-config` crate** (folded into `app` deliberately).
@@ -291,7 +294,7 @@ Treat docs as part of the change. When a code change lands, update the affected 
 
 - **`README.md`** is the roadmap of record and also makes user-facing claims (default behaviour, feature gates, CLI surface, privacy guarantees, supported modalities, install story). When a Phase item ships, tick the checkbox in the roadmap table and update the "What currently works" / "What does not yet work" lists. When a change alters user-facing behaviour, update the relevant section. If the change is purely internal, leave it alone.
 - **`ARCHITECTURE.md`** — update when a crate boundary, seam, port trait, or layering rule changes. Not for implementation-only changes.
-- **`CLASSIFICATION.md`** — update when the tier cascade, default thresholds, rename cascade, or per-modality coverage changes.
+- **`CLASSIFICATION.md`** — update when semantic routing, optional reranking, default thresholds, rename behavior, or per-modality coverage changes.
 - **`DESIGN.md`** — update when UI/UX tokens, surface rules, component specs, or do/don't guidance change. Frontend work (`tidyup-ui` and any future frontend) should conform to it; deviations get reflected here.
 - **`CLAUDE.md`** — update when a change establishes a new invariant or "don't do this" rule future work must obey. It's guidance, not a spec; don't mirror implementation details.
 
@@ -300,7 +303,7 @@ Rule of thumb: if someone reading a doc *today* would be misled by *yesterday's*
 ## Reference docs in repo
 
 - `ARCHITECTURE.md` — layer diagram, seam rationale, crate boundary justifications.
-- `CLASSIFICATION.md` — three-tier cascade, embedding-default rationale, per-modality roadmap, rename extractive cascade.
+- `CLASSIFICATION.md` — semantic embedding routing, optional LLM reranking, per-modality roadmap, and rename policy.
 - `DESIGN.md` — UI/UX design system ("The Verdant Archive"): colors, typography, elevation, component specs, do/don't rules.
 - `README.md` — user-facing overview plus the phase-by-phase roadmap.
 - `CONTRIBUTING.md` — PR checklist, commit style.

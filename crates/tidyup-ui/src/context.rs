@@ -91,7 +91,7 @@ pub(crate) async fn build(
     // `None` unless all three privacy gates align — see `build_text_backend`.
     let text = build_text_backend(config, activation).await?;
 
-    let extractors = default_extractors();
+    let extractors = default_extractors(config);
 
     // Classifier config from the loaded TidyupConfig (rename thresholds +
     // Tier-3 activation tied to text-backend presence).
@@ -198,13 +198,18 @@ pub(crate) async fn verify_and_load_default_embeddings(
     Ok(Arc::new(embeddings))
 }
 
-fn default_extractors() -> Vec<Arc<dyn tidyup_core::extractor::ContentExtractor>> {
+fn default_extractors(
+    config: &TidyupConfig,
+) -> Vec<Arc<dyn tidyup_core::extractor::ContentExtractor>> {
     // Mirrors the CLI: `AudioExtractor` supplies ID3/Vorbis tags so audio files
     // get metadata renames and music-album clustering (the `audio` feature is
     // enabled on the extract dep in Cargo.toml).
     vec![
         Arc::new(tidyup_extract::pdf::PdfExtractor),
-        Arc::new(tidyup_extract::image::ImageExtractor),
+        Arc::new(tidyup_extract::image::ImageExtractor::with_ocr(
+            config.extraction.ocr_enabled,
+            config.extraction.ocr_max_bytes,
+        )),
         Arc::new(tidyup_extract::audio::AudioExtractor),
         Arc::new(tidyup_extract::text::PlainTextExtractor),
     ]

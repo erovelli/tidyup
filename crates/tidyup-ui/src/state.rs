@@ -141,9 +141,6 @@ impl SharedState {
     /// an App-scope signal from that same task trips dioxus'
     /// `copy_value_hoisted` warning and risks dropped updates.
     pub(crate) fn new_at_root() -> Self {
-        let llm_fallback_active = cfg!(feature = "llm-fallback")
-            && boolish_env("TIDYUP_LLM_FALLBACK")
-            && tidyup_app::config::load().is_ok_and(|cfg| cfg.inference.llm_fallback);
         let signals = SignalBundle {
             phase: Signal::new_maybe_sync_in_scope(None, ScopeId::ROOT),
             progress_current: Signal::new_maybe_sync_in_scope(0_u64, ScopeId::ROOT),
@@ -160,10 +157,7 @@ impl SharedState {
             runs: Signal::new_maybe_sync_in_scope(Vec::new(), ScopeId::ROOT),
             error: Signal::new_maybe_sync_in_scope(None, ScopeId::ROOT),
             model_ready: Signal::new_maybe_sync_in_scope(None, ScopeId::ROOT),
-            llm_fallback_active: Signal::new_maybe_sync_in_scope(
-                llm_fallback_active,
-                ScopeId::ROOT,
-            ),
+            llm_fallback_active: Signal::new_maybe_sync_in_scope(false, ScopeId::ROOT),
         };
         Self {
             signals,
@@ -172,6 +166,19 @@ impl SharedState {
             combined_review_slot: Arc::new(Mutex::new(None)),
         }
     }
+}
+
+/// Resolve the desktop UI's optional third LLM gate without blocking Dioxus
+/// root construction on config-file I/O.
+pub(crate) async fn load_llm_fallback_prearm() -> bool {
+    if !cfg!(feature = "llm-fallback") || !boolish_env("TIDYUP_LLM_FALLBACK") {
+        return false;
+    }
+    tokio::task::spawn_blocking(tidyup_app::config::load)
+        .await
+        .ok()
+        .and_then(std::result::Result::ok)
+        .is_some_and(|config| config.inference.llm_fallback)
 }
 
 fn boolish_env(name: &str) -> bool {

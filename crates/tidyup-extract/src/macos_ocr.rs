@@ -5,37 +5,37 @@
 //! directory and invoked only for an image being extracted. No network, cloud
 //! API, or user account is involved.
 
-use std::fs;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::sync::OnceLock;
 
 use anyhow::{anyhow, Context, Result};
 
 const HELPER_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tidyup-ocr"));
-static HELPER_PATH: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+static HELPER_FILE: OnceLock<Result<tempfile::NamedTempFile, String>> = OnceLock::new();
 
 fn helper_path() -> Result<&'static Path> {
-    let resolved = HELPER_PATH.get_or_init(|| {
-        let path = std::env::temp_dir().join(format!(
-            "tidyup-ocr-{}-{}",
-            env!("CARGO_PKG_VERSION"),
-            std::process::id()
-        ));
-        let install = (|| -> Result<PathBuf> {
-            fs::write(&path, HELPER_BYTES)
-                .with_context(|| format!("writing embedded OCR helper to {}", path.display()))?;
-            let mut permissions = fs::metadata(&path)?.permissions();
+    let resolved = HELPER_FILE.get_or_init(|| {
+        let install = (|| -> Result<tempfile::NamedTempFile> {
+            let mut file = tempfile::Builder::new()
+                .prefix("tidyup-ocr-")
+                .tempfile()
+                .context("creating private temporary OCR helper")?;
+            file.write_all(HELPER_BYTES)
+                .context("writing embedded OCR helper")?;
+            file.flush().context("flushing embedded OCR helper")?;
+            let mut permissions = file.as_file().metadata()?.permissions();
             permissions.set_mode(0o700);
-            fs::set_permissions(&path, permissions)?;
-            Ok(path)
+            file.as_file().set_permissions(permissions)?;
+            Ok(file)
         })();
         install.map_err(|error| error.to_string())
     });
 
     match resolved {
-        Ok(path) => Ok(path.as_path()),
+        Ok(file) => Ok(file.path()),
         Err(message) => Err(anyhow!(message.clone())),
     }
 }

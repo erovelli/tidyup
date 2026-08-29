@@ -66,6 +66,10 @@ fn App() -> Element {
     // cached `SharedState` is cloned on every subsequent render. Inner handles
     // (signals, Arc) stay stable.
     let state = use_hook(SharedState::new_at_root);
+    let mut llm_fallback_active = state.signals.llm_fallback_active;
+    use_future(move || async move {
+        llm_fallback_active.set(state::load_llm_fallback_prearm().await);
+    });
     provide_context(state);
 
     rsx! {

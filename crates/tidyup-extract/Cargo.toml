@@ -17,7 +17,7 @@ default = ["text", "pdf", "image"]
 text    = []
 pdf     = ["dep:pdf-extract"]
 excel   = ["dep:calamine"]
-image   = ["dep:image", "dep:kamadak-exif"]
+image   = ["dep:image", "dep:kamadak-exif", "dep:tempfile"]
 audio   = ["dep:lofty"]
 
 [dependencies]
@@ -36,9 +36,9 @@ calamine      = { workspace = true, optional = true }
 image         = { workspace = true, optional = true }
 kamadak-exif  = { workspace = true, optional = true }
 lofty         = { workspace = true, optional = true }
+tempfile      = { workspace = true, optional = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
 tokio    = { workspace = true, features = ["rt-multi-thread", "macros", "fs"] }
 
 [lints]

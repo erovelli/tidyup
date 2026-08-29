@@ -19,7 +19,7 @@
 
 pub mod mime;
 
-#[cfg(all(target_os = "macos", feature = "image"))]
+#[cfg(all(target_os = "macos", feature = "image", macos_vision_ocr))]
 mod macos_ocr;
 pub mod router;
 

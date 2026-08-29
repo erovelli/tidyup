@@ -18,18 +18,18 @@ Your files stay where they belong — with you.
 > embedding model is missing. The `tidyup-desktop` Dioxus UI is wired on top
 > of the same `ServiceContext` — the plug-and-play seam promised by the
 > architecture: CLI and UI differ only in how they report progress and
-> gather review decisions. Phase 7 added optional cross-modal Tier 2 for
+> gather review decisions. Phase 7 added optional cross-modal embeddings for
 > images (SigLIP) and audio (CLAP) in scan mode; both load when their ONNX
-> bundles are present. The Tier 3 LLM fallback is now wired through the
+> bundles are present. The optional LLM fallback is wired through the
 > same pipeline seam — opt in with `--features llm-fallback` (or
 > `--features remote`) plus the matching config + flag activation, and
-> low-confidence Tier 2 verdicts get a second-opinion re-rank. Interactive
+> low-confidence embedding verdicts get a second-opinion re-rank. Interactive
 > bundle review now works in **both the CLI and the desktop UI** — each detected
 > bundle gets an atomic approve/reject instead of silently staying pending.
 > Migration mode now profiles target folders with a text content centroid (from
 > each folder's documents), plus image/audio centroids when the SigLIP/CLAP
 > bundles are installed, so files route on their own contents instead of
-> folder-name text. The desktop UI now has a **Settings → Tier 3 toggle** that
+> folder-name text. The desktop UI has a **Settings → LLM fallback toggle** that
 > surfaces the same three-gate activation as the CLI (build the UI with
 > `--features llm-fallback`, set `[inference] llm_fallback = true`, then flip the
 > per-session switch). That said: confidence thresholds aren't calibrated against
@@ -81,10 +81,7 @@ This is a portfolio project and a personal tool. It is also a statement: useful 
 
 - **Hashes file contents with BLAKE3** and logs every proposal, move, and backup to a local SQLite database, so each run is reviewable and reversible. (Content-addressed dedup — classifying identical contents once no matter how many copies exist — is planned, not yet wired: each loose file is currently classified independently.)
 - **Detects logical groupings first.** Coding projects, photo bursts, music albums, Jupyter notebook sets, document series — tidyup recognizes these as bundles via structural markers (`.git/`, `Cargo.toml`, `package.json`, consistent EXIF timestamps, matching ID3 album tags, etc.) and moves them as atomic units. A coding project is never shredded; either the whole tree relocates or nothing does.
-- **Classifies each loose file by its contents** via a three-tier cascade, cheapest first:
-  1. **Heuristics** (~1ms) — extension, MIME, keyword rules.
-  2. **Embeddings** (~50ms, default) — cosine similarity against learned target-folder profiles via `bge-small-en-v1.5` on ONNX Runtime. Deterministic, auditable, offline.
-  3. **Local LLM fallback** (1–10s, optional) — available only with `--features llm-fallback`, off by default. When Tier 2 lands in the review zone, the LLM classifies the content; its `summary + category + tags` is re-embedded and re-ranked against the same candidate list. The LLM-reranked top is adopted only if it scores higher than Tier 2's. Renames stay extractive — the LLM's `suggested_name` is deliberately ignored. Default builds exclude this tier entirely; low-confidence files surface directly to review.
+- **Classifies each loose file semantically.** The default path embeds filename/context and extracted content with `bge-small-en-v1.5`, then ranks the fixed scan taxonomy or learned migration profiles by cosine similarity. There is no extension/keyword destination router. An optional local LLM fallback (1–10s, `--features llm-fallback`) can rerank uncertain embedding results; its `suggested_name` is ignored. Default builds exclude the LLM entirely and surface low-confidence files for review.
 - **Proposes a destination folder** — with a plain-English reason.
 - **Proposes a rename** when filename and contents disagree — using two tunable signals (classification confidence × filename-content mismatch). Renames never auto-apply: even `--yes` auto-rejects them, so approving a rename requires an interactive review run.
 - **Shows you a diff-style review UI** — approve or reject per file or per bundle.
@@ -156,7 +153,7 @@ cargo build --release -p tidyup-cli --features remote
 
 Rust pinned to 1.95 via `rust-toolchain.toml`. The default-binary embedding model (~35 MB) is fetched out-of-band by `cargo xtask download-models` — the release binary itself has no HTTP client and cannot download anything. Packagers are expected to bundle the model alongside the binary; developers run the xtask once. Model cache: `dirs::cache_dir()/tidyup/models/` (overridable via `TIDYUP_MODEL_CACHE`).
 
-**Multimodal model bundles (optional, Phase 7).** Image and audio Tier 2
+**Multimodal model bundles (optional, Phase 7).** Specialized image and audio
 classification needs the SigLIP and CLAP ONNX bundles — neither ships by
 default because each adds several hundred MB to the on-disk install (SigLIP ~370 MB, CLAP ~600 MB).
 
@@ -170,8 +167,15 @@ cargo xtask download-models --multimodal
 ```
 
 The CLI and UI binaries detect the bundles at startup and enable the
-modality-specific Tier 2 path automatically when present. Absent bundles are
-not an error — image/audio files fall back to Tier 1 heuristics.
+modality-specific embedding path automatically when present. Absent bundles
+are not an error — image/audio files fall back to the general text-embedding
+path using their filename, local path context, and extracted EXIF/ID3 text.
+
+**macOS screenshot OCR.** The default image feature can compile a tiny local
+Apple Vision helper when `xcrun`, Swift 5, and the macOS 14 SDK are available.
+If that toolchain is missing or incompatible, the build emits a warning and
+continues without OCR. At runtime OCR is limited to plausible screenshot names
+under `[extraction] ocr_max_bytes`; ordinary photos never launch the helper.
 
 **Integrity.** `download-models` verifies each file after fetching against the
 same `BundleSpec`/`ArtifactSpec` the binary checks at load time (one source of
@@ -211,7 +215,7 @@ tidyup prune --days 30
 tidyup config
 ```
 
-Flags: `--yes`, `--json`, `--llm-fallback`, and `--remote` are **global** (accepted in any position); `--dry-run` (propose only) is a per-command flag on `scan` and `migrate`. `--yes` auto-approves *moves* above the confidence threshold but never renames — it auto-rejects them, so approving a rename needs an interactive run. `--json` emits machine-readable events for scripting; `--llm-fallback` / `--remote` activate the optional Tier 3 backends (see [Privacy guarantees](#privacy-guarantees)). The loop is always **dry-run → review → apply → reversible**.
+Flags: `--yes`, `--json`, `--llm-fallback`, and `--remote` are **global** (accepted in any position); `--dry-run` (propose only) is a per-command flag on `scan` and `migrate`. `--yes` auto-approves *moves* above the confidence threshold but never renames — it auto-rejects them, so approving a rename needs an interactive run. `--json` emits machine-readable events for scripting; `--llm-fallback` / `--remote` activate optional reranking backends (see [Privacy guarantees](#privacy-guarantees)). The loop is always **dry-run → review → apply → reversible**.
 
 ---
 
@@ -225,13 +229,13 @@ Config is layered: built-in defaults → a TOML file → a few environment overr
 backup_retention_days = 30             # shelved originals older than this are eligible for `prune`
 
 [classifier]
-tiers = ["heuristics", "embeddings"]   # tier cascade order; "llm" is added only under the triple-gated opt-in
+tiers = ["embeddings"]                 # compatibility field; only semantic embeddings are currently used
 min_confidence = 0.75                  # --yes auto-approve threshold for moves; does not change classification/review thresholds
 
 [inference]
 backends = ["embeddings-ort"]          # reserved: parsed for forward-compat but not yet consulted; the
-                                       # context builder selects Tier 3 via llm_fallback / [inference.remote]
-llm_fallback = false                   # gate (b) for Tier 3 LLM fallback; still needs the feature + flag
+                                       # context builder selects a fallback via llm_fallback / [inference.remote]
+llm_fallback = false                   # gate (b) for LLM reranking; still needs the feature + flag
 
 # [inference.remote]                    # only consulted under --features remote + --remote / TIDYUP_REMOTE=1
 # endpoint = "https://api.openai.com/v1"
@@ -240,6 +244,10 @@ llm_fallback = false                   # gate (b) for Tier 3 LLM fallback; still
 
 [inference.embedding]
 model_id = "bge-small-en-v1.5"         # default on-device embedding model
+
+[extraction]
+ocr_enabled = true                     # local Apple Vision OCR for plausible screenshots on supported macOS builds
+ocr_max_bytes = 20971520               # 20 MiB cap for a whole image passed to Vision
 
 [rename]
 min_classification_confidence = 0.85   # both thresholds must clear before a rename is proposed
@@ -251,7 +259,7 @@ extra_markers = []                     # extra directory-bundle marker filenames
 soft_bundle_enabled = true             # metadata clusters: EXIF photo bursts, ID3 albums, filename series
 ```
 
-Two keys worth knowing: **`bundle_detection.extra_markers`** declares additional directory-bundle markers without a rebuild, and **`classifier.tiers`** controls the cascade order.
+`classifier.tiers` is retained so old config files continue to parse; the current classifier always uses semantic embeddings and ignores unknown/removed tier ids. The OCR controls are live in both CLI and desktop service construction. The `[bundle_detection]` fields are parsed but not yet wired into the pipeline.
 
 ---
 
@@ -262,7 +270,7 @@ Two keys worth knowing: **`bundle_detection.extra_markers`** declares additional
 | `TIDYUP_CONFIG_PATH` | Override the config-file location. |
 | `TIDYUP_DATA_DIR` | Override the data root (SQLite DB + backup shelf). |
 | `TIDYUP_MODEL_CACHE` | Override the model-cache directory (ONNX bundles + taxonomy cache). |
-| `TIDYUP_LLM_FALLBACK=1` | Per-invocation activation of Tier 3 LLM fallback (same as `--llm-fallback`). Never persisted. |
+| `TIDYUP_LLM_FALLBACK=1` | Per-invocation activation of optional LLM reranking (same as `--llm-fallback`). In the desktop UI it pre-arms the session toggle only when the cargo feature and config gate also permit it. Never persisted. |
 | `TIDYUP_REMOTE=1` | Per-invocation activation of the remote backend (same as `--remote`). Never persisted. |
 | `RUST_LOG` | Standard `tracing`/`EnvFilter` log verbosity, e.g. `RUST_LOG=tidyup=debug` (defaults to `info`). |
 
@@ -289,7 +297,8 @@ The model cache sits under the OS *cache* dir (`~/.cache/tidyup/models/` on Linu
 - **"Missing embedding model" on first run.** The default binary ships without the model. Fetch it with `cargo xtask download-models` (or place the `bge-small-en-v1.5` files under the model cache), then re-run. The binary has no network path and never downloads anything itself.
 - **Confirm the model is installed.** `tidyup status` reports embedding-model presence (`--json` for scripts).
 - **"platform cache directory unavailable".** Set `TIDYUP_MODEL_CACHE` to an explicit directory.
-- **Image/audio files aren't classified by content.** That needs the optional SigLIP/CLAP bundles — `cargo xtask download-models --multimodal`. Without them, media falls back to Tier 1 heuristics (not an error).
+- **Image/audio files need stronger content classification.** Install the optional SigLIP/CLAP bundles with `cargo xtask download-models --multimodal`. Without them, media uses the general text-embedding path over filenames and extracted metadata; weak results are held for review.
+- **Screenshot OCR is unavailable on macOS.** Install Xcode command-line tools with Swift 5 and the macOS 14 SDK, then rebuild. OCR is optional: a missing/incompatible toolchain produces a build warning, not a failure. It can also be disabled with `[extraction] ocr_enabled = false`.
 
 ---
 
@@ -303,10 +312,10 @@ tidyup is being built in phases. Each phase lands an independently compilable sl
 | 1     | Domain types, SQLite storage, BLAKE3 indexer, layered config, `BundleProposal` aggregate    | [x] Complete   |
 | 2     | Content extractors: router + MIME detection, plain text, PDF, Excel, image, audio           | [x] Complete   |
 | 3     | Inference: `bge-small-en-v1.5` via ONNX Runtime (default); optional LLM + remote backends   | [x] Complete   |
-| 4     | Pipeline: heuristics, bundle detection, scan + migration classifiers, rename cascade        | [x] Complete   |
+| 4     | Pipeline: semantic routing, bundle detection, scan + migration classifiers, rename cascade | [x] Complete   |
 | 5     | CLI wiring, apply + rollback, first-run model check, end-to-end flows                       | [x] Complete   |
 | 6     | Dioxus desktop UI (dashboard, review, runs, settings) on the same service seam              | [x] Complete   |
-| 7     | Multimodal encoders (SigLIP image / CLAP audio Tier 2) wired into scan-mode for both CLI and UI | [x] Complete   |
+| 7     | Multimodal encoders (SigLIP image / CLAP audio) wired into scan and migration | [x] Complete   |
 | 8+    | Video keyframe encoder, code signing, package-manager distribution (Homebrew/winget), UI app bundles | [ ] Backlog    |
 
 **What currently works:**
@@ -318,26 +327,26 @@ tidyup is being built in phases. Each phase lands an independently compilable sl
 - `cargo xtask check-privacy` asserts the default dep graph contains no `reqwest`/`hyper`/`rustls`/`mistralrs`/`candle-core`/`hf-hub`
 - SQLite storage: `FileIndex`, `ChangeLog`, `BackupStore`, `RunLog` with bundle-atomic shelving
 - Layered TOML config with platform-aware paths
-- `tidyup-extract`: MIME detection + router + `PlainTextExtractor` + `PdfExtractor` + `ExcelExtractor` + `ImageExtractor` (dimensions + EXIF) + `AudioExtractor` (ID3/Vorbis tags), each behind its own cargo feature
+- `tidyup-extract`: MIME detection + router + `PlainTextExtractor` + `PdfExtractor` + `ExcelExtractor` + `ImageExtractor` (dimensions, EXIF, and bounded/configurable macOS Vision OCR for plausible screenshots) + `AudioExtractor` (ID3/Vorbis tags), each behind its own cargo feature. Missing Swift/Xcode support degrades to no OCR instead of failing the build.
 - `tidyup-embeddings-ort`: `bge-small-en-v1.5` ONNX classifier, taxonomy cache (BLAKE3-invalidated), custom-taxonomy loader (`scan --taxonomy file.toml`, validated `[[entry]]` tables), model-install verifier
 - `tidyup-inference-mistralrs` (opt-in `--features llm-fallback`): `TextBackend` + lazy `VisionBackend` via `mistralrs`; Metal/CUDA pass-through features
 - `tidyup-inference-remote` (opt-in `--features remote`): `TextBackend` over OpenAI-compatible endpoints. Anthropic and Ollama endpoint variants exist in the crate but are not yet selectable from CLI config — only the OpenAI-compatible path is wired today
 - `tidyup-pipeline`: semantic embedding routing, directory bundle detection (Cargo/npm/pyproject/Gradle/Xcode/.git/Jupyter), and atomic **content-cluster detection** (photo bursts by EXIF time, music albums by ID3 album tag, document series by filename family, and cross-format semantic collections by descriptive entity stem plus optional overlapping screenshot text). Numeric/date-only and generic screenshot prefixes cannot anchor semantic collections; filename tokenization and screenshot extraction are each performed once per clustering pass. The pipeline also provides target-tree name+centroid profiles, inline n-gram YAKE keyphrase extraction (language-aware stopwords: EN/ES/FR/DE), the extractive rename cascade, optional LLM reranking, and scan/migration classifiers.
-- **Tier 3 LLM fallback (optional, off-by-default)**: when Tier 2 lands in the review zone (below threshold or inside the ambiguity gap), an optional `TextBackend` re-classifies the content; the LLM's `summary + category + tags` is re-embedded and re-ranked against the same candidate list. Adopted only if it scores above Tier 2. Triple-gated activation per the privacy model: compile with `--features llm-fallback` (or `--features remote`), set `[inference] llm_fallback = true` (or `[inference.remote]`) in config, and pass `--llm-fallback` (or `--remote`) at invocation. Renames stay extractive — the LLM's `suggested_name` is deliberately ignored
+- **Optional LLM fallback (off-by-default)**: when embedding routing lands in the review zone, a `TextBackend` can re-classify the content; `summary + category + tags` is re-embedded and re-ranked against the same candidates, and adopted only if its score improves. Activation is triple-gated by cargo feature, config, and invocation flag. The LLM's `suggested_name` is ignored.
 - `tidyup-app`: `ScanService`, `MigrationService`, and `RollbackService` driving the pipeline end-to-end — shelve → move → mark applied → per-run rollback via the `RunLog`. Bundles are decided through the `ReviewHandler::review_bundles` seam — `--yes` auto-applies move-only bundles at or above `0.50` raw semantic cosine, while bundles containing member renames require explicit review — and move all-or-nothing. Frontend-edited semantic labels/filenames are reconciled against the original immutable member ids, source paths, hashes, and destination parent before any shelf or move operation.
 - First-run model check: scan/migrate surface `cargo xtask download-models` (or a manual placement hint) when the embedding bundle is missing, without linking an HTTP client
 - `tidyup-ui`: Dioxus 0.7 desktop binary (`cargo run -p tidyup-ui --bin tidyup-desktop`) with Dashboard / Review / Runs / Settings pages, signal-backed `ProgressReporter` and oneshot-channel `ReviewHandler`. Same `ServiceContext` construction, extractors, and embedding model as the CLI — the only difference is the frontend port impls. **Bundle review is interactive**: the Review page surfaces each detected bundle for atomic approve/reject through the same `ReviewHandler::review_bundles` seam the CLI uses (a second review pass after loose proposals). Styled per `DESIGN.md` ("The Verdant Archive")
-- **Phase 7 multimodal Tier 2 (optional, off-by-default)**: SigLIP-base for cross-modal image classification and CLAP-htsat-unfused for audio. Both are pure-Rust ONNX (no FFI beyond `ort`/`symphonia`/`image`) and load only when their model bundles exist on disk. Default install ships text-only — image and audio files fall back to Tier 1 heuristics when the multimodal bundles aren't installed. Fetch them with `cargo xtask download-models --multimodal`. Wired identically into both CLI and UI `ServiceContext`. **Both scan and migration use it**: scan ranks against per-modality taxonomies; migration ranks against per-folder centroids the profiler builds from a bounded sample of each target folder — text `content_centroid` always, plus image/audio centroids when those bundles are installed — each in its own latent space, never cross-compared
+- **Phase 7 multimodal embeddings (optional, off-by-default)**: SigLIP-base for cross-modal image classification and CLAP-htsat-unfused for audio. Both load only when their model bundles exist. Without them, image/audio metadata and names use the general text-embedding route and uncertain results are reviewed. Fetch them with `cargo xtask download-models --multimodal`. Scan ranks against per-modality taxonomies; migration ranks against per-folder centroids in isolated latent spaces.
 - **Model-integrity verification**: `cargo xtask download-models` and the runtime loader share one `BundleSpec` source of truth (`tidyup-embeddings-ort::install`); downloads are checksum-verified (pinned BLAKE3 enforced and a corrupt file deleted; unpinned digests reported so they can be pinned), and `cargo xtask verify-models` checks an install against those specs on demand
-- **Classification eval harness** (`cargo xtask eval`): a labeled golden corpus under `xtask/corpus/` plus a metrics runner reporting overall accuracy, per-label precision/recall/F1, tier coverage, Tier-1 regressions, and confusions (`--json` for machine output). Tier-1 heuristics are scored with no model, so the harness is meaningful in CI; Tier-2 embedding scoring runs automatically when the `bge-small-en-v1.5` bundle is installed, otherwise content-dependent entries are reported as deferred. `cargo xtask eval --calibrate` additionally fits a Platt confidence calibrator over the corpus and reports Expected Calibration Error before/after. This is the measurement foundation for confidence calibration — it deliberately stays out of `cargo xtask ci` (which must run model-free)
+- **Classification eval harness** (`cargo xtask eval`): a labeled golden corpus plus accuracy, per-label precision/recall/F1, coverage, and confusions (`--json`). Classification entries require the `bge-small-en-v1.5` bundle; without it they are reported as deferred. `cargo xtask eval --calibrate` fits a Platt calibrator and reports Expected Calibration Error. The harness stays out of model-free `cargo xtask ci`.
 - **Held-out routing eval** (`cargo xtask eval-routing <corpus>`): the *falsifiable* test of the core premise "route by contents, not filename." It treats an already-organized directory as ground truth (folder = label), holds out files, routes them with the real embedding backend (the migration centroid-cosine rule), and reports top-1/top-3 with bootstrap 95% CIs against three baselines — **filename-embedding** (the one it must beat), most-frequent, and extension — plus the content−filename delta and a PASS/FAIL verdict. The split/metrics/baselines are unit-tested deterministically (a stub backend proves the instrument without the model). The **`model-eval` nightly lane** provisions libonnxruntime + the bundle and runs both `eval` and `eval-routing` on real 20-Newsgroups data, gated so a broken premise fails the lane — the only CI lane that exercises the real model path
 
 **What does not yet work:**
 
 - ~~Migration-mode multimodal.~~ **Now shipped:** the migration profiler builds per-folder centroids in three latent spaces — text `content_centroid` (from each folder's documents, always), plus image/audio centroids when the SigLIP/CLAP bundles are installed — and routes each source file against the centroid in its own space, falling back to folder-name embeddings when a folder lacks the matching centroid.
-- Video keyframe encoder. Video files still classify via Tier 1 only — pure-Rust frame-extraction is gated on the `ffmpeg-next` FFI vs metadata-only decision.
+- Video keyframe encoder. Video files have no dedicated content encoder; they can only use extractable text/name context and otherwise remain low-confidence or unclassified. Pure-Rust frame extraction is gated on the `ffmpeg-next` FFI vs metadata-only decision.
 - Calibrated confidence **by default**. The calibration mechanism now exists — Platt scaling via `Calibration` (default `Identity`), fit with `cargo xtask eval --calibrate`, measured by Expected Calibration Error — but the shipped default is still raw weighted-cosine. Enabling a fitted default needs the embedding model plus a held-out corpus larger than the current fixture set.
-- ~~UI Tier 3 toggle.~~ **Now shipped (LLM fallback):** the desktop UI's Settings page surfaces a per-session Tier 3 toggle that mirrors the CLI's three-gate model — it's only enabled when the UI is built `--features llm-fallback` *and* `[inference] llm_fallback = true`, and its state feeds the same `ServiceContext.text` activation. (The UI deliberately does not surface the `remote` backend; that stays CLI-only, so the default desktop binary has no HTTP client.) `cargo xtask check-privacy` now also asserts the default UI graph is LLM-silent.
+- ~~UI LLM fallback toggle.~~ **Now shipped:** Settings surfaces a per-session toggle under the same three-gate model. `TIDYUP_LLM_FALLBACK=1` pre-arms it only when the feature and config gates are also active; config loading happens asynchronously after root construction. The UI deliberately does not expose remote inference, and `cargo xtask check-privacy` asserts the default UI graph is LLM-silent.
 - ~~Prebuilt binary releases.~~ **Now shipped:** `release.yml` builds the default `tidyup` CLI for Linux/macOS(x2)/Windows on a `vX.Y.Z` tag and uploads checksummed archives to GitHub Releases (default features only — the published binary stays network- and LLM-silent). Still to come: **signed** binaries and Homebrew/winget package-manager distribution.
 
 The invariants the finished tool will uphold — human-in-the-loop review, reversible moves, bundle atomicity, no-network-by-default, extractive-only renames — are now enforced at the code path, not just the design.

@@ -100,7 +100,7 @@ pub(crate) async fn build(
     // operational rule in CLAUDE.md (concurrent model loads OOM on 8GB hosts).
     let text = build_text_backend(config, activation).await?;
 
-    let extractors = default_extractors();
+    let extractors = default_extractors(config);
 
     // Materialise the classifier config from the loaded TidyupConfig: rename
     // thresholds from `[rename]`, and Tier-3 activation tied to whether a text
@@ -258,7 +258,9 @@ pub(crate) async fn verify_and_load_default_embeddings(
     Ok(Arc::new(embeddings))
 }
 
-fn default_extractors() -> Vec<Arc<dyn tidyup_core::extractor::ContentExtractor>> {
+fn default_extractors(
+    config: &TidyupConfig,
+) -> Vec<Arc<dyn tidyup_core::extractor::ContentExtractor>> {
     // Registration order matters: more-specific extractors first, plain text
     // as the catch-all fallback. The CLI enables `tidyup-extract`'s `text`,
     // `pdf`, `image`, and `audio` features (see Cargo.toml), so these modules
@@ -266,7 +268,10 @@ fn default_extractors() -> Vec<Arc<dyn tidyup_core::extractor::ContentExtractor>
     // what music-album clustering keys on.
     vec![
         Arc::new(tidyup_extract::pdf::PdfExtractor),
-        Arc::new(tidyup_extract::image::ImageExtractor),
+        Arc::new(tidyup_extract::image::ImageExtractor::with_ocr(
+            config.extraction.ocr_enabled,
+            config.extraction.ocr_max_bytes,
+        )),
         Arc::new(tidyup_extract::audio::AudioExtractor),
         Arc::new(tidyup_extract::text::PlainTextExtractor),
     ]

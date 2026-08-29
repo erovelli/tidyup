@@ -5,16 +5,16 @@ Design doc for how tidyup decides where a file belongs, whether it should be ren
 ## Contents
 
 - [The question this doc answers](#the-question-this-doc-answers)
-- [Decision: three-tier cascade](#decision-three-tier-cascade-embeddings-at-the-spine)
+- [Decision: semantic embeddings with optional reranking](#decision-semantic-embeddings-with-optional-reranking)
 - [The unified-pattern property](#the-unified-pattern-property)
 - [v0.1 scope: text by default, image/audio opt-in](#v01-scope-text-by-default-imageaudio-opt-in)
-- [Tier 2: how embedding classification works](#tier-2-how-embedding-classification-works)
+- [How embedding classification works](#how-embedding-classification-works)
 - [Confidence: raw cosine by default, calibration available](#confidence-raw-cosine-by-default-calibration-available)
 - [Bundle detection](#bundle-detection)
 - [Rename strategy: extractive cascade](#rename-strategy-extractive-cascade)
 - [Why embeddings over a local LLM on the default path](#why-embeddings-over-a-local-llm-on-the-default-path)
 - [What embeddings give up — honestly](#what-embeddings-give-up--honestly)
-- [Tier 3: the LLM-fallback escape hatch](#tier-3-the-llm-fallback-escape-hatch)
+- [The optional LLM-fallback escape hatch](#the-optional-llm-fallback-escape-hatch)
 - [Architectural implications](#architectural-implications)
 - [Open questions](#open-questions)
 - [References in repo](#references-in-repo)
@@ -30,15 +30,14 @@ A messy source directory contains text documents, images, audio, video, and mixe
 
 All of this must run **locally, deterministically, reversibly, and fast enough for interactive review** — per the four product promises in `CLAUDE.md`. What sits behind the `Classifier` port to deliver this with one unified pattern?
 
-## Decision: three-tier cascade, embeddings at the spine
+## Decision: semantic embeddings with optional reranking
 
-tidyup classifies via a three-tier cascade, each tier cheaper than the last, short-circuiting on confidence. The default-binary spine is non-LLM: deterministic heuristics plus embedding similarity carry the classification load. The LLM is an optional escape hatch, never a default.
+tidyup routes destinations by semantic similarity. Extension and keyword heuristics do not choose folders; structural marker detection is reserved for preserving load-bearing bundles. The default path is one deterministic embedding stage, with an optional LLM reranker for uncertain results.
 
-1. **Tier 1 — Heuristics (~1 ms).** Extension, MIME, marker-file matching, simple keyword rules. Handles the obvious cases (`.gitignore`, `Cargo.toml`, `*.env`) for free. Files with an unambiguous category by extension short-circuit here and never reach Tier 2 — **except** image/audio files when the multimodal (SigLIP/CLAP) bundle is installed: those deliberately bypass the Tier-1 extension short-circuit so cross-modal Tier 2 can classify them by content, with the Tier-1 category as the fallback when Tier 2 misses (see "Multimodal Tier 2").
-2. **Tier 2 — Embedding similarity (~50 ms).** The extracted body is embedded to a vector and matched by cosine similarity — in **scan** mode against a fixed taxonomy, in **migration** mode against the target folders' content centroids. In scan mode the query is built by the single canonical `tidyup_domain::classification_query` (the filename prepended to the body), shared with the offline golden-corpus `eval` so the eval measures the shipped scan construction. Migration mode embeds the raw body only — the source *filename* is not part of the migration Tier-2 query (a folder's own `name_embedding` contributes a separate metadata term, but that is the target folder's name, not the source filename; see the migration section). The UES spine. Default Tier 2.
-3. **Tier 3 — Local LLM fallback (optional, opt-in, ~1–10 s).** Feature-gated under `--features llm-fallback`, off by default. When compiled in and enabled per-invocation, files that fall below Tier 2 confidence thresholds can be routed to a local LLM for a second opinion. Default builds exclude this tier entirely.
+1. **Semantic embedding routing (~50 ms).** In scan mode, separately embedded filename/path/MIME context and extracted content are weighted by `ScoreWeights` and ranked against a fixed taxonomy. In migration mode, extracted content is ranked against learned target-folder name and content-centroid embeddings. Missing content redistributes weight to the live signal instead of deflating confidence.
+2. **Local LLM reranking (optional, opt-in, ~1–10 s).** Feature-gated under `--features llm-fallback`, off by default. When compiled and triple-gated per invocation, uncertain embedding results can receive a second opinion. The result is re-embedded and must beat the original score; it never generates filenames.
 
-**Non-LLM AI on the default path.** The default binary ships Tier 1 and Tier 2 only. Classification is deterministic, auditable, bit-reproducible, and runs in ~50 ms per file on CPU. Tier 3 sits symmetrically with remote inference under the same **three-gate** pattern (compile-time feature + runtime config + per-invocation flag).
+**Non-LLM AI on the default path.** The default binary uses embeddings only. Classification is deterministic, auditable, bit-reproducible, and runs in ~50 ms per file on CPU. Optional local/remote rerankers sit behind the same **three-gate** pattern (compile-time feature + runtime config + per-invocation flag).
 
 ## The unified-pattern property
 
@@ -61,15 +60,16 @@ One input, one output, same for every modality and every operation. That is the 
 
 ## v0.1 scope: text by default, image/audio opt-in
 
-v0.1 ships text Tier 2 via `bge-small-en-v1.5` by default. Phase 7 added
-optional cross-modal Tier 2 for images (`SigLIP-base-patch16-224`) and audio
+v0.1 ships text embeddings via `bge-small-en-v1.5` by default. Phase 7 added
+optional cross-modal embeddings for images (`SigLIP-base-patch16-224`) and audio
 (`CLAP-htsat-unfused`); both are off by default and only activate when their
-ONNX bundles are present in the platform model cache. Cross-modal Tier 2 now
+ONNX bundles are present in the platform model cache. Cross-modal routing now
 applies in **both** scan and migration mode: scan ranks against per-modality
 taxonomies, migration ranks against per-folder image/audio centroids built by
-the profiler (see "Migration-mode multimodal centroids" below). Video still
-routes through Tier 1 heuristics — keyframe extraction is gated on the
-`ffmpeg-next` FFI decision.
+the profiler (see "Migration-mode multimodal centroids" below). Video has no
+dedicated content encoder; it uses any available text/name context and
+otherwise remains low-confidence or unclassified. Keyframe extraction is
+gated on the `ffmpeg-next` FFI decision.
 
 The scan-mode text taxonomy is the built-in `default_taxonomy()` unless the user
 supplies their own with `scan --taxonomy <file.toml>` — an array of validated
@@ -99,12 +99,12 @@ description = "product manuals, datasheets, user guides, specifications"
 
 It overrides only the text taxonomy; the image and audio taxonomies stay at their per-modality defaults.
 
-| Modality | Default handling | Phase 7 (opt-in) | Post-Phase-7 |
+| Modality | Default handling | Optional specialized encoder | Future |
 |---|---|---|---|
-| Text (pdf / docx / md / source / ipynb) | Tier 2 via `bge-small-en-v1.5` | — | — |
-| Image (jpg / png / heic / raw) | Tier 1 heuristics (extension + EXIF) | Tier 2 via `SigLIP-base` (cross-modal) when bundle installed | — |
-| Audio (mp3 / flac / m4a / wav) | Tier 1 heuristics (extension + ID3 via `lofty`) | Tier 2 via `CLAP-htsat-unfused` (cross-modal) when bundle installed | — |
-| Video (mp4 / mov / mkv) | Tier 1 heuristics only (extension + container metadata) | — | SigLIP(keyframe) + CLAP(audio), gated on pure-Rust video decode vs `ffmpeg-next` FFI decision |
+| Text (pdf / docx / md / source / ipynb) | `bge-small-en-v1.5` over filename/context + extracted text | — | — |
+| Image (jpg / png / heic / raw) | general text embeddings over filename/context + EXIF/OCR text | SigLIP cross-modal when installed | — |
+| Audio (mp3 / flac / m4a / wav) | general text embeddings over filename/context + ID3 text | CLAP cross-modal when installed | — |
+| Video (mp4 / mov / mkv) | name/context text only; weak results review/unclassified | — | SigLIP(keyframe) + CLAP(audio), pending decoder decision |
 
 Adding a modality is a new encoder behind a port trait — currently
 [`ImageEmbeddingBackend`](crates/tidyup-core/src/inference.rs) and
@@ -112,14 +112,12 @@ Adding a modality is a new encoder behind a port trait — currently
 service-layer refactor. Each modality's backend is held as
 `Option<Arc<dyn …>>` on `ServiceContext`; the pipeline routes by
 [`FileModality`](crates/tidyup-core/src/inference.rs). When the matching
-backend **is** loaded (the bundle is on disk), an image/audio file bypasses the
-Tier-1 extension short-circuit and is classified cross-modally first — in scan
+backend **is** loaded (the bundle is on disk), an image/audio file is classified cross-modally first — in scan
 mode against the image/audio taxonomy, in migration mode against the folders'
-`image_centroid` / `audio_centroid` — falling back to the Tier-1 category on a
-miss. When the backend is **absent** (the default install), or the file is
+`image_centroid` / `audio_centroid`. When the backend is **absent** (the default install), or the file is
 too large to read, or no folder carries a centroid, routing short-circuits to
-Tier 1 / the text Tier 2 path exactly as before, so the default path is
-unchanged.
+the general text-embedding path over filename/context and extracted metadata;
+uncertain results are held for review rather than extension-routed.
 
 ### Cross-modal latent-space isolation
 
@@ -132,7 +130,7 @@ cross-space cosine. Each modality has its own natural-language taxonomy
 authored as captions ("a photograph of a person", "a podcast episode") rather
 than the keyword soup that works best for `bge-small`.
 
-## Tier 2: how embedding classification works
+## How embedding classification works
 
 Text extracted via `tidyup-extract` → embedded with `bge-small-en-v1.5` (384-dim, ~35 MB Q8 ONNX, via `ort`) → scored against each candidate folder's profile:
 
@@ -148,8 +146,8 @@ Default weights (from `ClassifierConfig::ScoreWeights` in `tidyup-domain`): `w_c
 Decision per file:
 
 1. Compute `score` against every candidate folder.
-2. Top score above `embedding_threshold` (default 0.35) AND gap-to-second above `ambiguity_gap` (default 0.05) ⇒ confident proposal, exit cascade.
-3. Below either threshold ⇒ surface to review. If `--features llm-fallback` is compiled in and enabled per-invocation, route to Tier 3 instead of surfacing directly to review.
+2. Top score above `embedding_threshold` (default 0.35) AND gap-to-second above `ambiguity_gap` (default 0.05) ⇒ confident proposal.
+3. Below either threshold ⇒ surface to review. If the optional LLM fallback is compiled and triple-gated for the invocation, rerank before surfacing.
 
 ### Migration-mode centroids (text + cross-modal)
 
@@ -160,7 +158,7 @@ own latent space:
 - **`content_centroid` (text).** The profiler extracts the bodies of the
   folder's text documents (everything that isn't image/audio/video) and embeds
   them with the same `bge-small` backend as `name_embedding`. This is the
-  `w_cent = 0.55` term — the dominant signal — so a folder full of tax PDFs
+  `w_cent = 0.6875` term — the dominant signal — so a folder full of tax PDFs
   attracts tax-like source files by *content*, not just folder name. A folder
   with no text documents keeps `content_centroid = None` (see fallback above).
 - **`image_centroid` (SigLIP) / `audio_centroid` (CLAP).** When the cross-modal
@@ -181,8 +179,8 @@ Source files then route by modality:
 **Latent-space isolation.** An image embedding is never compared against
 `name_embedding`, `content_centroid`, or `audio_centroid` — they live in
 disjoint spaces. When no folder has a centroid in the file's modality (or the
-file can't be read/embedded), the cascade falls through to the text Tier 2 /
-Tier 1 path rather than fabricating a cross-space match.
+file can't be read/embedded), routing falls through to the general text-
+embedding path rather than fabricating a cross-space match.
 
 **Renames stay on the text path.** As in scan mode, cross-modal placement does
 not generate a rename — image/audio renames remain extractive (EXIF / ID3
@@ -244,7 +242,7 @@ Directory bundles remain **opaque** to per-file classification and route from ag
 Rename proposals come from an extractive cascade. Each step is strictly higher-signal than the one below; the first that fires produces the proposal.
 
 1. **Embedded metadata.** PDF `/Title`, DOCX `core.xml` title, ID3 `TIT2`, EXIF `ImageDescription`, Office core properties. If present and non-trivially different from the current filename, this is the rename.
-2. **Local OCR evidence.** On supported macOS builds, Vision-recognized text is available as extractive image content and may supply a rename candidate. `RenameSource::Ocr` is provenance only: OCR candidates must clear the same configured classification-confidence and filename-mismatch gates as metadata and keyword candidates.
+2. **Local OCR evidence.** On supported macOS builds, Vision-recognized text is available as image content and may supply a rename candidate. OCR is configurable (`[extraction] ocr_enabled`, default true), limited to plausible screenshot names, and capped at 20 MiB by default (`ocr_max_bytes`). Ordinary photos do not spawn the helper. Missing `xcrun`/Swift/macOS 14 SDK support emits a build warning and compiles this path out. `RenameSource::Ocr` is provenance only: OCR candidates must clear the same configured classification-confidence and filename-mismatch gates as metadata and keyword candidates.
 3. **Keyword-template fill.** Extract top-k keyphrases from content — n-grams up to 3 words (inlined YAKE — see below). The target folder's siblings are analysed for a naming pattern via regex inference. Top keyphrases fill the `<topic>` slot, flattened into a word-deduplicated stem (`"tax return"` + `"tax form"` → `tax_return_form`); dates come from EXIF or file mtime.
 4. **No signal → no rename.** Keep the filename; just move.
 
@@ -271,7 +269,7 @@ Every constraint in `README.md`, `CLAUDE.md`, and `ARCHITECTURE.md` scores embed
 | Atomic bundles, reversible moves | Classifier choice irrelevant | Same |
 | Pure-Rust-preferred | `mistralrs`/`candle` (Rust, but deep tree) | `ort` — FFI cost already accepted |
 
-Both modes treat the LLM as an optional Tier 3 escape hatch rather than a default — the cost of CPU inference (25–50s/file) makes embedding-default the right baseline, with the human review step as the final safety net for low-confidence Tier 2 verdicts. Tier 3 sits behind the three-gate activation in both scan and migration mode; same code path, same threshold logic, same review fallback when the LLM still produces a low-confidence verdict.
+Both modes treat the LLM as an optional reranker rather than a default — the cost of CPU inference (25–50s/file) makes embedding-default the right baseline, with human review as the final safety net for low-confidence results. The reranker sits behind three-gate activation in both modes; same code path, same threshold logic, same review fallback when it remains uncertain.
 
 ## What embeddings give up — honestly
 
@@ -283,7 +281,7 @@ Both modes treat the LLM as an optional Tier 3 escape hatch rather than a defaul
 
 None of these break a spec invariant. They shift judgment to the human review step, which the spec already frames as the safety net. (3) is the sharpest — call it out in `--help` output and docs.
 
-## Tier 3: the LLM-fallback escape hatch
+## The optional LLM-fallback escape hatch
 
 `tidyup-inference-mistralrs` is retained but feature-gated, symmetric with `tidyup-inference-remote`:
 
@@ -293,17 +291,17 @@ None of these break a spec invariant. They shift judgment to the human review st
 - Never recommended in first-run UX or default docs.
 - `cargo xtask check-privacy` asserts `mistralrs`/`candle-core`/`hf-hub` are absent from the default `tidyup-cli`/`tidyup-ui` dep graph (the same check that guards the `reqwest`/`hyper`/`rustls` network surface). `cargo-deny` covers licenses/advisories/sources — it does **not** enforce these feature-gated crate bans (`deny.toml [bans].deny` is empty).
 
-### What Tier 3 actually does (current implementation)
+### What the fallback actually does (current implementation)
 
-When Tier 2 lands in the **review zone** (`needs_review = true` — below `embedding_threshold` or inside `ambiguity_gap`) and a `TextBackend` is wired in, the pipeline:
+When embedding routing lands in the **review zone** (`needs_review = true` — below `embedding_threshold` or inside `ambiguity_gap`) and a `TextBackend` is wired in, the pipeline:
 
 1. Calls `text_backend.classify_text(content, filename)` — the LLM emits a `ContentClassification { category, tags, summary, suggested_name }`.
 2. Builds a query string from `category + tags + summary` (the `suggested_name` is **deliberately dropped** — renames stay extractive per the rename policy).
-3. Re-embeds the query via the same `EmbeddingBackend` Tier 2 used.
+3. Re-embeds the query via the same `EmbeddingBackend` used for the original result.
 4. Re-ranks the same candidate list (scan: `ScanCandidate[]`; migration: `FolderProfile[]`) under the same scoring rules.
-5. Adopts the LLM-reranked top **only if** it scores higher than the Tier 2 top. Otherwise the Tier 2 verdict stands.
+5. Adopts the LLM-reranked top **only if** it scores higher than the original embedding top. Otherwise the original verdict stands.
 
-The cost (1–10 s of inference) is paid only on hard cases — Tier 2 hits that already cleared their thresholds skip Tier 3 entirely. The verdict's `reasoning` field records `tier3 llm-rerank: …` so post-hoc auditing can tell which tier resolved each file. In migration mode the result also carries `Tier::Llm` in `ClassificationResult.resolved_at`.
+The cost (1–10 s of inference) is paid only on hard cases; confident embedding hits skip the fallback entirely. The verdict's legacy `reasoning` label records `tier3 llm-rerank: …` so post-hoc auditing can identify fallback use. In migration mode the result also carries `Tier::Llm` in `ClassificationResult.resolved_at`.
 
 `tidyup-inference-remote` plugs into the same seam: it implements `TextBackend`, so `--remote` swaps the local mistralrs engine for a remote endpoint without any pipeline changes. The crate ships OpenAI-compatible, Anthropic, and Ollama `RemoteEndpoint` adapters, but **only the OpenAI-compatible path is selectable from CLI config today** (`RemoteBackendConfig` has no provider discriminator); the Anthropic/Ollama variants exist but aren't yet wired from config. An Ollama server is still reachable via its OpenAI-compatible `/v1` endpoint.
 
@@ -311,7 +309,7 @@ The cost (1–10 s of inference) is paid only on hard cases — Tier 2 hits that
 
 - **`tidyup-inference-mistralrs` is feature-gated.** `--features llm-fallback`. Not in the default crate graph.
 - **`tidyup-embeddings-ort` carries the default classifier.** Hosts `bge-small-en-v1.5` with room to add modality-specific encoders post-v0.1.
-- **`tidyup-pipeline` hosts Tier 1 + Tier 2.** Plus soft-bundle clustering (metadata/filename-only today in `pipeline::clustering`; HDBSCAN-over-embeddings is the planned upgrade), the extractive rename cascade, and (when the feature is on) the Tier 3 call-through.
+- **`tidyup-pipeline` hosts semantic embedding routing.** It also owns conservative file-set clustering, the rename cascade, and the optional LLM rerank call-through. Structural bundle markers preserve codebases but never choose destinations for loose files.
 - **Marker bundle detection stays in `pipeline::bundle`; soft-bundle clustering lives in `pipeline::clustering`.** Marker detection unchanged; soft-bundle clustering is metadata/filename-only in v0.1 (no embedding step yet).
 - **`ClassifierConfig.calibration` defaults to `Identity` (raw cosine).** The Platt-scaling mechanism + fitting tool (`cargo xtask eval --calibrate`) exist; the shipped default stays uncalibrated until a corpus-fit parameter set lands.
 
@@ -319,7 +317,7 @@ The cost (1–10 s of inference) is paid only on hard cases — Tier 2 hits that
 
 - **Held-out corpus for calibration (v0.2).** Ship a synthetic fixture corpus? Calibrate on first run against a labelled sample? Defer until there's real-world feedback to mine (with user opt-in)?
 - **Multilingual support.** When to swap to `bge-m3` or `multilingual-e5`? Gate on binary-size impact vs observed demand.
-- **Image-side rename gating.** Phase 7 image classification produces a folder choice but no rename proposal. The rename cascade still runs against text Tier 2 (EXIF metadata → keyword fill → keep). A future enhancement: cross-modal mismatch gate using SigLIP text + image embeddings of filename and content.
+- **Image-side rename gating.** Cross-modal image classification produces a folder choice but no rename proposal. Renames still use the text-embedding confidence gate and extractive image evidence. A future enhancement could add a cross-modal mismatch gate using SigLIP text + image embeddings of filename and content.
 - **Video keyframe extraction.** Still pending the `ffmpeg-next` FFI vs metadata-only decision.
 - **Cold-start loose-file UX.** Bundles are now preserved safely at the target root, but loose files still have no honest category when the target exposes zero leaves. Should a future `--bootstrap` mode accept a user-authored taxonomy, or is an explicit unclassified list the right permanent behavior?
 - **Inline-YAKE maintenance.** A few hundred lines of keyword extraction inline is cheap but adds a small maintenance item. Acceptable until a mainstream crate crosses the DL threshold.
