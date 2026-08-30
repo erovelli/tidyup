@@ -32,6 +32,7 @@ use tidyup_core::extractor::{ContentExtractor, ExtractedContent};
 use tidyup_core::inference::ImageEmbeddingBackend;
 use tidyup_domain::bundle::BundleKind;
 
+use crate::indexing::SourceIdentities;
 use crate::scanner::DetectedBundle;
 use crate::semantic::{cosine, rank_concepts, GroundedConcept, SemanticRunCache};
 
@@ -81,6 +82,10 @@ pub struct SemanticClusterContext<'a> {
     pub image: Option<&'a dyn ImageEmbeddingBackend>,
     pub image_concepts: &'a [GroundedConcept],
     pub cache: &'a SemanticRunCache<'a>,
+    /// MIME identities collected by the indexing pass.  Keeping them here
+    /// prevents clustering from reopening every file merely to rediscover its
+    /// media type.
+    pub identities: &'a SourceIdentities,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,6 +137,7 @@ pub async fn cluster_loose(
     config: &ClusterConfig,
 ) -> ClusterOutcome {
     let cache = SemanticRunCache::default();
+    let identities = SourceIdentities::default();
     cluster_loose_semantic(
         loose,
         extractors,
@@ -140,6 +146,7 @@ pub async fn cluster_loose(
             image: None,
             image_concepts: &[],
             cache: &cache,
+            identities: &identities,
         },
     )
     .await
@@ -184,10 +191,11 @@ async fn cluster_dir(
     // `atomsnotelectrons_submission.txt` + `atomsnotelectrons_testbench.png`).
     // OCR-similar generic screenshots can then attach to that anchored set.
     let (mut bundles, semantic_left) =
-        cluster_semantic_collections(dir, files, extractors, semantic.cache).await;
+        cluster_semantic_collections(dir, files, extractors, semantic.cache, semantic.identities)
+            .await;
     let mut modalities = HashMap::with_capacity(semantic_left.len());
     for path in &semantic_left {
-        let mime = tidyup_extract::mime::detect(path).await;
+        let mime = semantic.identities.mime_type_or_detect(path).await;
         modalities.insert(path.clone(), modality_from_mime(mime.as_deref()));
     }
     let mut images = Vec::new();
@@ -242,6 +250,7 @@ async fn cluster_semantic_collections(
     files: &[PathBuf],
     extractors: &[Arc<dyn ContentExtractor>],
     cache: &SemanticRunCache<'_>,
+    identities: &SourceIdentities,
 ) -> (Vec<DetectedBundle>, Vec<PathBuf>) {
     // Directory cohesion outranks repeated stems inside an assembly. A CAD
     // directory commonly contains the same part in multiple formats
@@ -259,7 +268,7 @@ async fn cluster_semantic_collections(
     // so G groups and S screenshots cost S extractions rather than G * S.
     let mut screenshot_evidence = Vec::new();
     for path in files.iter().filter(|path| is_generic_screenshot(path)) {
-        let mime = tidyup_extract::mime::detect(path).await;
+        let mime = identities.mime_type_or_detect(path).await;
         let Some(content) = cache.extract(path, mime.as_deref(), extractors).await else {
             continue;
         };
@@ -285,7 +294,7 @@ async fn cluster_semantic_collections(
         // locally recognised text overlaps the group's image/text evidence.
         let mut evidence_tokens = HashSet::new();
         for member in &members {
-            let mime = tidyup_extract::mime::detect(member).await;
+            let mime = identities.mime_type_or_detect(member).await;
             if let Some(content) = cache.extract(member, mime.as_deref(), extractors).await {
                 if let Some(text) = content.text {
                     evidence_tokens.extend(semantic_tokens(&text));
@@ -368,6 +377,7 @@ struct VisualClusters {
     over_cap: usize,
 }
 
+#[allow(clippy::too_many_lines)]
 async fn cluster_visual_neighbors(
     dir: &Path,
     files: &[PathBuf],
@@ -400,7 +410,9 @@ async fn cluster_visual_neighbors(
 
     let mut embedded = Vec::new();
     for path in &image_paths {
-        let mime = tidyup_extract::mime::detect(path)
+        let mime = semantic
+            .identities
+            .mime_type_or_detect(path)
             .await
             .unwrap_or_else(|| "application/octet-stream".to_string());
         match semantic.cache.image_embedding(path, &mime, backend).await {
@@ -1236,6 +1248,7 @@ mod tests {
         std::fs::write(&files[3], b"x unrelated fixture").unwrap();
 
         let cache = SemanticRunCache::default();
+        let identities = SourceIdentities::default();
         let concepts = vec![
             GroundedConcept {
                 label: "cat".to_string(),
@@ -1262,6 +1275,7 @@ mod tests {
                 image: Some(&VisualBackend),
                 image_concepts: &concepts,
                 cache: &cache,
+                identities: &identities,
             },
         )
         .await;
@@ -1286,6 +1300,7 @@ mod tests {
         }
 
         let cache = SemanticRunCache::default();
+        let identities = SourceIdentities::default();
         let concepts = vec![GroundedConcept {
             label: "photograph".to_string(),
             prompt: "a photograph".to_string(),
@@ -1316,6 +1331,7 @@ mod tests {
                 image: Some(&VisualBackend),
                 image_concepts: &concepts,
                 cache: &cache,
+                identities: &identities,
             },
         )
         .await;

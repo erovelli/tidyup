@@ -133,6 +133,7 @@ pub async fn run_migration(
             image: multimodal.image,
             image_concepts: multimodal.image_concepts,
             cache: &semantic_cache,
+            identities,
         },
     )
     .await;
@@ -235,6 +236,7 @@ pub async fn run_migration(
     for path in &loose_files {
         match classify_file(
             path,
+            identities,
             profiles,
             embeddings,
             text_backend,
@@ -297,6 +299,7 @@ struct Verdict {
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn classify_file(
     path: &Path,
+    identities: &crate::indexing::SourceIdentities,
     profiles: &ProfileCache,
     embeddings: &dyn EmbeddingBackend,
     text_backend: Option<&dyn TextBackend>,
@@ -311,7 +314,7 @@ async fn classify_file(
         .unwrap_or_default()
         .to_string();
 
-    let mime = tidyup_extract::mime::detect(path).await;
+    let mime = identities.mime_type_or_detect(path).await;
     let extracted = semantic_cache
         .extract(path, mime.as_deref(), extractors)
         .await;
@@ -802,6 +805,7 @@ async fn build_content_bundle_proposal(
     for member in &bundle.members {
         let verdict = classify_file(
             member,
+            identities,
             profiles,
             embeddings,
             text_backend,
@@ -2053,6 +2057,7 @@ mod tests {
                 audio: None,
                 extractors: &[],
                 artifact_store: None,
+                identities: None,
             },
         )
         .await
@@ -2103,6 +2108,7 @@ mod tests {
                 audio: None,
                 extractors: &[],
                 artifact_store: None,
+                identities: None,
             },
         )
         .await
@@ -2191,6 +2197,7 @@ mod tests {
                 audio: None,
                 extractors: &[],
                 artifact_store: None,
+                identities: None,
             },
         )
         .await
