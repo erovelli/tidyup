@@ -8,14 +8,19 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tidyup_core::frontend::Level;
 use tidyup_core::{ProgressReporter, Result, ReviewHandler, ReviewOutcome};
-use tidyup_domain::{RunMode, RunRecord, RunState};
+use tidyup_domain::{
+    CapabilityManifest, FileProcessingRole, FileProcessingStage, RunMode, RunRecord, RunState,
+};
 use tidyup_pipeline::migration::{run_migration, MigrationMultimodal};
 use tidyup_pipeline::profiler::{self, MultimodalProfilers};
 use uuid::Uuid;
 
 use crate::executor::{
-    apply_bundles, apply_loose_decisions, select_bundle_decisions, ApplyReport, ExecutorDeps,
-    DEFAULT_BUNDLE_MIN_CONFIDENCE,
+    apply_bundles, apply_loose_decisions, select_bundle_decisions, validate_destination_ledger,
+    ApplyReport, ExecutorDeps, DEFAULT_BUNDLE_MIN_CONFIDENCE,
+};
+use crate::processing::{
+    attach_indexed_identities, record_source_outcomes, record_target_profiled, report_indexing,
 };
 use crate::ServiceContext;
 
@@ -29,10 +34,11 @@ pub struct MigrationRequest {
     pub source: std::path::PathBuf,
     pub target: std::path::PathBuf,
     pub dry_run: bool,
-    /// When true (the `--yes` path), auto-apply bundles whose confidence clears
-    /// `bundle_min_confidence` without prompting. When false, bundles are
-    /// surfaced to the `ReviewHandler` for interactive per-bundle approval. Set
-    /// by the CLI only if `--yes`.
+    /// When true (the `--yes` path), auto-apply eligible opaque structural
+    /// bundles whose confidence clears `bundle_min_confidence` without
+    /// prompting. Soft/file-set and generic bundles remain review-only. When
+    /// false, bundles are surfaced to the `ReviewHandler` for interactive
+    /// per-bundle approval. Set by the CLI only if `--yes`.
     #[serde(default)]
     pub auto_approve_bundles: bool,
     /// Lower bound on confidence for auto-applied bundles.
@@ -46,6 +52,9 @@ const fn default_bundle_confidence() -> f32 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MigrationReport {
+    pub source_indexed: usize,
+    pub target_indexed: usize,
+    pub indexing_failed: usize,
     pub proposed: usize,
     pub bundles: usize,
     pub unclassified: usize,
@@ -57,6 +66,7 @@ pub struct MigrationReport {
     pub bundles_skipped: usize,
     pub bundles_failed: usize,
     pub run_id: Uuid,
+    pub capabilities: CapabilityManifest,
 }
 
 impl MigrationService {
@@ -70,8 +80,10 @@ impl MigrationService {
     /// 1. Scans target tree, builds folder profiles (`Phase::ProfilingTarget`).
     /// 2. Classifies each source file (`Phase::Classifying`).
     /// 3. Persists proposals + bundles via [`ChangeLog`], tagged with a run id.
-    /// 4. Calls `review.review(proposals)` for loose proposals.
-    /// 5. Shelves and moves approved proposals atomically (per-file or per-bundle).
+    /// 4. Calls `review.review_all(proposals, bundles)` for an interactive
+    ///    complete plan, or the restricted threshold paths under `--yes`.
+    /// 5. Shelves, journals, and moves approved proposals atomically
+    ///    (per-file or per-bundle).
     ///
     /// [`ChangeLog`]: tidyup_core::storage::ChangeLog
     ///
@@ -92,7 +104,8 @@ impl MigrationService {
             RunMode::Migrate,
             request.source.clone(),
             Some(request.target.clone()),
-        );
+        )
+        .with_capabilities(self.ctx.capabilities.clone());
         let run_id = run.id;
         self.ctx.run_log.record_run(&run).await?;
 
@@ -105,7 +118,17 @@ impl MigrationService {
                     .finish_run(run_id, RunState::Completed)
                     .await?;
             }
-            Err(_) => {
+            Err(error) => {
+                let _ = self
+                    .ctx
+                    .file_index
+                    .fail_incomplete_processing(
+                        run_id,
+                        FileProcessingRole::Source,
+                        FileProcessingStage::Planning,
+                        &format!("run failed before a terminal file outcome: {error}"),
+                    )
+                    .await;
                 let _ = self.ctx.run_log.finish_run(run_id, RunState::Failed).await;
             }
         }
@@ -121,6 +144,23 @@ impl MigrationService {
         run_id: Uuid,
     ) -> Result<MigrationReport> {
         progress
+            .message(
+                Level::Info,
+                &format!("capabilities: {}", self.ctx.capabilities.summary()),
+            )
+            .await;
+        // Persist identity for both sides of a migration before semantic
+        // profiling/classification. This makes unchanged files reusable and
+        // ensures failures remain visible in the durable index.
+        let target_indexed = tidyup_pipeline::indexing::index_directory(
+            &request.target,
+            self.ctx.file_index.as_ref(),
+            run_id,
+            FileProcessingRole::TargetProfile,
+        )
+        .await?;
+        report_indexing(&target_indexed, progress).await;
+        progress
             .phase_started(tidyup_domain::Phase::ProfilingTarget, None)
             .await;
         let target_scan = profiler::scan_target(&request.target)?;
@@ -132,14 +172,46 @@ impl MigrationService {
         //   when their bundles are loaded.
         // Source files then route against the matching-space centroid; missing
         // centroids fall back to the name/text path.
+        let hierarchy_labels = target_scan
+            .leaf_folders
+            .iter()
+            .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let image_concepts = if let Some(backend) = self.ctx.image_embeddings.as_deref() {
+            match tidyup_pipeline::semantic::prepare_visual_concepts_with_labels(
+                backend,
+                &hierarchy_labels,
+            )
+            .await
+            {
+                Ok(concepts) => concepts,
+                Err(error) => {
+                    progress
+                        .message(
+                            Level::Warn,
+                            &format!(
+                                "visual concept preparation failed; semantic image renames disabled: {error}"
+                            ),
+                        )
+                        .await;
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
         let multimodal = MigrationMultimodal {
             image: self.ctx.image_embeddings.as_deref(),
             audio: self.ctx.audio_embeddings.as_deref(),
+            image_concepts: &image_concepts,
+            artifact_store: Some(self.ctx.file_index.as_ref()),
         };
         let profilers = MultimodalProfilers {
             image: multimodal.image,
             audio: multimodal.audio,
             extractors: &self.ctx.extractors,
+            artifact_store: Some(self.ctx.file_index.as_ref()),
         };
         let profile_cache = profiler::build_profile_cache_multimodal(
             &target_scan,
@@ -147,14 +219,39 @@ impl MigrationService {
             profilers,
         )
         .await?;
+        record_target_profiled(
+            self.ctx.file_index.as_ref(),
+            run_id,
+            &target_indexed.indexed,
+        )
+        .await?;
         progress
             .phase_finished(tidyup_domain::Phase::ProfilingTarget)
             .await;
 
+        let source_indexed = tidyup_pipeline::indexing::index_directory(
+            &request.source,
+            self.ctx.file_index.as_ref(),
+            run_id,
+            FileProcessingRole::Source,
+        )
+        .await?;
+        report_indexing(&source_indexed, progress).await;
+        progress
+            .message(
+                Level::Info,
+                &format!(
+                    "indexed {} target file(s) and {} source file(s)",
+                    target_indexed.indexed.len(),
+                    source_indexed.indexed.len()
+                ),
+            )
+            .await;
+
         let text_backend = self.ctx.text.as_deref();
-        // Classifier config (rename thresholds + Tier-3 activation) is
+        // Classifier config (rename thresholds + optional reranker) is
         // materialised from the loaded TidyupConfig at context-build time.
-        let outcome = run_migration(
+        let mut outcome = run_migration(
             &request.source,
             &profile_cache,
             self.ctx.embeddings.as_ref(),
@@ -163,6 +260,21 @@ impl MigrationService {
             &self.ctx.extractors,
             &self.ctx.classifier,
             progress,
+        )
+        .await?;
+
+        attach_indexed_identities(
+            &source_indexed.indexed,
+            &mut outcome.proposals,
+            &mut outcome.bundles,
+        );
+        record_source_outcomes(
+            self.ctx.file_index.as_ref(),
+            run_id,
+            &source_indexed.indexed,
+            &outcome.proposals,
+            &outcome.bundles,
+            &outcome.unclassified,
         )
         .await?;
 
@@ -214,6 +326,8 @@ impl MigrationService {
             progress,
         };
 
+        validate_destination_ledger(&outcome.proposals, &decisions, &approved_bundles)?;
+
         let loose_report: ApplyReport = if decisions.is_empty() {
             ApplyReport::default()
         } else {
@@ -248,6 +362,9 @@ impl MigrationService {
             apply_bundles(&outcome.bundles, &approved_bundles, &deps, request.dry_run).await?;
 
         Ok(MigrationReport {
+            source_indexed: source_indexed.indexed.len(),
+            target_indexed: target_indexed.indexed.len(),
+            indexing_failed: source_indexed.failed.saturating_add(target_indexed.failed),
             proposed: outcome.proposals.len(),
             bundles: outcome.bundles.len(),
             unclassified: outcome.unclassified.len(),
@@ -259,6 +376,7 @@ impl MigrationService {
             bundles_skipped: bundle_report.bundles_skipped,
             bundles_failed: bundle_report.bundles_failed,
             run_id,
+            capabilities: self.ctx.capabilities.clone(),
         })
     }
 

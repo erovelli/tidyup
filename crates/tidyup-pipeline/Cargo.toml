@@ -26,9 +26,12 @@ serde         = { workspace = true }
 serde_json    = { workspace = true }
 uuid          = { workspace = true }
 chrono        = { workspace = true }
+infer         = { workspace = true }
+mime_guess    = { workspace = true }
 
 [dev-dependencies]
 tempfile      = { workspace = true }
+tidyup-storage-sqlite = { workspace = true }
 # Multimodal tests author tiny PNGs to exercise image-modality routing.
 image         = { workspace = true }
 

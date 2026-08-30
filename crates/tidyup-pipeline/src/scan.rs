@@ -1,11 +1,11 @@
 //! Scan-mode pipeline — classify a source tree against a fixed taxonomy.
 //!
-//! The scan pipeline uses a semantic cascade with a *taxonomy* as target:
+//! The scan pipeline uses semantic routing with a *taxonomy* as target:
 //! each file is compared against every candidate category. Contrast with the migration pipeline in
 //! [`crate::migration`], which classifies against an arbitrary existing
 //! folder hierarchy.
 //!
-//! # Cascade
+//! # Routing flow
 //!
 //! 1. **Bundle detection** (in the scanner) carves out opaque subtrees; scan
 //!    mode preserves their internal paths while routing their aggregate
@@ -16,11 +16,11 @@
 //!    picks the highest-cosine candidate. Review is required below the
 //!    `embedding_threshold` (default 0.35) with `ambiguity_gap`.
 //! 3. **LLM fallback** (optional): when a [`TextBackend`] is provided
-//!    and Tier 2 lands in the review zone (below threshold or inside the
+//!    and deterministic embedding routing lands in the review zone (below threshold or inside the
 //!    ambiguity gap), the LLM classifies the content and the resulting
 //!    `summary + category + tags` is re-embedded and re-ranked against the
-//!    same candidate list. If the re-ranked top scores higher than Tier 2's,
-//!    we adopt it with [`Tier::Llm`] reasoning. The activation gate is the
+//!    same candidate list. If the re-ranked top scores higher than the original,
+//!    we adopt it with legacy [`Tier::Llm`] provenance. The activation gate is the
 //!    caller passing `Some(text_backend)` — this module is feature-flag-free
 //!    by design.
 //! 4. **Uncertain results**: surface to review via `needs_review = true`.
@@ -42,6 +42,7 @@ use uuid::Uuid;
 
 use crate::naming::{propose_rename, uniquify_bundle_member_names, RenameProposal};
 use crate::scanner::{self, DetectedBundle};
+use crate::semantic::{gate_grounded_rename, GroundedConcept, SemanticRunCache};
 use crate::yake;
 
 /// A classification target: one leaf in the scan taxonomy.
@@ -64,22 +65,25 @@ pub struct ScanCandidate {
     pub embedding: Vec<f32>,
 }
 
-/// Optional multimodal Tier 2 backends + per-modality candidate lists.
+/// Optional multimodal embedding backends + per-modality candidate lists.
 ///
-/// Phase 7 wiring: when a backend is present, the pipeline routes files of
-/// that modality through it instead of (or in addition to) the text cascade.
+/// When a backend is present, the pipeline routes files of
+/// that modality through it instead of (or in addition to) text routing.
 /// Each candidate list embeds in the **modality-specific** latent space and
 /// is NOT interchangeable with the text-only `ScanCandidate` list passed at
 /// the top level — the pipeline keeps them separate so a misconfigured
 /// caller can't compute a meaningless cross-space cosine.
 ///
-/// `Default::default()` returns an empty context so legacy text-only
-/// callers don't have to know about Phase 7.
+/// `Default::default()` returns an empty context so text-only callers do not
+/// need to construct modality-specific state.
 #[derive(Default)]
 #[allow(missing_debug_implementations)] // trait objects don't implement Debug
 pub struct MultimodalContext<'a> {
     pub image: Option<ImageContext<'a>>,
     pub audio: Option<AudioContext<'a>>,
+    /// Optional persistent semantic-artifact store. Cache failures degrade to
+    /// fresh inference and never fail classification.
+    pub artifact_store: Option<&'a dyn tidyup_core::storage::FileIndex>,
 }
 
 /// Image-side classification context: SigLIP-style backend + image taxonomy.
@@ -87,6 +91,10 @@ pub struct MultimodalContext<'a> {
 pub struct ImageContext<'a> {
     pub backend: &'a dyn ImageEmbeddingBackend,
     pub candidates: &'a [ScanCandidate],
+    /// General visible concepts, pre-embedded once in the image backend's text
+    /// space. They support grounded naming and collection labels but never map
+    /// directly to a destination.
+    pub concepts: &'a [GroundedConcept],
 }
 
 /// Audio-side classification context: CLAP-style backend + audio taxonomy.
@@ -101,25 +109,25 @@ pub struct AudioContext<'a> {
 pub struct ScanOutcome {
     pub proposals: Vec<ChangeProposal>,
     pub bundles: Vec<BundleProposal>,
-    /// Files the cascade couldn't classify at all. Listed here so callers can
+    /// Files the semantic router could not classify. Listed here so callers can
     /// surface them rather than silently drop.
     pub unclassified: Vec<PathBuf>,
 }
 
-/// Drive the scan cascade end-to-end.
+/// Drive the scan pipeline end-to-end.
 ///
 /// `output_root` is the destination prefix applied to each taxonomy leaf
 /// path — typically the source root itself (to reorganize in-place) or a
 /// user-specified directory.
 ///
-/// `multimodal` carries optional Phase 7 image/audio backends + their per-
+/// `multimodal` carries optional image/audio backends and their per-
 /// modality candidate lists. Pass [`MultimodalContext::default()`] for the
-/// text-only cascade.
+/// text-only path.
 ///
-/// `text_backend` is the optional Tier 3 LLM. Pass `None` (the default-build
-/// case) and the cascade stops at Tier 2; pass `Some` and low-confidence
-/// Tier 2 verdicts get a chance to be re-ranked through an LLM-cleaned query.
-/// The pipeline never invokes the backend when Tier 2 already cleared its
+/// `text_backend` is the optional LLM reranker. Pass `None` (the default-build
+/// case) to use deterministic embeddings only; pass `Some` and low-confidence
+/// embedding verdicts get a chance to be re-ranked through an LLM-cleaned query.
+/// The pipeline never invokes the backend when the embedding result already cleared its
 /// thresholds, so the cost is paid only on hard cases.
 ///
 /// # Errors
@@ -138,16 +146,25 @@ pub async fn run_scan(
     config: &ClassifierConfig,
     progress: &dyn ProgressReporter,
 ) -> Result<ScanOutcome> {
+    let semantic_cache = SemanticRunCache::new(multimodal.artifact_store);
     progress.phase_started(Phase::Indexing, None).await;
     let tree = scanner::scan(source_root);
     // Content clustering: group loose siblings into photo bursts / music albums
     // / document series. Runs after the structural scanner; these move as
     // file-sets (each member individually, atomically) — see
     // `BundleKind::moves_as_file_set`.
-    let (content_bundles, loose_files) = crate::clustering::cluster_loose(
+    let (content_bundles, loose_files) = crate::clustering::cluster_loose_semantic(
         &tree.loose_files,
         extractors,
         &crate::clustering::ClusterConfig::default(),
+        crate::clustering::SemanticClusterContext {
+            image: multimodal.image.as_ref().map(|context| context.backend),
+            image_concepts: multimodal
+                .image
+                .as_ref()
+                .map_or(&[], |context| context.concepts),
+            cache: &semantic_cache,
+        },
     )
     .await;
     progress.phase_finished(Phase::Indexing).await;
@@ -185,6 +202,7 @@ pub async fn run_scan(
             text_backend,
             extractors,
             config,
+            &semantic_cache,
         )
         .await
         {
@@ -218,6 +236,7 @@ pub async fn run_scan(
             text_backend,
             extractors,
             config,
+            &semantic_cache,
         )
         .await
         {
@@ -273,9 +292,9 @@ struct ClassifiedFile {
 
 /// Classify a single loose file using semantic evidence and optional LLM reranking.
 ///
-/// Tier 3 fires only when (a) Tier 2 produced a `needs_review` result, (b) a
+/// Optional LLM reranking fires only when (a) embedding routing produced a `needs_review` result, (b) a
 /// `text_backend` was supplied by the caller, and (c)
-/// `config.enable_llm_fallback` is true. Otherwise the cascade stops at Tier 2.
+/// `config.enable_llm_fallback` is true. Otherwise the embedding result stands.
 ///
 /// Returns `Ok(None)` when there are no destination candidates.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
@@ -287,6 +306,7 @@ async fn classify_file(
     text_backend: Option<&dyn TextBackend>,
     extractors: &[Arc<dyn ContentExtractor>],
     config: &ClassifierConfig,
+    semantic_cache: &SemanticRunCache<'_>,
 ) -> Result<Option<ClassifiedFile>> {
     let filename = path
         .file_name()
@@ -296,18 +316,17 @@ async fn classify_file(
 
     // Extract early so content can contribute semantic evidence.
     let mime = tidyup_extract::mime::detect(path).await;
-    let extracted = match tidyup_extract::router::pick(extractors, path, mime.as_deref()) {
-        Some(ext) => ext.extract(path).await.ok(),
-        None => None,
-    };
+    let extracted = semantic_cache
+        .extract(path, mime.as_deref(), extractors)
+        .await;
     let effective_mime = extracted
         .as_ref()
         .map(|e| e.mime.clone())
         .or_else(|| mime.clone());
 
-    // MIME/extension may select a compatible semantic backend, but never a
+    // Content-sniffed MIME selects a compatible semantic capability, never a
     // destination. All destination choices below come from model similarity.
-    let modality = file_modality(path, effective_mime.as_deref());
+    let modality = file_modality(effective_mime.as_deref());
     if matches!(modality, FileModality::Image) {
         if let Some(img_ctx) = multimodal.image.as_ref() {
             if let Some(verdict) = classify_image(
@@ -316,6 +335,7 @@ async fn classify_file(
                 effective_mime.as_deref(),
                 extracted.as_ref(),
                 config,
+                semantic_cache,
             )
             .await?
             {
@@ -366,10 +386,9 @@ async fn classify_file(
     let mut tier3_model: Option<String> = None;
     let needs_review = best_score < config.embedding_threshold || gap < config.ambiguity_gap;
 
-    // Tier 3 — LLM fallback. Only fires when Tier 2 was uncertain *and* the
-    // caller wired in a text backend *and* config gates haven't disabled it.
-    // We never call the LLM when Tier 2 was already confident — the cost only
-    // shows up on the hard cases.
+    // Optional LLM reranking only fires when deterministic semantic routing is
+    // uncertain, the caller wired in a text backend, and configuration permits
+    // it. Confident local-model results never pay the fallback cost.
     if needs_review && config.enable_llm_fallback {
         if let Some(backend) = text_backend {
             let llm_evidence = if text.trim().is_empty() {
@@ -407,12 +426,9 @@ async fn classify_file(
     let metadata_json = extracted
         .as_ref()
         .map_or(serde_json::Value::Null, |e| e.metadata.clone());
-    // Rename gate is driven by Tier 2's confidence (`best_score`), NOT the
-    // post-Tier-3 rerank score (`chosen_score`). Tier 3 only fires when Tier 2
-    // was uncertain, and it can only raise the score — feeding `chosen_score`
-    // here would let a Tier-3 reroute clear the rename threshold, producing a
-    // rename off the back of an LLM reroute. Gating on Tier 2 keeps the
-    // invariant "Tier 3 reroutes never produce renames" (see CLAUDE.md).
+    // Rename gating uses the deterministic semantic score (`best_score`), not
+    // the post-rerank routing score (`chosen_score`). The optional LLM is only
+    // consulted for uncertain placement and must not create a rename path.
     let rename = gate_rename(
         path,
         &metadata_json,
@@ -448,7 +464,8 @@ async fn classify_file(
         year,
         temporal: candidate.temporal,
         rename: rename.proposal,
-        // The Tier-2 sub-score that gated the rename (not the Tier-3 rerank).
+        // The deterministic semantic score that gated the rename, before any
+        // optional LLM reranking.
         classification_confidence: Some(best_score),
         rename_mismatch_score: rename.mismatch_score,
     }))
@@ -520,13 +537,13 @@ fn normalize_semantic_text(value: &str) -> String {
         .collect::<String>()
 }
 
-/// Tier 3: ask the LLM to classify the content, then re-embed its summary +
+/// Optional rerank: ask the LLM to classify the content, then re-embed its summary +
 /// category + tags as a richer query and re-rank the candidate list. Returns
 /// `(idx, score, gap, model_id)` for the new top, or `None` when the LLM
 /// produced no usable output.
 ///
-/// We deliberately ignore the LLM's `suggested_name` — rename proposals are
-/// extractive only, never LLM-fabricated (per the project's rename policy).
+/// We deliberately ignore the LLM's `suggested_name`: rename proposals use
+/// exact evidence or scored local concept retrieval, never LLM-authored text.
 async fn tier3_rerank(
     text_backend: &dyn TextBackend,
     embeddings: &dyn EmbeddingBackend,
@@ -572,11 +589,10 @@ async fn file_len(path: &Path) -> u64 {
     tokio::fs::metadata(path).await.map_or(0, |m| m.len())
 }
 
-/// Decide a file's modality from its extension + MIME. Used to pick which
-/// Tier 2 backend handles it. Mirrors the classification in
-/// `tidyup-extract` but produces the [`FileModality`] enum the inference
-/// crate exposes.
-fn file_modality(path: &Path, mime: Option<&str>) -> FileModality {
+/// Select a compatible semantic capability from the centralized MIME result.
+/// Unknown/application types use the general text/context path; no local
+/// extension table controls inference behavior.
+fn file_modality(mime: Option<&str>) -> FileModality {
     if let Some(m) = mime {
         if m.starts_with("image/") {
             return FileModality::Image;
@@ -591,53 +607,32 @@ fn file_modality(path: &Path, mime: Option<&str>) -> FileModality {
             return FileModality::Text;
         }
     }
-    let Some(ext) = path
-        .extension()
-        .and_then(|s| s.to_str())
-        .map(str::to_ascii_lowercase)
-    else {
-        return FileModality::Skip;
-    };
-    match ext.as_str() {
-        "jpg" | "jpeg" | "png" | "gif" | "bmp" | "tiff" | "tif" | "webp" | "ico" | "avif"
-        | "jxl" | "heic" | "heif" | "raw" | "cr2" | "cr3" | "nef" | "arw" | "orf" | "dng"
-        | "rw2" | "raf" => FileModality::Image,
-        "mp3" | "flac" | "m4a" | "wav" | "ogg" | "opus" | "aiff" | "aif" | "ape" | "wma"
-        | "alac" | "aac" | "mka" => FileModality::Audio,
-        "mp4" | "mov" | "mkv" | "avi" | "wmv" | "flv" | "webm" | "m4v" | "mpg" | "mpeg" => {
-            FileModality::Video
-        }
-        _ => FileModality::Text,
-    }
+    FileModality::Text
 }
 
-/// Image-modality Tier 2 — `SigLIP` cross-modal cosine against image taxonomy.
+/// Image-modality routing — `SigLIP` cross-modal cosine against image taxonomy.
 ///
 /// Returns `Ok(None)` when the image fails to read or the candidate list is
-/// empty. The caller falls back to the text Tier 2 path in that case.
+/// empty. The caller falls back to the general text path in that case.
 async fn classify_image(
     path: &Path,
     ctx: &ImageContext<'_>,
     mime: Option<&str>,
     extracted: Option<&tidyup_core::extractor::ExtractedContent>,
     config: &ClassifierConfig,
+    semantic_cache: &SemanticRunCache<'_>,
 ) -> Result<Option<ClassifiedFile>> {
     if ctx.candidates.is_empty() {
         return Ok(None);
     }
-    // Bound the read: an oversized image falls through to other semantic
-    // evidence rather than being slurped whole into memory for embedding.
-    if file_len(path).await > tidyup_extract::MAX_DOCUMENT_BYTES {
-        return Ok(None);
-    }
-    let Ok(bytes) = tokio::fs::read(path).await else {
-        return Ok(None);
-    };
     let mime_str = mime.unwrap_or("application/octet-stream");
-    let Ok(embedding) = ctx.backend.embed_image(&bytes, mime_str).await else {
+    let Ok(Some(embedding)) = semantic_cache
+        .image_embedding(path, mime_str, ctx.backend)
+        .await
+    else {
         return Ok(None);
     };
-    let (best_idx, best_score, gap) = best_match(&embedding, ctx.candidates);
+    let (best_idx, best_score, gap) = best_match(embedding.as_slice(), ctx.candidates);
     let Some(idx) = best_idx else {
         return Ok(None);
     };
@@ -646,27 +641,31 @@ async fn classify_image(
     };
     let needs_review = best_score < config.embedding_threshold || gap < config.ambiguity_gap;
     let year = year_from_path_and_text(path, extracted.and_then(|e| e.text.as_deref()));
+    let grounded =
+        gate_grounded_rename(path, embedding.as_slice(), ctx.concepts, best_score, config);
+    let concept_reasoning = grounded
+        .concepts
+        .iter()
+        .map(|concept| format!("{}:{:.3}", concept.label, concept.score))
+        .collect::<Vec<_>>()
+        .join(",");
     Ok(Some(ClassifiedFile {
         folder_path: candidate.folder_path.clone(),
         confidence: best_score,
         reasoning: format!(
-            "tier2 image: cos={best_score:.3} gap={gap:.3} model={}",
+            "tier2 image: cos={best_score:.3} gap={gap:.3} model={} concepts=[{concept_reasoning}]",
             ctx.backend.model_id(),
         ),
-        needs_review,
+        needs_review: needs_review || !matches!(grounded.proposal, RenameProposal::Keep),
         year,
         temporal: candidate.temporal,
-        // Image-side rename gating is intentionally not wired in v0.1 of
-        // Phase 7 — extractive renames for images come from the existing
-        // EXIF metadata path, which the text Tier 2 cascade already covers.
-        // Surfacing image filenames as-is keeps the cross-modal cut conservative.
-        rename: RenameProposal::Keep,
+        rename: grounded.proposal,
         classification_confidence: Some(best_score),
-        rename_mismatch_score: None,
+        rename_mismatch_score: grounded.mismatch_score,
     }))
 }
 
-/// Audio-modality Tier 2 — `CLAP` cross-modal cosine against audio taxonomy.
+/// Audio-modality routing — `CLAP` cross-modal cosine against audio taxonomy.
 async fn classify_audio(
     path: &Path,
     ctx: &AudioContext<'_>,
@@ -947,7 +946,7 @@ async fn build_bundle_proposal(
             original_path: m.clone(),
             proposed_path,
             proposed_name: name,
-            confidence: 0.90,
+            confidence,
             reasoning: bundle.reasoning.clone(),
             needs_review: false,
             status: ChangeStatus::Pending,
@@ -980,6 +979,7 @@ async fn build_content_bundle_proposal(
     text_backend: Option<&dyn TextBackend>,
     extractors: &[Arc<dyn ContentExtractor>],
     config: &ClassifierConfig,
+    semantic_cache: &SemanticRunCache<'_>,
 ) -> Result<BundleProposal> {
     let label = bundle.target_subdir.clone().unwrap_or_else(|| {
         bundle
@@ -1002,6 +1002,7 @@ async fn build_content_bundle_proposal(
             text_backend,
             extractors,
             config,
+            semantic_cache,
         )
         .await?
         .ok_or_else(|| anyhow::anyhow!("no classification for {}", member.display()))?;
@@ -1065,7 +1066,7 @@ async fn build_content_bundle_proposal(
     for proposal in &mut proposals {
         proposal.proposed_path = collection_root.join(&proposal.proposed_name);
     }
-    uniquify_bundle_member_names(&mut proposals);
+    uniquify_bundle_member_names(&mut proposals)?;
 
     let count = u16::try_from(proposals.len()).unwrap_or(u16::MAX);
     let member_confidence = if count == 0 {
@@ -1631,6 +1632,112 @@ mod tests {
         }
     }
 
+    struct GroundedImageBackend;
+
+    #[async_trait]
+    impl ImageEmbeddingBackend for GroundedImageBackend {
+        async fn embed_image(&self, _bytes: &[u8], _mime: &str) -> Result<Vec<f32>> {
+            Ok(vec![1.0, 0.0])
+        }
+
+        async fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
+            if text.contains("cat") {
+                Ok(vec![1.0, 0.0])
+            } else if text.contains("beach") {
+                Ok(vec![0.8, 0.2])
+            } else {
+                Ok(vec![0.0, 1.0])
+            }
+        }
+
+        async fn embed_texts(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            let mut vectors = Vec::with_capacity(texts.len());
+            for text in texts {
+                vectors.push(self.embed_text(text).await?);
+            }
+            Ok(vectors)
+        }
+
+        fn dimensions(&self) -> usize {
+            2
+        }
+
+        fn model_id(&self) -> &'static str {
+            "grounded-image"
+        }
+    }
+
+    #[tokio::test]
+    async fn non_textual_image_receives_grounded_semantic_rename() {
+        let temp = TempDir::new().unwrap();
+        let image_path = temp.path().join("image_2348985fg.png");
+        image::RgbImage::new(4, 4).save(&image_path).unwrap();
+        let backend = GroundedImageBackend;
+        let candidates = vec![ScanCandidate {
+            folder_path: "Photos/Pets/".to_string(),
+            description: "a photograph of a cat at a beach".to_string(),
+            temporal: true,
+            embedding: vec![1.0, 0.0],
+        }];
+        let concepts = vec![
+            GroundedConcept {
+                label: "cat".to_string(),
+                prompt: "a photograph of a cat".to_string(),
+                family: "animal".to_string(),
+                embedding: vec![1.0, 0.0],
+            },
+            GroundedConcept {
+                label: "beach".to_string(),
+                prompt: "a photograph of a beach".to_string(),
+                family: "scene".to_string(),
+                embedding: vec![0.8, 0.2],
+            },
+            GroundedConcept {
+                label: "office".to_string(),
+                prompt: "a photograph of an office".to_string(),
+                family: "place".to_string(),
+                embedding: vec![0.0, 1.0],
+            },
+        ];
+        let multimodal = MultimodalContext {
+            image: Some(ImageContext {
+                backend: &backend,
+                candidates: &candidates,
+                concepts: &concepts,
+            }),
+            audio: None,
+            artifact_store: None,
+        };
+        let config = ClassifierConfig {
+            embedding_threshold: 0.30,
+            ambiguity_gap: 0.01,
+            ..ClassifierConfig::default()
+        };
+        let outcome = run_scan(
+            temp.path(),
+            temp.path(),
+            &[],
+            &BucketEmbeddings,
+            &multimodal,
+            None,
+            &[],
+            &config,
+            &NullProgress,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.proposals.len(), 1);
+        let proposal = &outcome.proposals[0];
+        assert_eq!(proposal.change_type, ChangeType::RenameAndMove);
+        assert_eq!(proposal.proposed_name, "cat_on_beach.png");
+        assert!(
+            proposal.needs_review,
+            "semantic renames always require review"
+        );
+        assert!(proposal.reasoning.contains("cat:1.000"));
+    }
+
     #[tokio::test]
     async fn image_modality_routes_through_image_backend_when_present() {
         let td = TempDir::new().unwrap();
@@ -1649,10 +1756,12 @@ mod tests {
         let img_ctx = ImageContext {
             backend: &img_be,
             candidates: &candidates,
+            concepts: &[],
         };
         let multimodal = MultimodalContext {
             image: Some(img_ctx),
             audio: None,
+            artifact_store: None,
         };
 
         let eb = BucketEmbeddings;
@@ -1708,10 +1817,12 @@ mod tests {
         let img_ctx = ImageContext {
             backend: &img_be,
             candidates: &candidates,
+            concepts: &[],
         };
         let multimodal = MultimodalContext {
             image: Some(img_ctx),
             audio: None,
+            artifact_store: None,
         };
 
         let eb = BucketEmbeddings;
@@ -1743,14 +1854,14 @@ mod tests {
     }
 
     #[test]
-    fn file_modality_classifies_image_extension() {
-        let m = file_modality(Path::new("/tmp/photo.HEIC"), None);
-        assert!(matches!(m, FileModality::Image));
+    fn unknown_mime_uses_general_semantic_path() {
+        let m = file_modality(None);
+        assert!(matches!(m, FileModality::Text));
     }
 
     #[test]
     fn file_modality_classifies_audio_mime() {
-        let m = file_modality(Path::new("/tmp/clip"), Some("audio/mpeg"));
+        let m = file_modality(Some("audio/mpeg"));
         assert!(matches!(m, FileModality::Audio));
     }
 

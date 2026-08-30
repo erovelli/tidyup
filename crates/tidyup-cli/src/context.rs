@@ -16,8 +16,8 @@
 //! [`InferenceActivation`] captures the per-invocation gate. The CLI parses
 //! flags + env vars and builds it before calling [`build`]. With the default
 //! activation (`llm_fallback: false`, `remote: false`) the context's
-//! [`text`](tidyup_app::ServiceContext::text) field is `None` and Tier 3 is
-//! never invoked — same shape as the default build with neither feature
+//! [`text`](tidyup_app::ServiceContext::text) field is `None` and optional
+//! reranking is never invoked — the same shape as a build with neither feature
 //! compiled in.
 
 use std::sync::Arc;
@@ -37,7 +37,7 @@ use tidyup_storage_sqlite::SqliteStore;
 /// Constructed in `commands::dispatch` from CLI flags + environment + config.
 /// Only the cargo features compiled in can produce `true` values; with no
 /// features the struct is always all-false and the loader treats the
-/// activation as a no-op (Tier 3 stays off).
+/// activation as a no-op (optional reranking stays off).
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct InferenceActivation {
     /// Triple-gated activation for the local LLM fallback (mistralrs).
@@ -56,7 +56,7 @@ pub(crate) struct InferenceActivation {
 ///
 /// `activation` carries the triple-gated per-invocation flags. When both
 /// fields are `false` (the default), the [`ServiceContext::text`] field is
-/// `None` and Tier 3 is never invoked — same shape as the default build with
+/// `None` and optional reranking is never invoked — the same shape as the default build with
 /// neither LLM nor remote features compiled in. When activation requests a
 /// backend the corresponding feature wasn't compiled in, the loader fails
 /// fast with a rebuild hint.
@@ -89,24 +89,35 @@ pub(crate) async fn build(
             .unwrap_or_else(|_| Arc::new(NullEmbeddings))
     };
 
-    // Phase 7: optional image/audio backends. Each is loaded only if its
+    // Optional image/audio backends. Each is loaded only if its
     // bundle is present on disk — missing artifacts are NOT an error since
     // the default install path ships text-only. The pipeline gracefully
     // falls back when a backend is absent.
     let image_embeddings = try_load_siglip();
     let audio_embeddings = try_load_clap();
 
-    // Tier 3 text backend. Loaded sequentially after the embedding model per
+    // Optional reranking text backend. Loaded sequentially after the embedding model per
     // operational rule in CLAUDE.md (concurrent model loads OOM on 8GB hosts).
     let text = build_text_backend(config, activation).await?;
 
     let extractors = default_extractors(config);
 
     // Materialise the classifier config from the loaded TidyupConfig: rename
-    // thresholds from `[rename]`, and Tier-3 activation tied to whether a text
+    // thresholds from `[rename]`, and reranker activation tied to whether a text
     // backend was wired (the three-gate model produces `Some` only under full
     // activation).
     let classifier = tidyup_app::classifier_config_for(config, text.is_some());
+    let capabilities = tidyup_app::capability_manifest_for(tidyup_app::CapabilityManifestInput {
+        embeddings: embeddings.as_ref(),
+        image_embeddings: image_embeddings.as_deref(),
+        audio_embeddings: audio_embeddings.as_deref(),
+        text: text.as_deref(),
+        vision: None,
+        extractors: &extractors,
+        ocr_enabled: config.extraction.ocr_enabled,
+        ocr_available: tidyup_extract::macos_vision_ocr_available(),
+        text_requires_network: activation.remote,
+    });
 
     Ok(Arc::new(ServiceContext {
         file_index: Arc::new(store.clone()),
@@ -119,11 +130,12 @@ pub(crate) async fn build(
         image_embeddings,
         audio_embeddings,
         extractors,
+        capabilities,
         classifier,
     }))
 }
 
-/// Build the optional Tier 3 [`TextBackend`] from the per-invocation
+/// Build the optional reranking [`TextBackend`] from the per-invocation
 /// activation + config.
 ///
 /// Precedence: `--remote` wins over `--llm-fallback` if both fire (a remote
@@ -148,14 +160,14 @@ async fn build_llm_backend(config: &TidyupConfig) -> Result<Arc<dyn TextBackend>
     if !config.inference.llm_fallback {
         return Err(anyhow!(
             "--llm-fallback flag set but [inference] llm_fallback is false in config; \
-             the privacy model requires both to enable Tier 3 LLM fallback"
+             the privacy model requires both to enable optional LLM reranking"
         ));
     }
     let model_id = "Qwen/Qwen3-0.6B";
-    tracing::info!(model_id, "loading mistralrs text backend (Tier 3)");
+    tracing::info!(model_id, "loading optional mistralrs reranker");
     let engine = tidyup_inference_mistralrs::MistralRsEngine::load(model_id)
         .await
-        .context("loading mistralrs Tier 3 backend")?;
+        .context("loading optional mistralrs reranker")?;
     let backend: Arc<dyn TextBackend> = engine;
     Ok(backend)
 }
@@ -189,7 +201,7 @@ fn build_remote_backend(config: &TidyupConfig) -> Result<Arc<dyn TextBackend>> {
         api_key: api_key.into(),
         model: remote_cfg.model.clone(),
     };
-    tracing::info!(model = %remote_cfg.model, "loading remote text backend (Tier 3)");
+    tracing::info!(model = %remote_cfg.model, "loading optional remote reranker");
     let backend = RemoteText::new(endpoint).context("constructing remote text backend")?;
     Ok(Arc::new(backend))
 }
@@ -204,19 +216,19 @@ fn build_remote_backend(_config: &TidyupConfig) -> Result<Arc<dyn TextBackend>> 
 
 /// Best-effort load of the `SigLIP` image encoder. Returns `None` when the
 /// bundle is missing or fails to load — the caller surfaces the absence as
-/// a soft fallback to text-tier classification, not an error.
+/// a soft fallback to general text classification, not an error.
 fn try_load_siglip() -> Option<Arc<dyn ImageEmbeddingBackend>> {
     if verify_siglip_model().is_err() {
-        tracing::debug!("SigLIP bundle not present; image-modality Tier 2 disabled");
+        tracing::debug!("SigLIP bundle not present; visual semantic routing disabled");
         return None;
     }
     match SigLipEmbeddings::load_default() {
         Ok(b) => {
-            tracing::info!("SigLIP image encoder loaded — image-modality Tier 2 enabled");
+            tracing::info!("SigLIP image encoder loaded — visual semantic routing enabled");
             Some(Arc::new(b))
         }
         Err(e) => {
-            tracing::warn!(error = %e, "SigLIP load failed; falling back to text Tier 2");
+            tracing::warn!(error = %e, "SigLIP load failed; falling back to general text routing");
             None
         }
     }
@@ -226,16 +238,16 @@ fn try_load_siglip() -> Option<Arc<dyn ImageEmbeddingBackend>> {
 /// [`try_load_siglip`].
 fn try_load_clap() -> Option<Arc<dyn AudioEmbeddingBackend>> {
     if verify_clap_model().is_err() {
-        tracing::debug!("CLAP bundle not present; audio-modality Tier 2 disabled");
+        tracing::debug!("CLAP bundle not present; audio semantic routing disabled");
         return None;
     }
     match ClapEmbeddings::load_default() {
         Ok(b) => {
-            tracing::info!("CLAP audio encoder loaded — audio-modality Tier 2 enabled");
+            tracing::info!("CLAP audio encoder loaded — audio semantic routing enabled");
             Some(Arc::new(b))
         }
         Err(e) => {
-            tracing::warn!(error = %e, "CLAP load failed; falling back to text Tier 2");
+            tracing::warn!(error = %e, "CLAP load failed; falling back to general text routing");
             None
         }
     }
@@ -426,7 +438,7 @@ mod tests {
     use super::*;
 
     /// The privacy-preserving default: no activation → no text backend, so
-    /// Tier 3 is never invoked.
+    /// Optional LLM reranking is never invoked.
     #[tokio::test]
     async fn no_activation_yields_no_text_backend() {
         let cfg = TidyupConfig::default();

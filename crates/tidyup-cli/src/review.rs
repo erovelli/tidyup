@@ -1,8 +1,9 @@
 //! CLI [`ReviewHandler`](tidyup_core::frontend::ReviewHandler) impls:
-//! - [`AutoApproveHandler`] — used under `--yes`; approve if confidence clears
-//!   the threshold, otherwise reject. Bundle review (`review_bundles`) is never
-//!   invoked under `--yes`: the service applies the threshold directly, so this
-//!   handler relies on the trait's default (approve nothing) for bundles.
+//! - [`AutoApproveHandler`] — used under `--yes`; approve loose proposals if
+//!   confidence clears the threshold, otherwise reject. Bundle review
+//!   (`review_bundles`) is never invoked under `--yes`: the service applies the
+//!   threshold only to eligible opaque structural bundles, so this handler
+//!   relies on the trait's default (approve nothing) for bundles.
 //! - [`InteractiveHandler`] — prompt-per-proposal via `console`. For each
 //!   proposal, print a diff-like summary and read a single keystroke:
 //!   `a` approve, `A` approve all remaining, `r` reject, `q` reject all
@@ -13,7 +14,7 @@
 //!   → "Don't auto-apply rename proposals"). Bulk approve (`A`) approves the
 //!   item on screen (which may be a rename you're looking at — that's an
 //!   explicit keystroke on a surfaced proposal) and then auto-approves the
-//!   remaining **moves**; every subsequent rename still gets its own explicit
+//!   remaining **move proposals**; every subsequent rename still gets its own explicit
 //!   prompt, so a rename is never approved without being seen. If there is no
 //!   TTY (piped/redirected/CI), the handler errors up front pointing at
 //!   `--yes`, rather than spinning on a stream that never yields a keystroke.
@@ -96,7 +97,8 @@ fn ensure_attended(stdin_tty: bool, stdout_tty: bool) -> Result<()> {
     Err(anyhow::anyhow!(
         "interactive review needs a terminal, but stdin/stdout is not a TTY \
          (piped, redirected, or non-interactive). Re-run in a terminal, or pass \
-         --yes to auto-approve moves above the confidence threshold (renames are \
+         --yes to auto-approve eligible opaque structural bundles and loose moves \
+         above the confidence threshold (soft/file-set bundles and renames are \
          never auto-applied)."
     ))
 }
@@ -274,8 +276,8 @@ fn prompt_each_bundle(bundles: Vec<BundleProposal>) -> Result<Vec<BundleProposal
         if reject_rest {
             continue;
         }
-        // Bulk-approve covers move-only bundles. A semantic collection with a
-        // member rename still surfaces for an explicit keystroke.
+        // Interactive bulk approval is still an explicit user action. Bundles
+        // with member renames remain individually surfaced for review.
         if approve_rest && !bundle_has_renames(&b) {
             approved.push(b);
             continue;
@@ -297,7 +299,7 @@ fn prompt_each_bundle(bundles: Vec<BundleProposal>) -> Result<Vec<BundleProposal
                     approved.push(b.clone());
                     approve_rest = true;
                     let _ = term.write_line(
-                        &style(" → approving all remaining move-only bundles")
+                        &style(" → approving all remaining eligible bundles")
                             .green()
                             .to_string(),
                     );

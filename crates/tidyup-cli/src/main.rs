@@ -35,8 +35,10 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
 
-    /// Suppress interactive prompts; auto-approve anything above the internal
-    /// confidence threshold. Renames never auto-apply, even under `--yes`.
+    /// Suppress interactive prompts; auto-approve loose move-only proposals
+    /// above `[classifier] min_confidence` and recognized opaque structural
+    /// bundles above the application's separate threshold. Soft/file-set and
+    /// generic bundles remain review-only, as do all renames.
     #[arg(long, global = true)]
     yes: bool,
 
@@ -44,26 +46,23 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
-    /// Activate the local LLM Tier 3 fallback (mistralrs).
+    /// Activate the optional local LLM reranker (mistralrs).
     ///
     /// Power-user opt-in. Triple-gated: requires `--features llm-fallback`
     /// at build time, `[inference] llm_fallback = true` in config, and this
     /// flag (or `TIDYUP_LLM_FALLBACK=1`) at invocation. Default builds and
     /// default invocations remain LLM-silent.
     ///
-    /// The `TIDYUP_LLM_FALLBACK` env var is read in `commands::dispatch` with a
-    /// boolish parser (`1`/`true`/`yes`/`on`) rather than via clap's `env`, so
-    /// the documented `TIDYUP_LLM_FALLBACK=1` works and a global flag with an
-    /// optional value can't swallow a following positional argument.
+    /// The env var accepts `1`, `true`, `yes`, or `on` (case-insensitive).
     #[arg(long, global = true)]
     llm_fallback: bool,
 
-    /// Activate the remote Tier 3 backend (`OpenAI`-compatible endpoint).
+    /// Activate the optional remote reranker (`OpenAI`-compatible endpoint).
     ///
     /// Power-user opt-in. Triple-gated: requires `--features remote` at
     /// build time, an `[inference.remote]` section in config, and this flag
-    /// (or `TIDYUP_REMOTE=1`) at invocation. The env var is parsed boolishly
-    /// in `commands::dispatch` (see `--llm-fallback`). Only the OpenAI-compatible
+    /// (or `TIDYUP_REMOTE=1`) at invocation. The env var accepts the same
+    /// boolish values as `TIDYUP_LLM_FALLBACK`. Only the OpenAI-compatible
     /// endpoint is selectable from config today; Anthropic/Ollama adapters exist
     /// in `tidyup-inference-remote` but aren't yet wired.
     #[arg(long, global = true)]
@@ -112,11 +111,11 @@ enum Command {
         #[arg(long)]
         list: bool,
     },
-    /// Prune shelved backups older than the retention window.
+    /// Prune shelved backups and semantic cache entries past the retention window.
     ///
-    /// Expires (and removes from the shelf) backups past their TTL. Defaults to
-    /// `[storage] backup_retention_days` (30 unless configured). Once pruned, a
-    /// run can no longer be rolled back.
+    /// Expires backups and removes reconstructible semantic artifacts past the
+    /// TTL. Defaults to `[storage] backup_retention_days` (30 unless configured).
+    /// Once a backup is pruned, its run can no longer be rolled back.
     Prune {
         /// Override the retention window, in days.
         #[arg(long)]

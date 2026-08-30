@@ -37,8 +37,8 @@ const CLASSIFY_TEMPERATURE: f32 = 0.1;
 /// Give up establishing a TCP/TLS connection after this long.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Give up on a whole request/response after this long, so a stalled server
-/// can never hang classification indefinitely (Tier 3 then falls back to the
-/// Tier-2 verdict).
+/// can never hang classification indefinitely (failure leaves the deterministic
+/// embedding verdict in place).
 const REQUEST_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Redacting wrapper for an API key.

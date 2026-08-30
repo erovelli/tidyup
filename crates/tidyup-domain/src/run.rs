@@ -20,6 +20,113 @@ use uuid::Uuid;
 
 use crate::change::ParseError;
 
+/// Semantic or extraction capability recorded with a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CapabilityKind {
+    TextEmbedding,
+    ImageEmbedding,
+    AudioEmbedding,
+    GenerativeText,
+    VisionCaptioning,
+    ContentExtractor,
+    Ocr,
+    /// Capability introduced by a newer writer and not understood by this
+    /// binary. Retained so diagnostic provenance never blocks run recovery.
+    #[serde(other)]
+    Unknown,
+}
+
+impl CapabilityKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TextEmbedding => "text-embedding",
+            Self::ImageEmbedding => "image-embedding",
+            Self::AudioEmbedding => "audio-embedding",
+            Self::GenerativeText => "generative-text",
+            Self::VisionCaptioning => "vision-captioning",
+            Self::ContentExtractor => "content-extractor",
+            Self::Ocr => "ocr",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Whether a capability could participate in this run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CapabilityStatus {
+    Available,
+    Unavailable,
+    Disabled,
+}
+
+impl CapabilityStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::Unavailable => "unavailable",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
+/// One inspectable runtime capability.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityEntry {
+    pub kind: CapabilityKind,
+    pub status: CapabilityStatus,
+    pub implementation: String,
+    pub model_id: Option<String>,
+    pub dimensions: Option<usize>,
+    pub requires_network: bool,
+    pub detail: Option<String>,
+}
+
+/// Versioned manifest of the semantic facilities available to a run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityManifest {
+    pub schema_version: u32,
+    pub entries: Vec<CapabilityEntry>,
+}
+
+impl Default for CapabilityManifest {
+    fn default() -> Self {
+        Self {
+            schema_version: 1,
+            entries: Vec::new(),
+        }
+    }
+}
+
+impl CapabilityManifest {
+    /// Compact user-facing summary of primary semantic channels.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let primary = [
+            CapabilityKind::TextEmbedding,
+            CapabilityKind::ImageEmbedding,
+            CapabilityKind::AudioEmbedding,
+            CapabilityKind::GenerativeText,
+            CapabilityKind::Ocr,
+        ];
+        primary
+            .iter()
+            .filter_map(|kind| {
+                self.entries
+                    .iter()
+                    .find(|entry| entry.kind == *kind)
+                    .map(|entry| {
+                        let identity = entry
+                            .model_id
+                            .as_deref()
+                            .unwrap_or(entry.implementation.as_str());
+                        format!("{}={} ({})", kind.as_str(), identity, entry.status.as_str())
+                    })
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 /// Which service produced this run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RunMode {
@@ -89,6 +196,9 @@ pub struct RunRecord {
     pub started_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
     pub state: RunState,
+    /// Exact semantic/extraction capabilities available when this run began.
+    #[serde(default)]
+    pub capabilities: CapabilityManifest,
 }
 
 impl RunRecord {
@@ -104,7 +214,15 @@ impl RunRecord {
             started_at: Utc::now(),
             completed_at: None,
             state: RunState::InProgress,
+            capabilities: CapabilityManifest::default(),
         }
+    }
+
+    /// Attach the runtime capability manifest captured before work starts.
+    #[must_use]
+    pub fn with_capabilities(mut self, capabilities: CapabilityManifest) -> Self {
+        self.capabilities = capabilities;
+        self
     }
 }
 

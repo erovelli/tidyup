@@ -30,7 +30,7 @@ use tidyup_domain::Calibration;
 use tidyup_embeddings_ort::{verify_default_model, EmbeddingClassifier, OrtEmbeddings};
 use tidyup_pipeline::calibration::{expected_calibration_error, fit_platt};
 
-/// The cascade tier that produced a prediction.
+/// The resolver that produced a prediction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum Tier {
@@ -43,7 +43,7 @@ enum Tier {
 struct CorpusEntry {
     /// Path to the fixture, relative to the corpus directory.
     file: String,
-    /// Taxonomy leaf the cascade is expected to route the file to.
+    /// Taxonomy leaf the semantic resolver is expected to route the file to.
     expected: String,
 }
 
@@ -58,10 +58,10 @@ struct Manifest {
 #[derive(Debug, Clone)]
 struct Outcome {
     expected: String,
-    /// `None` when no evaluated tier produced a prediction (unresolved).
+    /// `None` when no evaluated resolver produced a prediction (unresolved).
     predicted: Option<String>,
     tier: Tier,
-    /// Raw confidence the producing tier assigned (`None` when unresolved).
+    /// Raw confidence the resolver assigned (`None` when unresolved).
     /// Feeds `--calibrate`.
     confidence: Option<f32>,
 }
@@ -134,7 +134,7 @@ struct Report {
 /// Entry point for `cargo xtask eval`.
 ///
 /// `json` switches to machine-readable output. `no_model` forces the
-/// embedding tier off even when the bundle is present (useful for fast,
+/// embedding resolver off even when the bundle is present (useful for fast,
 /// deterministic, model-free runs).
 ///
 /// # Errors

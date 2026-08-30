@@ -69,6 +69,8 @@ pub(crate) struct SignalBundle {
     pub(crate) progress_current: SyncSignal<u64>,
     pub(crate) progress_total: SyncSignal<Option<u64>>,
     pub(crate) progress_label: SyncSignal<String>,
+    /// Successful identity records from the current source indexing pass.
+    pub(crate) indexed_count: SyncSignal<u64>,
     pub(crate) messages: SyncSignal<Vec<LogMessage>>,
     pub(crate) proposals: SyncSignal<Vec<ChangeProposal>>,
     pub(crate) bundles: SyncSignal<Vec<BundleProposal>>,
@@ -83,7 +85,7 @@ pub(crate) struct SignalBundle {
     pub(crate) runs: SyncSignal<Vec<RunRecord>>,
     pub(crate) error: SyncSignal<Option<String>>,
     pub(crate) model_ready: SyncSignal<Option<bool>>,
-    /// Per-invocation Tier 3 (LLM fallback) activation — the third privacy gate,
+    /// Per-invocation optional LLM-reranker activation — the third privacy gate,
     /// toggled from Settings or explicitly requested at process launch through
     /// `TIDYUP_LLM_FALLBACK`. It can become true only when the feature is
     /// compiled and `[inference] llm_fallback = true`.
@@ -146,6 +148,7 @@ impl SharedState {
             progress_current: Signal::new_maybe_sync_in_scope(0_u64, ScopeId::ROOT),
             progress_total: Signal::new_maybe_sync_in_scope(None, ScopeId::ROOT),
             progress_label: Signal::new_maybe_sync_in_scope(String::new(), ScopeId::ROOT),
+            indexed_count: Signal::new_maybe_sync_in_scope(0_u64, ScopeId::ROOT),
             messages: Signal::new_maybe_sync_in_scope(Vec::new(), ScopeId::ROOT),
             proposals: Signal::new_maybe_sync_in_scope(Vec::new(), ScopeId::ROOT),
             bundles: Signal::new_maybe_sync_in_scope(Vec::new(), ScopeId::ROOT),

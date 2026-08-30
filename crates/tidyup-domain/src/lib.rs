@@ -18,13 +18,19 @@ pub mod run;
 pub use backup::{BackupRecord, BackupStatus, RestorePrecheck};
 pub use bundle::{BundleError, BundleKind, BundleProposal};
 pub use change::{ChangeProposal, ChangeStatus, ChangeType, ParseError};
-pub use file::{ContentHash, FileId, IndexedFile};
+pub use file::{
+    ContentHash, FileId, FileProcessingRecord, FileProcessingRole, FileProcessingStage,
+    FileProcessingState, IndexedFile, SemanticArtifact,
+};
 pub use migration::{
     Calibration, Candidate, ClassificationResult, ClassifierConfig, DatePattern, FolderMetadata,
     FolderNode, FolderProfile, OrganizationType, ProfileCache, RenameConfig, ScanDiff,
     ScoreBreakdown, ScoreWeights, TargetScan, Tier,
 };
-pub use run::{RunMode, RunRecord, RunState};
+pub use run::{
+    CapabilityEntry, CapabilityKind, CapabilityManifest, CapabilityStatus, RunMode, RunRecord,
+    RunState,
+};
 
 /// Phases emitted to frontends during a run. Drives the single progress contract
 /// shared between CLI (`indicatif`) and UI (Dioxus signals).

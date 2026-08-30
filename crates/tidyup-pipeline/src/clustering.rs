@@ -23,15 +23,17 @@
 //!
 //! [`scanner`]: crate::scanner
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::NaiveDateTime;
 use tidyup_core::extractor::{ContentExtractor, ExtractedContent};
+use tidyup_core::inference::ImageEmbeddingBackend;
 use tidyup_domain::bundle::BundleKind;
 
 use crate::scanner::DetectedBundle;
+use crate::semantic::{cosine, rank_concepts, GroundedConcept, SemanticRunCache};
 
 /// Tunables for content clustering. Thresholds are deliberately conservative —
 /// a misfired cluster is more annoying than a few un-grouped files, since the
@@ -46,6 +48,15 @@ pub struct ClusterConfig {
     pub min_album: usize,
     /// Minimum files in a filename family to count as a document series.
     pub min_series: usize,
+    /// Minimum visually similar loose siblings in a semantic collection.
+    pub min_semantic_cluster: usize,
+    /// Complete-link cosine floor for every pair in a visual collection.
+    pub semantic_similarity_threshold: f32,
+    /// Minimum raw concept score used to ground a visual collection label.
+    pub semantic_label_confidence: f32,
+    /// Deterministic per-directory cap for the quadratic complete-link pass.
+    /// Files beyond the cap stay loose and remain individually classifiable.
+    pub max_semantic_candidates: usize,
 }
 
 impl Default for ClusterConfig {
@@ -55,8 +66,21 @@ impl Default for ClusterConfig {
             burst_window_secs: 60,
             min_album: 3,
             min_series: 3,
+            min_semantic_cluster: 3,
+            semantic_similarity_threshold: 0.88,
+            semantic_label_confidence: 0.30,
+            max_semantic_candidates: 512,
         }
     }
+}
+
+/// Optional modality semantics for generalized content clustering.
+#[derive(Clone, Copy)]
+#[allow(missing_debug_implementations)]
+pub struct SemanticClusterContext<'a> {
+    pub image: Option<&'a dyn ImageEmbeddingBackend>,
+    pub image_concepts: &'a [GroundedConcept],
+    pub cache: &'a SemanticRunCache<'a>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,24 +90,14 @@ enum Modality {
     Other,
 }
 
-const IMAGE_EXTS: &[&str] = &[
-    "jpg", "jpeg", "png", "gif", "bmp", "tiff", "tif", "webp", "heic", "heif", "raw", "cr2", "cr3",
-    "nef", "arw", "dng", "orf", "rw2", "raf",
-];
-const AUDIO_EXTS: &[&str] = &[
-    "mp3", "flac", "m4a", "wav", "ogg", "opus", "aiff", "aif", "ape", "wma", "alac", "aac",
-];
+// This list protects opaque 3D assemblies as bundles; it never chooses a
+// destination or semantic label. Capability dispatch below uses MIME/content.
 const MODEL_EXTS: &[&str] = &["stl", "obj", "3mf", "step", "stp", "fbx"];
 
-fn modality(path: &Path) -> Modality {
-    let ext = path
-        .extension()
-        .and_then(|s| s.to_str())
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_default();
-    if IMAGE_EXTS.contains(&ext.as_str()) {
+fn modality_from_mime(mime: Option<&str>) -> Modality {
+    if mime.is_some_and(|value| value.starts_with("image/")) {
         Modality::Image
-    } else if AUDIO_EXTS.contains(&ext.as_str()) {
+    } else if mime.is_some_and(|value| value.starts_with("audio/")) {
         Modality::Audio
     } else {
         Modality::Other
@@ -99,6 +113,28 @@ pub async fn cluster_loose(
     extractors: &[Arc<dyn ContentExtractor>],
     config: &ClusterConfig,
 ) -> (Vec<DetectedBundle>, Vec<PathBuf>) {
+    let cache = SemanticRunCache::default();
+    cluster_loose_semantic(
+        loose,
+        extractors,
+        config,
+        SemanticClusterContext {
+            image: None,
+            image_concepts: &[],
+            cache: &cache,
+        },
+    )
+    .await
+}
+
+/// Cluster loose files with optional semantic embeddings. The caller-owned
+/// cache is reused later by placement and naming.
+pub async fn cluster_loose_semantic(
+    loose: &[PathBuf],
+    extractors: &[Arc<dyn ContentExtractor>],
+    config: &ClusterConfig,
+    semantic: SemanticClusterContext<'_>,
+) -> (Vec<DetectedBundle>, Vec<PathBuf>) {
     // Group inputs by parent directory (BTreeMap for deterministic order).
     let mut by_dir: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
     for path in loose {
@@ -109,7 +145,8 @@ pub async fn cluster_loose(
     let mut bundles = Vec::new();
     let mut leftovers = Vec::new();
     for (dir, files) in by_dir {
-        let (dir_bundles, dir_leftover) = cluster_dir(&dir, &files, extractors, config).await;
+        let (dir_bundles, dir_leftover) =
+            cluster_dir(&dir, &files, extractors, config, semantic).await;
         bundles.extend(dir_bundles);
         leftovers.extend(dir_leftover);
     }
@@ -121,26 +158,39 @@ async fn cluster_dir(
     files: &[PathBuf],
     extractors: &[Arc<dyn ContentExtractor>],
     config: &ClusterConfig,
+    semantic: SemanticClusterContext<'_>,
 ) -> (Vec<DetectedBundle>, Vec<PathBuf>) {
     // High-precision semantic collections run before modality-specific passes:
     // a shared rare entity stem is meaningful across extensions (for example
     // `atomsnotelectrons_submission.txt` + `atomsnotelectrons_testbench.png`).
     // OCR-similar generic screenshots can then attach to that anchored set.
-    let (mut bundles, semantic_left) = cluster_semantic_collections(dir, files, extractors).await;
-
+    let (mut bundles, semantic_left) =
+        cluster_semantic_collections(dir, files, extractors, semantic.cache).await;
+    let mut modalities = HashMap::with_capacity(semantic_left.len());
+    for path in &semantic_left {
+        let mime = tidyup_extract::mime::detect(path).await;
+        modalities.insert(path.clone(), modality_from_mime(mime.as_deref()));
+    }
     let mut images = Vec::new();
     let mut audio = Vec::new();
     let mut others = Vec::new();
     for f in &semantic_left {
-        match modality(f) {
+        match modalities.get(f).copied().unwrap_or(Modality::Other) {
             Modality::Image => images.push(f.clone()),
             Modality::Audio => audio.push(f.clone()),
             Modality::Other => others.push(f.clone()),
         }
     }
 
+    // Explicit capture-time metadata outranks visual similarity. A real burst
+    // remains a PhotoBurst (and therefore preserves member names) even when a
+    // loaded image encoder would also find its frames visually cohesive.
     let (burst_bundles, burst_left) = cluster_photo_bursts(dir, &images, extractors, config).await;
     bundles.extend(burst_bundles);
+
+    let (visual_bundles, visual_left) =
+        cluster_visual_neighbors(dir, &burst_left, config, semantic, &modalities).await;
+    bundles.extend(visual_bundles);
 
     let (album_bundles, album_left) = cluster_music_albums(dir, &audio, extractors, config).await;
     bundles.extend(album_bundles);
@@ -153,7 +203,7 @@ async fn cluster_dir(
     // they fall through for individual semantic classification.
     let (series_bundles, mut leftover) = cluster_document_series(dir, &others, config);
     bundles.extend(series_bundles);
-    leftover.extend(burst_left);
+    leftover.extend(visual_left);
     leftover.extend(album_left);
 
     (bundles, leftover)
@@ -167,6 +217,7 @@ async fn cluster_semantic_collections(
     dir: &Path,
     files: &[PathBuf],
     extractors: &[Arc<dyn ContentExtractor>],
+    cache: &SemanticRunCache<'_>,
 ) -> (Vec<DetectedBundle>, Vec<PathBuf>) {
     // Directory cohesion outranks repeated stems inside an assembly. A CAD
     // directory commonly contains the same part in multiple formats
@@ -184,7 +235,8 @@ async fn cluster_semantic_collections(
     // so G groups and S screenshots cost S extractions rather than G * S.
     let mut screenshot_evidence = Vec::new();
     for path in files.iter().filter(|path| is_generic_screenshot(path)) {
-        let Some(content) = extract(path, extractors).await else {
+        let mime = tidyup_extract::mime::detect(path).await;
+        let Some(content) = cache.extract(path, mime.as_deref(), extractors).await else {
             continue;
         };
         let Some(text) = content.text else {
@@ -209,7 +261,8 @@ async fn cluster_semantic_collections(
         // locally recognised text overlaps the group's image/text evidence.
         let mut evidence_tokens = HashSet::new();
         for member in &members {
-            if let Some(content) = extract(member, extractors).await {
+            let mime = tidyup_extract::mime::detect(member).await;
+            if let Some(content) = cache.extract(member, mime.as_deref(), extractors).await {
                 if let Some(text) = content.text {
                     evidence_tokens.extend(semantic_tokens(&text));
                 }
@@ -277,6 +330,207 @@ async fn cluster_semantic_collections(
         .cloned()
         .collect();
     (bundles, leftovers)
+}
+
+// ---------------------------------------------------------------------------
+// General visual-neighbor collections
+// ---------------------------------------------------------------------------
+
+async fn cluster_visual_neighbors(
+    dir: &Path,
+    files: &[PathBuf],
+    config: &ClusterConfig,
+    semantic: SemanticClusterContext<'_>,
+    modalities: &HashMap<PathBuf, Modality>,
+) -> (Vec<DetectedBundle>, Vec<PathBuf>) {
+    let Some(backend) = semantic.image else {
+        return (Vec::new(), files.to_vec());
+    };
+    if semantic.image_concepts.is_empty() {
+        return (Vec::new(), files.to_vec());
+    }
+
+    let (image_paths, candidate_count) =
+        bounded_visual_candidates(files, modalities, config.max_semantic_candidates);
+    if candidate_count > image_paths.len() {
+        tracing::debug!(
+            directory = %dir.display(),
+            candidates = candidate_count,
+            cap = config.max_semantic_candidates,
+            "visual collection discovery capped; remaining files stay loose"
+        );
+    }
+
+    let mut embedded = Vec::new();
+    for path in &image_paths {
+        let mime = tidyup_extract::mime::detect(path)
+            .await
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        match semantic.cache.image_embedding(path, &mime, backend).await {
+            Ok(Some(embedding)) => embedded.push((path.clone(), embedding)),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "semantic image clustering skipped file");
+            }
+        }
+    }
+    embedded.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+    // Deterministic complete-link grouping. A candidate joins only when it is
+    // close to every member, avoiding single-link chains through ambiguous
+    // bridge images.
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for candidate in 0..embedded.len() {
+        let destination = groups.iter().position(|group| {
+            let Some(candidate_embedding) = embedded.get(candidate) else {
+                return false;
+            };
+            group.iter().all(|member| {
+                embedded.get(*member).is_some_and(|member_embedding| {
+                    cosine(
+                        candidate_embedding.1.as_slice(),
+                        member_embedding.1.as_slice(),
+                    ) >= config.semantic_similarity_threshold
+                })
+            })
+        });
+        if let Some(index) = destination {
+            if let Some(group) = groups.get_mut(index) {
+                group.push(candidate);
+            }
+        } else {
+            groups.push(vec![candidate]);
+        }
+    }
+
+    let mut consumed = HashSet::new();
+    let mut bundles = Vec::new();
+    for group in groups
+        .into_iter()
+        .filter(|group| group.len() >= config.min_semantic_cluster)
+    {
+        let centroid = mean_embedding(
+            group
+                .iter()
+                .filter_map(|index| embedded.get(*index).map(|item| item.1.as_slice())),
+        );
+        let ranked = rank_concepts(&centroid, semantic.image_concepts);
+        let Some((label, evidence)) = grounded_collection_label(&ranked, config) else {
+            continue;
+        };
+        let members: Vec<PathBuf> = group
+            .iter()
+            .filter_map(|index| embedded.get(*index).map(|item| item.0.clone()))
+            .collect();
+        let min_similarity = minimum_pair_similarity(&group, &embedded);
+        consumed.extend(members.iter().cloned());
+        bundles.push(make_bundle(
+            dir,
+            BundleKind::SemanticCollection {
+                label: label.clone(),
+            },
+            members,
+            &label,
+            format!(
+                "visually coherent collection; complete-link minimum cosine={min_similarity:.3}; grounded concepts={evidence}"
+            ),
+        ));
+    }
+
+    let leftovers = files
+        .iter()
+        .filter(|path| !consumed.contains(*path))
+        .cloned()
+        .collect();
+    (bundles, leftovers)
+}
+
+fn bounded_visual_candidates(
+    files: &[PathBuf],
+    modalities: &HashMap<PathBuf, Modality>,
+    cap: usize,
+) -> (Vec<PathBuf>, usize) {
+    let mut candidates = files
+        .iter()
+        .filter(|path| {
+            modalities
+                .get(*path)
+                .is_some_and(|modality| *modality == Modality::Image)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    candidates.sort();
+    let count = candidates.len();
+    candidates.truncate(cap);
+    (candidates, count)
+}
+
+fn mean_embedding<'a>(vectors: impl Iterator<Item = &'a [f32]>) -> Vec<f32> {
+    let vectors: Vec<&[f32]> = vectors.collect();
+    let Some(first) = vectors.first() else {
+        return Vec::new();
+    };
+    let mut mean = vec![0.0_f32; first.len()];
+    for vector in &vectors {
+        if vector.len() != mean.len() {
+            return Vec::new();
+        }
+        for (sum, value) in mean.iter_mut().zip(*vector) {
+            *sum += *value;
+        }
+    }
+    let denominator = u16::try_from(vectors.len()).map_or(1.0, f32::from);
+    for value in &mut mean {
+        *value /= denominator;
+    }
+    let norm = mean.iter().map(|value| value * value).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for value in &mut mean {
+            *value /= norm;
+        }
+    }
+    mean
+}
+
+fn grounded_collection_label(
+    ranked: &[crate::semantic::ConceptMatch],
+    config: &ClusterConfig,
+) -> Option<(String, String)> {
+    let first = ranked.first()?;
+    if first.score < config.semantic_label_confidence {
+        return None;
+    }
+    let mut selected = vec![first];
+    if let Some(second) = ranked.get(1) {
+        let third_score = ranked.get(2).map_or(0.0, |concept| concept.score);
+        if second.score >= config.semantic_label_confidence && second.score - third_score >= 0.02 {
+            selected.push(second);
+        }
+    }
+    let label = selected
+        .iter()
+        .map(|concept| display_collection_label(&concept.label))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let evidence = selected
+        .iter()
+        .map(|concept| format!("{}:{:.3}", concept.label, concept.score))
+        .collect::<Vec<_>>()
+        .join(",");
+    Some((label, evidence))
+}
+
+fn minimum_pair_similarity(group: &[usize], embedded: &[(PathBuf, Arc<Vec<f32>>)]) -> f32 {
+    let mut minimum = 1.0_f32;
+    for (offset, left) in group.iter().enumerate() {
+        for right in group.iter().skip(offset.saturating_add(1)) {
+            if let (Some(left_item), Some(right_item)) = (embedded.get(*left), embedded.get(*right))
+            {
+                minimum = minimum.min(cosine(left_item.1.as_slice(), right_item.1.as_slice()));
+            }
+        }
+    }
+    minimum
 }
 
 fn cohesive_model_bundle(dir: &Path, files: &[PathBuf]) -> Option<DetectedBundle> {
@@ -504,11 +758,15 @@ async fn exif_timestamp(path: &Path, extractors: &[Arc<dyn ContentExtractor>]) -
     parse_exif_datetime(date)
 }
 
-/// Parse an EXIF `DateTimeOriginal` string (`"YYYY:MM:DD HH:MM:SS"`) to a unix
-/// timestamp. EXIF has no timezone, so it's interpreted as UTC — fine for
-/// *relative* burst windowing.
+/// Parse an EXIF `DateTimeOriginal` string to a unix timestamp. The raw EXIF
+/// representation uses `YYYY:MM:DD`, while `kamadak-exif` displays the value as
+/// `YYYY-MM-DD`; accept both. EXIF has no timezone, so it's interpreted as UTC
+/// — sufficient for relative burst windowing.
 fn parse_exif_datetime(s: &str) -> Option<i64> {
-    let dt = NaiveDateTime::parse_from_str(s.trim(), "%Y:%m:%d %H:%M:%S").ok()?;
+    let value = s.trim();
+    let dt = NaiveDateTime::parse_from_str(value, "%Y:%m:%d %H:%M:%S")
+        .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S"))
+        .ok()?;
     Some(dt.and_utc().timestamp())
 }
 
@@ -744,9 +1002,76 @@ fn sanitize_subdir(s: &str) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use tempfile::TempDir;
+    use tidyup_extract::image::ImageExtractor;
+
+    struct VisualBackend;
+
+    #[async_trait]
+    impl ImageEmbeddingBackend for VisualBackend {
+        async fn embed_image(
+            &self,
+            image_bytes: &[u8],
+            _mime: &str,
+        ) -> tidyup_core::Result<Vec<f32>> {
+            if image_bytes.first() == Some(&b'c') {
+                Ok(vec![1.0, 0.0])
+            } else {
+                Ok(vec![0.0, 1.0])
+            }
+        }
+
+        async fn embed_text(&self, text: &str) -> tidyup_core::Result<Vec<f32>> {
+            if text.contains("cat") {
+                Ok(vec![1.0, 0.0])
+            } else {
+                Ok(vec![0.0, 1.0])
+            }
+        }
+
+        async fn embed_texts(&self, texts: &[&str]) -> tidyup_core::Result<Vec<Vec<f32>>> {
+            let mut embeddings = Vec::with_capacity(texts.len());
+            for text in texts {
+                embeddings.push(self.embed_text(text).await?);
+            }
+            Ok(embeddings)
+        }
+
+        fn dimensions(&self) -> usize {
+            2
+        }
+
+        fn model_id(&self) -> &'static str {
+            "visual-test"
+        }
+    }
 
     fn p(s: &str) -> PathBuf {
         PathBuf::from(s)
+    }
+
+    /// Add a little-endian EXIF `DateTimeOriginal` APP1 segment to the real,
+    /// decodable JPEG fixture. This exercises the production image extractor
+    /// rather than replacing the extractor boundary with a test double.
+    fn jpeg_with_capture_time() -> Vec<u8> {
+        let fixture = include_bytes!("../../tidyup-extract/tests/fixtures/sample.jpg");
+        assert_eq!(&fixture[..2], &[0xff, 0xd8]);
+
+        let mut app1 = vec![
+            0xff, 0xe1, 0x00, 0x48, b'E', b'x', b'i', b'f', 0x00, 0x00, b'I', b'I', 0x2a, 0x00,
+            0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x69, 0x87, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00,
+            0x1a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x03, 0x90, 0x02, 0x00,
+            0x14, 0x00, 0x00, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        app1.extend_from_slice(b"2024:01:15 10:30:45\0");
+
+        let capacity = fixture.len().saturating_add(app1.len());
+        let mut output = Vec::with_capacity(capacity);
+        output.extend_from_slice(&fixture[..2]);
+        output.extend_from_slice(&app1);
+        output.extend_from_slice(&fixture[2..]);
+        output
     }
 
     #[test]
@@ -784,6 +1109,10 @@ mod tests {
         let ts = parse_exif_datetime("2024:01:15 10:30:45").unwrap();
         // 2024-01-15T10:30:45Z
         assert_eq!(ts, 1_705_314_645);
+        assert_eq!(
+            parse_exif_datetime("2024-01-15 10:30:45"),
+            Some(1_705_314_645)
+        );
         assert!(parse_exif_datetime("not a date").is_none());
     }
 
@@ -833,6 +1162,99 @@ mod tests {
         let (bundles, leftover) = cluster_loose(&files, &[], &ClusterConfig::default()).await;
         assert!(bundles.is_empty());
         assert_eq!(leftover.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn visual_neighbors_cluster_without_filename_evidence() {
+        let temp = TempDir::new().unwrap();
+        let files = ["IMG_0001.png", "DSC_9137.png", "random_44.png", "other.png"]
+            .map(|name| temp.path().join(name));
+        for path in &files[..3] {
+            std::fs::write(path, b"cat beach fixture").unwrap();
+        }
+        std::fs::write(&files[3], b"x unrelated fixture").unwrap();
+
+        let cache = SemanticRunCache::default();
+        let concepts = vec![
+            GroundedConcept {
+                label: "cat".to_string(),
+                prompt: "a photograph of a cat".to_string(),
+                family: "animal".to_string(),
+                embedding: vec![1.0, 0.0],
+            },
+            GroundedConcept {
+                label: "beach".to_string(),
+                prompt: "a photograph of a beach".to_string(),
+                family: "scene".to_string(),
+                embedding: vec![0.8, 0.2],
+            },
+        ];
+        let (bundles, leftover) = cluster_loose_semantic(
+            &files,
+            &[],
+            &ClusterConfig::default(),
+            SemanticClusterContext {
+                image: Some(&VisualBackend),
+                image_concepts: &concepts,
+                cache: &cache,
+            },
+        )
+        .await;
+
+        assert_eq!(bundles.len(), 1);
+        assert_eq!(bundles[0].members.len(), 3);
+        assert!(matches!(
+            bundles[0].kind,
+            BundleKind::SemanticCollection { .. }
+        ));
+        assert!(bundles[0].reasoning.contains("visually coherent"));
+        assert_eq!(leftover, vec![files[3].clone()]);
+    }
+
+    #[tokio::test]
+    async fn exif_photo_burst_preempts_visual_collection() {
+        let temp = TempDir::new().unwrap();
+        let files = ["alpha.jpg", "bravo.jpg", "charlie.jpg"].map(|name| temp.path().join(name));
+        let jpeg = jpeg_with_capture_time();
+        for path in &files {
+            std::fs::write(path, &jpeg).unwrap();
+        }
+
+        let cache = SemanticRunCache::default();
+        let concepts = vec![GroundedConcept {
+            label: "photograph".to_string(),
+            prompt: "a photograph".to_string(),
+            family: "media".to_string(),
+            embedding: vec![0.0, 1.0],
+        }];
+        let extractors: Vec<Arc<dyn ContentExtractor>> =
+            vec![Arc::new(ImageExtractor::with_ocr(false, 0))];
+        let extracted = extractors[0].extract(&files[0]).await.unwrap();
+        assert!(
+            extracted.metadata["exif"]["date"].is_string(),
+            "fixture must expose DateTimeOriginal: {}",
+            extracted.metadata
+        );
+        assert_eq!(
+            extracted.metadata["exif"]["date"].as_str(),
+            Some("2024-01-15 10:30:45")
+        );
+        let (bundles, leftover) = cluster_loose_semantic(
+            &files,
+            &extractors,
+            &ClusterConfig::default(),
+            SemanticClusterContext {
+                image: Some(&VisualBackend),
+                image_concepts: &concepts,
+                cache: &cache,
+            },
+        )
+        .await;
+
+        assert_eq!(bundles.len(), 1);
+        assert!(matches!(bundles[0].kind, BundleKind::PhotoBurst));
+        assert_eq!(bundles[0].members.len(), 3);
+        assert!(leftover.is_empty());
     }
 
     #[tokio::test]

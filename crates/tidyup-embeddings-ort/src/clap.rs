@@ -11,8 +11,7 @@
     clippy::indexing_slicing
 )]
 
-//! CLAP cross-modal audio/text embedding backend — Phase 7 multimodal Tier 2
-//! audio classifier.
+//! CLAP cross-modal audio/text embedding backend for audio semantic routing.
 //!
 //! # Model contract
 //!

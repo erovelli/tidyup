@@ -46,9 +46,13 @@ impl ProgressReporter for DioxusReporter {
         current.set(0);
         total_sig.set(total);
         label.set(String::new());
+        if phase == Phase::Indexing {
+            let mut indexed = self.signals.indexed_count;
+            indexed.set(0);
+        }
     }
 
-    async fn item_completed(&self, _phase: Phase, item: ProgressItem) {
+    async fn item_completed(&self, phase: Phase, item: ProgressItem) {
         let mut current = self.signals.progress_current;
         let mut total_sig = self.signals.progress_total;
         let mut label = self.signals.progress_label;
@@ -57,6 +61,10 @@ impl ProgressReporter for DioxusReporter {
             total_sig.set(item.total);
         }
         label.set(item.label);
+        if phase == Phase::Indexing {
+            let mut indexed = self.signals.indexed_count;
+            indexed.set(item.current);
+        }
     }
 
     async fn phase_finished(&self, _phase: Phase) {

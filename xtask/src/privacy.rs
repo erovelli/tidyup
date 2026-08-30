@@ -27,7 +27,7 @@ pub fn check() -> Result<()> {
     // CLI default build: network-silent and LLM-silent.
     let cli_banned: Vec<&str> = NETWORK.iter().chain(LLM).copied().collect();
     check_crate("tidyup-cli", &cli_banned)?;
-    // UI default build: LLM-silent (Tier 3 is a power-user `--features` opt-in).
+    // UI default build: LLM-silent (the reranker is a power-user feature opt-in).
     check_crate("tidyup-ui", LLM)?;
     Ok(())
 }

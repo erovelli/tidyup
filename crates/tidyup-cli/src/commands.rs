@@ -18,7 +18,9 @@ use crate::reporter::CliReporter;
 use crate::review::{AutoApproveHandler, InteractiveHandler};
 use crate::{Cli, Command};
 
-/// Confidence threshold for auto-applying move-only bundles under `--yes`.
+/// Confidence threshold for auto-applying opaque structural bundles under
+/// `--yes`; soft/file-set and generic bundles remain review-only until their
+/// action-specific confidence is calibrated.
 const YES_BUNDLE_MIN_CONFIDENCE: f32 = tidyup_app::executor::DEFAULT_BUNDLE_MIN_CONFIDENCE;
 
 /// Interpret an environment variable as a boolean activation gate.
@@ -51,7 +53,7 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<()> {
     let remote = cli.remote || env_activates("TIDYUP_REMOTE");
     if llm_fallback && remote {
         anyhow::bail!(
-            "--llm-fallback and --remote are mutually exclusive; pick one Tier 3 backend"
+            "--llm-fallback and --remote are mutually exclusive; pick one optional rerank backend"
         );
     }
     let activation = InferenceActivation {
@@ -122,6 +124,10 @@ async fn run_migrate(
         json,
         "migrate",
         report.run_id,
+        report.source_indexed,
+        Some(report.target_indexed),
+        report.indexing_failed,
+        &report.capabilities,
         report.proposed,
         report.bundles,
         report.unclassified,
@@ -190,6 +196,10 @@ async fn run_scan(
         json,
         "scan",
         report.run_id,
+        report.indexed,
+        None,
+        report.indexing_failed,
+        &report.capabilities,
         report.proposed,
         report.bundles,
         report.unclassified,
@@ -206,7 +216,7 @@ async fn run_scan(
 }
 
 async fn run_list_runs(json: bool, cfg: &config::TidyupConfig) -> Result<()> {
-    // Rollback never invokes the classifier, so Tier 3 activation is irrelevant.
+    // Rollback never invokes the classifier, so optional reranker activation is irrelevant.
     let ctx = build(cfg, false, InferenceActivation::default()).await?;
     let service = RollbackService::new(ctx);
     let runs = service.list_runs().await?;
@@ -258,15 +268,23 @@ async fn run_prune(json: bool, cfg: &config::TidyupConfig, days: Option<u32>) ->
     let ctx = build(cfg, false, InferenceActivation::default()).await?;
     let service = RollbackService::new(ctx);
     let days = days.unwrap_or(cfg.storage.backup_retention_days);
-    let pruned = service.prune_backups(days).await?;
+    let backups_pruned = service.prune_backups(days).await?;
+    let semantic_artifacts_pruned = service.prune_semantic_artifacts(days).await?;
 
     if json {
         println!(
             "{}",
-            serde_json::json!({"event": "prune", "pruned": pruned, "older_than_days": days}),
+            serde_json::json!({
+                "event": "prune",
+                "backups_pruned": backups_pruned,
+                "semantic_artifacts_pruned": semantic_artifacts_pruned,
+                "older_than_days": days,
+            }),
         );
     } else {
-        println!("Pruned {pruned} shelved backup(s) older than {days} day(s).");
+        println!(
+            "Pruned {backups_pruned} shelved backup(s) and {semantic_artifacts_pruned} semantic cache artifact(s) older than {days} day(s)."
+        );
     }
     Ok(())
 }
@@ -297,6 +315,7 @@ async fn run_status(json: bool, cfg: &config::TidyupConfig) -> Result<()> {
                     "mode": r.mode.as_str(),
                     "state": r.state.as_str(),
                     "started_at": r.started_at,
+                    "capabilities": r.capabilities,
                 })
             })
             .collect();
@@ -365,7 +384,7 @@ async fn run_status(json: bool, cfg: &config::TidyupConfig) -> Result<()> {
 }
 
 async fn run_rollback(json: bool, cfg: &config::TidyupConfig, run_id: uuid::Uuid) -> Result<()> {
-    // Rollback never invokes the classifier, so Tier 3 activation is irrelevant.
+    // Rollback never invokes the classifier, so optional reranker activation is irrelevant.
     let ctx = build(cfg, false, InferenceActivation::default()).await?;
     let reporter = CliReporter::new(json);
     let service = RollbackService::new(ctx);
@@ -417,9 +436,10 @@ fn run_config(cfg: &config::TidyupConfig) -> Result<()> {
     Ok(())
 }
 
-/// Build the review handler. Under `--yes`, the auto-approve confidence
-/// threshold comes from `[classifier] min_confidence` in config (default 0.75),
-/// so users can tune how aggressively moves auto-apply without a rebuild.
+/// Build the review handler. Under `--yes`, the loose-proposal threshold comes
+/// from `[classifier] min_confidence` in config (default 0.75). Bundle
+/// auto-selection uses the same threshold only for opaque structural bundles;
+/// soft/file-set and generic bundles remain review-only.
 fn reviewer_for(yes: bool, cfg: &config::TidyupConfig) -> Box<dyn tidyup_core::ReviewHandler> {
     if yes {
         Box::new(AutoApproveHandler {
@@ -435,6 +455,10 @@ fn emit_summary(
     json: bool,
     mode: &str,
     run_id: uuid::Uuid,
+    indexed: usize,
+    target_indexed: Option<usize>,
+    indexing_failed: usize,
+    capabilities: &tidyup_domain::CapabilityManifest,
     proposed: usize,
     bundles: usize,
     unclassified: usize,
@@ -452,6 +476,10 @@ fn emit_summary(
             "event": format!("{mode}_summary"),
             "run_id": run_id,
             "dry_run": dry_run,
+            "indexed": indexed,
+            "target_indexed": target_indexed,
+            "indexing_failed": indexing_failed,
+            "capabilities": capabilities,
             "proposed": proposed,
             "bundles": bundles,
             "unclassified": unclassified,
@@ -469,6 +497,12 @@ fn emit_summary(
     let tag = if dry_run { " [dry-run]" } else { "" };
     println!();
     println!("{mode} complete{tag} (run {run_id}):");
+    if let Some(target_count) = target_indexed {
+        println!("  indexed:   {indexed} source, {target_count} target ({indexing_failed} failed)");
+    } else {
+        println!("  indexed:   {indexed} ({indexing_failed} failed)");
+    }
+    println!("  capabilities: {}", capabilities.summary());
     println!(
         "  proposals: {proposed} (approved {approved}, applied {applied}, skipped {skipped}, failed {failed})"
     );
@@ -478,7 +512,7 @@ fn emit_summary(
     if unclassified > 0 {
         println!("  unclassified: {unclassified}");
     }
-    if applied > 0 {
+    if !dry_run && (applied > 0 || bundles_applied > 0) {
         println!("Undo with: tidyup rollback {run_id}");
     }
 }

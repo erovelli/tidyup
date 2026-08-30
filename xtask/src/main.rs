@@ -7,6 +7,7 @@ mod eval;
 mod models;
 mod privacy;
 mod routing_eval;
+mod semantic_bench;
 
 use std::process::{Command, ExitCode};
 
@@ -22,7 +23,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Task {
-    /// Run the full CI suite: fmt, clippy, tests, deny, feature matrix.
+    /// Run portable local CI: privacy, formatting, layered clippy, and tests.
     Ci,
     /// Format all crates.
     Fmt,
@@ -39,7 +40,7 @@ enum Task {
     /// sanctioned one-shot installer.
     ///
     /// By default downloads only the text embedding bundle (`bge-small`).
-    /// Pass `--siglip` to additionally fetch the Phase 7 image encoder, or
+    /// Pass `--siglip` to additionally fetch the image encoder, or
     /// `--clap` for the audio encoder. `--multimodal` is shorthand for
     /// `--siglip --clap`.
     DownloadModels {
@@ -80,7 +81,7 @@ enum Task {
     ///
     /// Semantic embedding scoring runs when the `bge-small-en-v1.5` bundle is
     /// installed; otherwise entries are deferred. Reports accuracy, per-label
-    /// precision / recall / F1, tier coverage, and confusions. Not part of
+    /// precision / recall / F1, resolver coverage, and confusions. Not part of
     /// `ci` — it is a calibration tool.
     Eval {
         /// Emit the report as JSON instead of a human-readable summary.
@@ -117,6 +118,18 @@ enum Task {
         /// Gate: fail if (content − filename) top-1 is below this margin.
         #[arg(long)]
         fail_under: Option<f64>,
+    },
+    /// Measure the warm local semantic image path (read, hash, `SigLIP` encode,
+    /// and grounded-concept ranking). Cold model load is reported separately.
+    BenchSemantic {
+        /// Representative local image to process repeatedly.
+        image: std::path::PathBuf,
+        /// Number of warm samples used for percentile reporting.
+        #[arg(long, default_value_t = 20)]
+        iterations: usize,
+        /// Fail when warm p95 exceeds this latency.
+        #[arg(long, default_value_t = 1_000)]
+        fail_over_ms: u64,
     },
 }
 
@@ -172,6 +185,11 @@ impl Task {
                 seed,
                 fail_under,
             } => routing_eval::run(&corpus, train_frac, seed, fail_under, json),
+            Self::BenchSemantic {
+                image,
+                iterations,
+                fail_over_ms,
+            } => semantic_bench::run(&image, iterations, fail_over_ms),
         }
     }
 }
@@ -205,7 +223,7 @@ fn run_ci_lints() -> Result<()> {
         "-D",
         "warnings",
     ])?;
-    // The UI's Tier 3 path is `#[cfg(feature = "llm-fallback")]`; lint it with
+    // The UI's optional reranker is `#[cfg(feature = "llm-fallback")]`; lint it with
     // the feature on so the mistralrs-backed branch is covered (the default
     // workspace clippy above only sees the feature-off stub).
     sh(&[

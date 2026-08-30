@@ -1,0 +1,58 @@
+# Stable label<TAB>natural-language contrastive prompt
+adult	a photograph containing an adult person	person
+airplane	a photograph of an airplane
+animal	a photograph of an animal	animal
+architecture	a photograph of architecture or a building
+artwork	an image of artwork or an illustration
+baby	a photograph containing a baby	person
+beach	a photograph of a beach, sand, and the ocean	natural_scene
+bicycle	a photograph of a bicycle
+bird	a photograph of a bird	animal
+boat	a photograph of a boat or ship
+book	a photograph of a book
+bridge	a photograph of a bridge
+building	a photograph of a building	architecture
+car	a photograph of a car or automobile
+cat	a photograph of a cat	animal
+chart	an image of a chart, graph, or data visualization
+child	a photograph containing a child	person
+city	a photograph of a city or urban street	urban_scene
+concert	a photograph of a live concert or musical performance
+document	an image of a document or printed page
+dog	a photograph of a dog	animal
+drawing	an image of a drawing or sketch
+event	a photograph from an event or gathering
+family	a photograph of a family group	person
+flower	a photograph of a flower	plant
+food	a photograph of food or a meal
+forest	a photograph of a forest or woodland	natural_scene
+garden	a photograph of a garden	natural_scene
+home	a photograph inside or outside a home
+horse	a photograph of a horse	animal
+lake	a photograph of a lake	natural_scene
+landscape	a landscape photograph of natural scenery	natural_scene
+map	an image of a map
+mountain	a photograph of a mountain	natural_scene
+museum	a photograph inside a museum or gallery
+night	a photograph taken at night
+ocean	a photograph of the ocean or sea	natural_scene
+office	a photograph of an office or workspace
+party	a photograph of a party or celebration
+person	a photograph of a person	person
+plant	a photograph of a plant	plant
+portrait	a portrait photograph	person
+receipt	an image of a receipt
+restaurant	a photograph inside a restaurant
+river	a photograph of a river	natural_scene
+road	a photograph of a road	urban_scene
+screenshot	a screenshot of a computer or phone interface
+snow	a photograph of snow or a snowy scene	natural_scene
+sports	a photograph of a sport or athletic activity
+sunset	a photograph of a sunset	natural_scene
+train	a photograph of a train
+travel	a travel or vacation photograph
+tree	a photograph of a tree	plant
+vehicle	a photograph of a vehicle
+waterfall	a photograph of a waterfall	natural_scene
+wedding	a photograph from a wedding
+wildlife	a photograph of wildlife	animal

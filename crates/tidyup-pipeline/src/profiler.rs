@@ -13,6 +13,9 @@
 //!   directly in the folder. Optional in v0.1: only populated when a caller
 //!   supplies per-file embeddings. The migration cascade gracefully weights
 //!   around a missing centroid (see `scoring::score_candidate`).
+//! - **modality name prototypes + centroids** — when a cross-modal backend is
+//!   available, every folder gets a matching-space embedding of its semantic
+//!   description. Existing media contributes an optional content centroid.
 //! - **`metadata`** — [`FolderMetadata`] snapshot: extension counts, file
 //!   counts, date range, BLAKE3 content hash (for cache invalidation).
 //! - **`organization_type`** — [`OrganizationType`] detected from child-folder
@@ -43,6 +46,8 @@ use tidyup_domain::migration::{
     ScanDiff, TargetScan,
 };
 
+use crate::semantic::SemanticRunCache;
+
 /// Optional extra signals for profile building, beyond the always-present
 /// `name_embedding`.
 ///
@@ -66,30 +71,15 @@ pub struct MultimodalProfilers<'a> {
     /// Extractors used to pull text out of each folder's documents for the text
     /// `content_centroid`. Empty (the default) → no content centroid.
     pub extractors: &'a [Arc<dyn ContentExtractor>],
+    /// Optional persistent semantic-artifact store. Cache failures degrade to
+    /// fresh inference and do not fail profiling.
+    pub artifact_store: Option<&'a dyn tidyup_core::storage::FileIndex>,
 }
 
 /// Maximum number of files per folder sampled to build a content centroid.
 /// Bounded so profiling a large target tree stays affordable — centroids are a
 /// signal, not a census.
 const CENTROID_SAMPLE_CAP: usize = 24;
-
-/// Image file extensions sampled for the `SigLIP` image centroid. Mirrors the
-/// image set the scan pipeline routes through cross-modal Tier 2.
-const IMAGE_EXTS: &[&str] = &[
-    "jpg", "jpeg", "png", "gif", "bmp", "tiff", "tif", "webp", "ico", "avif", "jxl", "heic",
-    "heif", "raw", "cr2", "cr3", "nef", "arw", "orf", "dng", "rw2", "raf",
-];
-
-/// Audio file extensions sampled for the `CLAP` audio centroid.
-const AUDIO_EXTS: &[&str] = &[
-    "mp3", "flac", "m4a", "wav", "ogg", "opus", "aiff", "aif", "ape", "wma", "alac", "aac", "mka",
-];
-
-/// Video extensions — excluded from the text `content_centroid` (no text body)
-/// alongside images and audio. Video has no Tier 2 path in v0.1.
-const VIDEO_EXTS: &[&str] = &[
-    "mp4", "mov", "mkv", "avi", "wmv", "flv", "webm", "m4v", "mpg", "mpeg",
-];
 
 /// Walk `root` and build a [`TargetScan`] describing the folder hierarchy.
 ///
@@ -483,6 +473,30 @@ pub fn synthesize_description(node: &FolderNode) -> String {
     }
 }
 
+/// Describe a target folder for an image model's text tower. Folder names are
+/// dynamic user evidence; this gives even an empty folder a prototype in the
+/// same latent space as incoming images.
+#[must_use]
+pub fn synthesize_image_description(node: &FolderNode) -> String {
+    let path = semantic_folder_path(node);
+    format!("an image or photograph associated with {path}")
+}
+
+/// Describe a target folder for an audio model's text tower.
+#[must_use]
+pub fn synthesize_audio_description(node: &FolderNode) -> String {
+    let path = semantic_folder_path(node);
+    format!("an audio recording associated with {path}")
+}
+
+fn semantic_folder_path(node: &FolderNode) -> String {
+    if node.path_segments.is_empty() {
+        node.name.clone()
+    } else {
+        node.path_segments.join(" / ")
+    }
+}
+
 /// Build a text-only [`ProfileCache`] from a [`TargetScan`].
 ///
 /// Convenience wrapper over [`build_profile_cache_multimodal`] with no image or
@@ -521,11 +535,13 @@ pub async fn build_profile_cache(
 /// Per-file extraction / embedding failures while building centroids are logged
 /// and skipped — a folder gets a thinner (or absent) centroid rather than
 /// failing the whole profile build.
+#[allow(clippy::too_many_lines)]
 pub async fn build_profile_cache_multimodal(
     scan: &TargetScan,
     embeddings: &dyn EmbeddingBackend,
     multimodal: MultimodalProfilers<'_>,
 ) -> Result<ProfileCache> {
+    let semantic_cache = SemanticRunCache::new(multimodal.artifact_store);
     // Batch-embed all descriptions in insertion order for determinism.
     let mut paths: Vec<PathBuf> = scan.nodes.keys().cloned().collect();
     paths.sort();
@@ -542,9 +558,38 @@ pub async fn build_profile_cache_multimodal(
         name_vectors.append(&mut batch);
     }
 
+    let image_name_vectors = if let Some(backend) = multimodal.image {
+        let image_descriptions: Vec<String> = paths
+            .iter()
+            .filter_map(|path| scan.nodes.get(path).map(synthesize_image_description))
+            .collect();
+        let image_refs: Vec<&str> = image_descriptions.iter().map(String::as_str).collect();
+        let mut vectors = Vec::with_capacity(image_refs.len());
+        for chunk in image_refs.chunks(32) {
+            vectors.append(&mut backend.embed_texts(chunk).await?);
+        }
+        Some(vectors)
+    } else {
+        None
+    };
+    let audio_name_vectors = if let Some(backend) = multimodal.audio {
+        let audio_descriptions: Vec<String> = paths
+            .iter()
+            .filter_map(|path| scan.nodes.get(path).map(synthesize_audio_description))
+            .collect();
+        let audio_refs: Vec<&str> = audio_descriptions.iter().map(String::as_str).collect();
+        let mut vectors = Vec::with_capacity(audio_refs.len());
+        for chunk in audio_refs.chunks(32) {
+            vectors.append(&mut backend.embed_texts(chunk).await?);
+        }
+        Some(vectors)
+    } else {
+        None
+    };
+
     let now = SystemTime::now();
     let mut profiles: HashMap<PathBuf, FolderProfile> = HashMap::with_capacity(paths.len());
-    for (path, name_embedding) in paths.into_iter().zip(name_vectors) {
+    for (index, (path, name_embedding)) in paths.into_iter().zip(name_vectors).enumerate() {
         let Some(node) = scan.nodes.get(&path) else {
             continue;
         };
@@ -553,8 +598,9 @@ pub async fn build_profile_cache_multimodal(
 
         let (image_centroid, image_centroid_sample_count) = match multimodal.image {
             Some(backend) => {
-                modality_centroid(&path, IMAGE_EXTS, |bytes, mime| async move {
-                    backend.embed_image(&bytes, &mime).await
+                let cache = &semantic_cache;
+                modality_centroid(&path, "image/", |candidate, mime| async move {
+                    cache.image_embedding(&candidate, &mime, backend).await
                 })
                 .await
             }
@@ -562,8 +608,9 @@ pub async fn build_profile_cache_multimodal(
         };
         let (audio_centroid, audio_centroid_sample_count) = match multimodal.audio {
             Some(backend) => {
-                modality_centroid(&path, AUDIO_EXTS, |bytes, mime| async move {
-                    backend.embed_audio(&bytes, &mime).await
+                let cache = &semantic_cache;
+                modality_centroid(&path, "audio/", |candidate, mime| async move {
+                    cache.audio_embedding(&candidate, &mime, backend).await
                 })
                 .await
             }
@@ -582,8 +629,14 @@ pub async fn build_profile_cache_multimodal(
                 name_embedding,
                 content_centroid,
                 centroid_sample_count,
+                image_name_embedding: image_name_vectors
+                    .as_ref()
+                    .and_then(|vectors| vectors.get(index).cloned()),
                 image_centroid,
                 image_centroid_sample_count,
+                audio_name_embedding: audio_name_vectors
+                    .as_ref()
+                    .and_then(|vectors| vectors.get(index).cloned()),
                 audio_centroid,
                 audio_centroid_sample_count,
                 metadata: node.metadata.clone(),
@@ -605,9 +658,9 @@ pub async fn build_profile_cache_multimodal(
     })
 }
 
-/// Sample up to [`CENTROID_SAMPLE_CAP`] direct files in `dir` whose extension is
-/// in `exts`, embed each via `embed`, and return their mean vector (L2-
-/// normalized) plus the sample count.
+/// Sample up to [`CENTROID_SAMPLE_CAP`] direct files in `dir` whose centrally
+/// detected MIME belongs to `mime_prefix`, embed each via `embed`, and return
+/// their mean vector (L2-normalized) plus the sample count.
 ///
 /// Files are sampled in sorted order for determinism. Read or embedding
 /// failures on individual files are logged and skipped — they thin the sample
@@ -615,37 +668,36 @@ pub async fn build_profile_cache_multimodal(
 /// matching files or none could be embedded.
 async fn modality_centroid<F>(
     dir: &Path,
-    exts: &[&str],
-    embed: impl Fn(Vec<u8>, String) -> F,
+    mime_prefix: &str,
+    embed: impl Fn(PathBuf, String) -> F,
 ) -> (Option<Vec<f32>>, u32)
 where
-    F: std::future::Future<Output = Result<Vec<f32>>>,
+    F: std::future::Future<Output = Result<Option<Arc<Vec<f32>>>>>,
 {
     let mut candidates: Vec<PathBuf> = match fs::read_dir(dir) {
         Ok(rd) => rd
             .flatten()
             .filter(|e| e.file_type().is_ok_and(|ft| ft.is_file()))
             .map(|e| e.path())
-            .filter(|p| {
-                p.extension()
-                    .and_then(|s| s.to_str())
-                    .map(str::to_ascii_lowercase)
-                    .is_some_and(|ext| exts.contains(&ext.as_str()))
-            })
             .collect(),
         Err(_) => return (None, 0),
     };
     candidates.sort();
-    candidates.truncate(CENTROID_SAMPLE_CAP);
 
     let mut acc = CentroidAccumulator::default();
     for path in &candidates {
-        let Ok(bytes) = fs::read(path) else {
+        if acc.is_full() {
+            break;
+        }
+        let Some(mime) = tidyup_extract::mime::detect(path).await else {
             continue;
         };
-        let mime = mime_hint(path);
-        match embed(bytes, mime).await {
-            Ok(vec) => acc.add(&vec, path),
+        if !mime.starts_with(mime_prefix) {
+            continue;
+        }
+        match embed(path.clone(), mime).await {
+            Ok(Some(vec)) => acc.add(vec.as_slice(), path),
+            Ok(None) => {}
             Err(e) => {
                 tracing::warn!(
                     "profiler: embedding {} failed: {e}; skipping",
@@ -667,6 +719,10 @@ struct CentroidAccumulator {
 }
 
 impl CentroidAccumulator {
+    fn is_full(&self) -> bool {
+        usize::try_from(self.count).unwrap_or(usize::MAX) >= CENTROID_SAMPLE_CAP
+    }
+
     fn add(&mut self, vec: &[f32], path: &Path) {
         if vec.is_empty() {
             return;
@@ -703,9 +759,9 @@ impl CentroidAccumulator {
     }
 }
 
-/// Build the text `content_centroid` for `dir`: sample its direct text files
-/// (everything that isn't image/audio/video), extract each body via the
-/// supplied `extractors`, embed with `embeddings`, and average into one
+/// Build the text `content_centroid` for `dir`: visit direct files, let the
+/// extractor router select a compatible capability from MIME/content, embed
+/// every non-empty textual result, and average into one
 /// L2-normalized vector in the same text space as `name_embedding`.
 ///
 /// Returns `(None, 0)` when the folder has no text documents or none yield
@@ -721,15 +777,16 @@ async fn content_centroid(
             .flatten()
             .filter(|e| e.file_type().is_ok_and(|ft| ft.is_file()))
             .map(|e| e.path())
-            .filter(|p| !is_non_text_ext(p))
             .collect(),
         Err(_) => return (None, 0),
     };
     candidates.sort();
-    candidates.truncate(CENTROID_SAMPLE_CAP);
 
     let mut acc = CentroidAccumulator::default();
     for path in &candidates {
+        if acc.is_full() {
+            break;
+        }
         let mime = tidyup_extract::mime::detect(path).await;
         let Some(extractor) = tidyup_extract::router::pick(extractors, path, mime.as_deref())
         else {
@@ -758,42 +815,6 @@ async fn content_centroid(
         }
     }
     acc.finish()
-}
-
-/// Whether `path`'s extension is an image/audio/video type — i.e. NOT a text
-/// document for content-centroid purposes.
-fn is_non_text_ext(path: &Path) -> bool {
-    path.extension()
-        .and_then(|s| s.to_str())
-        .map(str::to_ascii_lowercase)
-        .is_some_and(|ext| {
-            let e = ext.as_str();
-            IMAGE_EXTS.contains(&e) || AUDIO_EXTS.contains(&e) || VIDEO_EXTS.contains(&e)
-        })
-}
-
-/// Best-effort MIME string from a file extension, used as an informational hint
-/// to the cross-modal backends (they decode from bytes, not MIME).
-fn mime_hint(path: &Path) -> String {
-    let ext = path
-        .extension()
-        .and_then(|s| s.to_str())
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_default();
-    match ext.as_str() {
-        "jpg" | "jpeg" => "image/jpeg".to_string(),
-        "png" => "image/png".to_string(),
-        "gif" => "image/gif".to_string(),
-        "webp" => "image/webp".to_string(),
-        "bmp" => "image/bmp".to_string(),
-        "tiff" | "tif" => "image/tiff".to_string(),
-        "mp3" => "audio/mpeg".to_string(),
-        "flac" => "audio/flac".to_string(),
-        "wav" => "audio/wav".to_string(),
-        "ogg" | "opus" => "audio/ogg".to_string(),
-        "m4a" | "aac" | "alac" => "audio/mp4".to_string(),
-        _ => "application/octet-stream".to_string(),
-    }
 }
 
 /// L2-normalize a vector in place. No-op for a zero vector.
@@ -1189,12 +1210,17 @@ mod tests {
                 image: Some(&img),
                 audio: None,
                 extractors: &[],
+                artifact_store: None,
             },
         )
         .await
         .unwrap();
 
         let photos = cache.profiles.get(&td.path().join("Photos")).unwrap();
+        assert!(
+            photos.image_name_embedding.is_some(),
+            "every named folder gets an image-space text prototype"
+        );
         assert_eq!(photos.image_centroid_sample_count, 2, "two images sampled");
         let centroid = photos.image_centroid.as_ref().unwrap();
         let norm = centroid.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -1204,6 +1230,10 @@ mod tests {
         );
 
         let docs = cache.profiles.get(&td.path().join("Docs")).unwrap();
+        assert!(
+            docs.image_name_embedding.is_some(),
+            "an empty/non-image folder still gets a dynamic text prototype"
+        );
         assert!(
             docs.image_centroid.is_none(),
             "no images → no image centroid"
@@ -1233,8 +1263,8 @@ mod tests {
     struct PlainExtractor;
     #[async_trait]
     impl ContentExtractor for PlainExtractor {
-        fn supports(&self, _path: &Path, _mime: Option<&str>) -> bool {
-            true
+        fn supports(&self, _path: &Path, mime: Option<&str>) -> bool {
+            mime.is_some_and(|value| value.starts_with("text/"))
         }
         async fn extract(
             &self,
@@ -1257,7 +1287,7 @@ mod tests {
         fs::create_dir_all(td.path().join("Empty")).unwrap();
         fs::write(td.path().join("Docs/a.txt"), b"quarterly revenue report").unwrap();
         fs::write(td.path().join("Docs/b.md"), b"annual financial summary").unwrap();
-        // A non-text file must be excluded from the content centroid sample.
+        // An unsupported file contributes no text to the content centroid.
         fs::write(td.path().join("Docs/cover.png"), b"img").unwrap();
 
         let scan = scan_target(td.path()).unwrap();
@@ -1269,6 +1299,7 @@ mod tests {
                 image: None,
                 audio: None,
                 extractors: &extractors,
+                artifact_store: None,
             },
         )
         .await
@@ -1277,7 +1308,7 @@ mod tests {
         let docs = cache.profiles.get(&td.path().join("Docs")).unwrap();
         assert_eq!(
             docs.centroid_sample_count, 2,
-            "two text docs sampled, the .png excluded",
+            "two text docs sampled; the unsupported image contributes nothing",
         );
         let centroid = docs.content_centroid.as_ref().unwrap();
         let norm = centroid.iter().map(|x| x * x).sum::<f32>().sqrt();

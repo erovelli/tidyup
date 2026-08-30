@@ -1,4 +1,4 @@
-//! Taxonomy-backed embedding classifier — Tier 2 of the classification cascade.
+//! Taxonomy-backed deterministic embedding classifier.
 //!
 //! Pairs an [`OrtEmbeddings`] with a list of [`TaxonomyEntry`]s. On load, it
 //! either restores pre-computed category embeddings from disk or recomputes

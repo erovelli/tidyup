@@ -49,10 +49,9 @@ pub enum FileModality {
     Skip,
 }
 
-/// Backend family — used for logs, diagnostics, and to gate expensive tiers.
-///
-/// The migration pipeline skips Tier 3 LLM fallback on [`BackendKind::Cpu`] by
-/// default (CPU LLM inference is 25–50 s/file and not viable interactively).
+/// Backend family used for logs, diagnostics, and accelerator selection.
+/// The current pipeline does not make classification correctness conditional
+/// on this enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum BackendKind {
     Cuda,
@@ -157,7 +156,7 @@ impl Default for GenerationOptions {
 // Backend traits
 // ---------------------------------------------------------------------------
 
-/// Generative text classifier. Used for Tier 3 LLM fallback and by any
+/// Generative text classifier. Used for optional low-confidence reranking and by any
 /// higher-level classifier that wants a natural-language opinion.
 ///
 /// v0.1 exposes four classification entry points covering the four modalities.
@@ -182,9 +181,9 @@ pub trait TextBackend: Send + Sync {
         description: &str,
     ) -> Result<ContentClassification>;
 
-    /// Raw generation — used for templated rename synthesis and ad-hoc
-    /// prompts. Default implementations may share a chat model with the
-    /// classify methods.
+    /// Raw generation capability for future explicitly authorized callers.
+    /// The current organization and rename pipelines do not call it; filenames
+    /// must remain grounded and non-generative.
     async fn complete(&self, prompt: &str, opts: &GenerationOptions) -> Result<String>;
 
     /// Stable identifier for this backend's text model. Surfaced in logs and
@@ -207,8 +206,7 @@ pub trait VisionBackend: Send + Sync {
     fn model_id(&self) -> &str;
 }
 
-/// Embedding generator for the Tier 2 cosine-similarity classifier and folder
-/// profiling.
+/// Embedding generator for deterministic cosine-similarity routing and folder profiling.
 ///
 /// Embeddings MUST be L2-normalized — consumers treat them as unit vectors and
 /// compute dot-products as cosine similarity directly.

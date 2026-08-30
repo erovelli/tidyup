@@ -3,7 +3,7 @@
 //! Uses `pdf-extract` to pull selectable text out of PDF documents. Scanned /
 //! image-only PDFs (OCR required) produce a tiny amount of extracted text —
 //! those surface as `text: None` with `metadata.scanned = true` so the
-//! classifier can skip them or route to a different tier rather than embedding
+//! classifier can defer them or fall back to other available evidence rather than embedding
 //! noise.
 //!
 //! `pdf-extract` is synchronous and CPU-heavy; the work runs under

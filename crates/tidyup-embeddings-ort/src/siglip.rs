@@ -9,8 +9,7 @@
     clippy::indexing_slicing
 )]
 
-//! SigLIP cross-modal image/text embedding backend — Phase 7 multimodal Tier 2
-//! image classifier.
+//! SigLIP cross-modal image/text embedding backend for visual semantic routing.
 //!
 //! # Model contract
 //!

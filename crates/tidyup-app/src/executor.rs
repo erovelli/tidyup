@@ -33,15 +33,15 @@ use tidyup_domain::{
 use uuid::Uuid;
 use walkdir::WalkDir;
 
-/// Minimum raw semantic cosine for non-interactive bundle approval.
-///
-/// Structural bundles use their aggregate semantic routing cosine. Semantic
-/// collections use the weaker of aggregate routing and mean member confidence.
-/// `0.50` remains above the pipeline's `0.35` review boundary while matching
-/// the raw-cosine scale produced for short bundle descriptions.
+/// Minimum raw semantic cosine for non-interactive approval of opaque
+/// structural bundles. Soft/file-set collections remain review-only until
+/// their action-specific confidence is calibrated.
 pub const DEFAULT_BUNDLE_MIN_CONFIDENCE: f32 = 0.50;
 
-/// Summary of what the executor did during an apply pass.
+/// Summary of one apply pass.
+///
+/// During a dry-run, successful previews count as applied dispositions even
+/// though this executor leaves the filesystem and persistence layers untouched.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ApplyReport {
     pub applied: usize,
@@ -205,7 +205,9 @@ pub async fn apply_bundles(
             apply_bundle_atomic(&bundle, deps, dry_run).await
         };
         match result {
-            Ok(()) => report.bundles_applied = report.bundles_applied.saturating_add(1),
+            Ok(()) => {
+                report.bundles_applied = report.bundles_applied.saturating_add(1);
+            }
             Err(e) => {
                 report.bundles_failed = report.bundles_failed.saturating_add(1);
                 deps.progress
@@ -869,16 +871,20 @@ fn indexed_stub(source: &Path, file_id: Option<FileId>) -> anyhow::Result<Indexe
 
 /// Threshold-only bundle selection used on the `--yes` path.
 ///
-/// - `auto_approve_all = true` (i.e. `--yes`): approve bundles with confidence ≥
-///   `min_confidence`; skip the rest. This mirrors how `--yes` auto-approves
-///   loose moves above a confidence threshold.
+/// - `auto_approve_all = true` (i.e. `--yes`): approve recognized opaque
+///   structural bundles with confidence ≥ `min_confidence`; skip soft/file-set
+///   collections and the rest. This precision-first policy remains until
+///   action-specific calibration establishes a safe collection threshold.
 /// - `auto_approve_all = false`: approve nothing. Callers that want interactive
 ///   per-bundle review go through [`select_bundle_decisions`] instead.
 ///
 /// Bundles are atomic aggregates, so the decision is binary per bundle — there
 /// is no per-member selection and no `Override` (members carry their own paths
 /// and are never selected independently). Bundles containing member renames
-/// require interactive review and are excluded from this path.
+/// require interactive review and are excluded from this path. Soft/file-set
+/// collections are held because their raw semantic confidence is not calibrated
+/// for unattended application. The legacy `Generic` kind is also held if read
+/// from persisted data; current scans do not create generic directory envelopes.
 #[must_use]
 pub fn select_auto_applied_bundles(
     bundles: &[BundleProposal],
@@ -891,7 +897,9 @@ pub fn select_auto_applied_bundles(
     bundles
         .iter()
         .filter(|b| {
-            b.confidence >= min_confidence
+            !b.kind.moves_as_file_set()
+                && !matches!(&b.kind, BundleKind::Generic)
+                && b.confidence >= min_confidence
                 && !b.members.iter().any(|member| {
                     matches!(
                         member.change_type,
@@ -903,20 +911,116 @@ pub fn select_auto_applied_bundles(
         .collect()
 }
 
+/// Validate selected destinations before any filesystem mutation.
+///
+/// Paths are folded conservatively for case-insensitive filesystems; this may
+/// hold a proposal that would be distinct on a case-sensitive volume, but it
+/// can never permit an overwrite on the user's default macOS volume.
+///
+/// Existing parent directories are allowed, while an existing final target is
+/// rejected. Bundle directory destinations reserve their root once; file-set
+/// collections reserve each member target.
+pub fn validate_destination_ledger(
+    proposals: &[ChangeProposal],
+    decisions: &[ReviewDecision],
+    approved_bundles: &[BundleProposal],
+) -> Result<()> {
+    let by_id: HashMap<Uuid, &ChangeProposal> = proposals.iter().map(|p| (p.id, p)).collect();
+    let mut reserved: Vec<(Vec<String>, String)> = Vec::new();
+
+    for decision in decisions {
+        let (id, target) = match decision {
+            ReviewDecision::Approve(id) => {
+                let Some(proposal) = by_id.get(id) else {
+                    continue;
+                };
+                (*id, proposal.proposed_path.as_path())
+            }
+            ReviewDecision::Override {
+                proposal_id,
+                new_target,
+            } => {
+                if !by_id.contains_key(proposal_id) {
+                    continue;
+                }
+                (*proposal_id, new_target.as_path())
+            }
+            ReviewDecision::Reject(_) => continue,
+        };
+        reserve_destination(&mut reserved, id, target)?;
+    }
+
+    for bundle in approved_bundles {
+        if bundle.kind.moves_as_file_set() {
+            for member in &bundle.members {
+                reserve_destination(&mut reserved, member.id, &member.proposed_path)?;
+            }
+        } else {
+            let leaf = bundle
+                .root
+                .file_name()
+                .ok_or_else(|| anyhow!("bundle root has no filename: {}", bundle.root.display()))?;
+            reserve_destination(&mut reserved, bundle.id, &bundle.target_parent.join(leaf))?;
+        }
+    }
+    Ok(())
+}
+
+fn reserve_destination(
+    reserved: &mut Vec<(Vec<String>, String)>,
+    id: Uuid,
+    target: &Path,
+) -> Result<()> {
+    let key = normalized_destination(target);
+    for (other_key, other) in reserved.iter() {
+        let overlap =
+            key == *other_key || key.starts_with(other_key) || other_key.starts_with(&key);
+        if overlap {
+            return Err(anyhow!(
+                "approved operations have overlapping destinations at {} ({} and {}); refusing to apply",
+                target.display(),
+                other,
+                id,
+            ));
+        }
+    }
+    if target.exists() {
+        return Err(anyhow!(
+            "approved operation targets an existing path {}; refusing to overwrite",
+            target.display()
+        ));
+    }
+    reserved.push((key, id.to_string()));
+    Ok(())
+}
+
+fn normalized_destination(path: &Path) -> Vec<String> {
+    // Component-wise comparison catches ancestor/descendant conflicts without
+    // confusing names such as `foo` and `foobar`. Lower-casing is conservative
+    // for case-insensitive macOS/Windows volumes. Unicode normalization is not
+    // performed here, so canonically equivalent decomposed/composed spellings
+    // remain a known limitation and are still subject to the exact filesystem
+    // guard at apply time.
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy().to_lowercase())
+        .collect()
+}
+
 /// Decide which bundles to apply, honouring both the `--yes` threshold path and
 /// interactive per-bundle review.
 ///
-/// - `auto_approve_all = true` (`--yes`): non-interactive — approve bundles
-///   clearing `min_confidence` via [`select_auto_applied_bundles`]. The bundle
-///   review handler is not consulted, consistent with `--yes` skipping prompts.
+/// - `auto_approve_all = true` (`--yes`): non-interactive — approve recognized
+///   opaque structural bundles clearing `min_confidence` via
+///   [`select_auto_applied_bundles`]. Soft/file-set collections remain pending
+///   until calibrated and explicitly reviewed.
 /// - `auto_approve_all = false`: delegate to [`ReviewHandler::review_bundles`].
-///   The CLI's interactive handler prompts per bundle; the default trait impl
-///   (UI today, test stubs) approves nothing, so every bundle stays pending —
-///   exactly the pre-bundle-review behaviour.
+///   The CLI prompts per bundle and the desktop exposes bundle decisions in its
+///   complete-plan surface. A frontend that relies on the default trait method
+///   approves nothing, so its bundles stay pending.
 ///
 /// Returns the proposals the user (or threshold) approved. The threshold path
-/// applies move-only bundles; any bundle containing a rename remains pending
-/// until a frontend reviews it explicitly.
+/// applies only recognized opaque structural bundles; any generic, soft, or
+/// rename-bearing bundle remains pending until a frontend reviews it explicitly.
 ///
 /// # Errors
 /// Propagates errors from the review handler.
@@ -1236,7 +1340,7 @@ mod tests {
         let report = apply_loose_decisions(&[proposal], &decisions, &deps, true)
             .await
             .unwrap();
-        assert_eq!(report.applied, 1);
+        assert_eq!(report.applied, 1, "dry-run reports what would apply");
         assert!(src.exists(), "dry-run must not touch source");
         assert!(!dst.exists(), "dry-run must not touch destination");
     }
@@ -1386,18 +1490,7 @@ mod tests {
 
     #[tokio::test]
     async fn select_auto_applied_bundles_requires_yes_and_threshold() {
-        let low = BundleProposal {
-            id: Uuid::new_v4(),
-            root: PathBuf::from("/a"),
-            kind: BundleKind::Generic,
-            target_parent: PathBuf::from("/target"),
-            members: vec![],
-            confidence: 0.3,
-            reasoning: "t".into(),
-            status: ChangeStatus::Pending,
-            created_at: chrono::Utc::now(),
-            applied_at: None,
-        };
+        let low = sample_bundle(0.3);
         let typical_raw_cosine = BundleProposal {
             confidence: 0.55,
             id: Uuid::new_v4(),
@@ -1413,7 +1506,33 @@ mod tests {
         assert_eq!(
             ids.iter().map(|bundle| bundle.id).collect::<Vec<_>>(),
             vec![typical_raw_cosine.id],
-            "a typical semantic bundle cosine must clear the auto-approve threshold",
+            "a structural bundle clears the configured raw-cosine threshold",
+        );
+    }
+
+    #[test]
+    fn soft_and_generic_bundles_require_explicit_review() {
+        let mut semantic = sample_bundle(0.99);
+        semantic.kind = BundleKind::SemanticCollection {
+            label: "example".to_string(),
+        };
+        let mut photo_burst = sample_bundle(0.99);
+        photo_burst.kind = BundleKind::PhotoBurst;
+        let mut generic = sample_bundle(0.99);
+        generic.kind = BundleKind::Generic;
+
+        assert!(
+            select_auto_applied_bundles(&[semantic, photo_burst, generic], true, 0.0).is_empty()
+        );
+
+        let structural = sample_bundle(0.99);
+        assert_eq!(
+            select_auto_applied_bundles(std::slice::from_ref(&structural), true, 0.50)
+                .iter()
+                .map(|bundle| bundle.id)
+                .collect::<Vec<_>>(),
+            vec![structural.id],
+            "recognized opaque structural bundles remain eligible after clearing the threshold",
         );
     }
 
@@ -1436,7 +1555,7 @@ mod tests {
         BundleProposal {
             id: Uuid::new_v4(),
             root: PathBuf::from("/a"),
-            kind: BundleKind::Generic,
+            kind: BundleKind::RustCrate,
             target_parent: PathBuf::from("/target"),
             members: vec![],
             confidence,
@@ -1497,6 +1616,15 @@ mod tests {
             reviewer.seen.lock().unwrap().is_empty(),
             "review_bundles must not be called on the --yes path",
         );
+    }
+
+    #[test]
+    fn generic_envelopes_require_explicit_review() {
+        let generic = BundleProposal {
+            kind: BundleKind::Generic,
+            ..sample_bundle(0.99)
+        };
+        assert!(select_auto_applied_bundles(&[generic], true, 0.0).is_empty());
     }
 
     #[tokio::test]
@@ -1867,7 +1995,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_file_set_bundle_dry_run_touches_nothing() {
+    async fn apply_file_set_bundle_dry_run_reports_same_disposition_as_real_apply() {
         let dir = TempDir::new().unwrap();
         let src = dir.path().join("c.jpg");
         std::fs::write(&src, b"c").unwrap();
@@ -1889,8 +2017,81 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(report.bundles_applied, 1);
+        assert_eq!(
+            report.bundles_applied, 1,
+            "dry-run reports what would apply"
+        );
         assert!(src.exists(), "dry-run must not move the source");
         assert!(!dst.exists(), "dry-run must not create the target");
+
+        let applied = apply_bundles(
+            std::slice::from_ref(&bundle),
+            std::slice::from_ref(&bundle),
+            &deps,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.bundles_applied, applied.bundles_applied);
+        assert!(!src.exists());
+        assert!(dst.exists());
+    }
+
+    #[test]
+    fn destination_ledger_catches_cross_case_collisions() {
+        let dir = TempDir::new().unwrap();
+        let source_a = dir.path().join("a.txt");
+        let source_b = dir.path().join("b.txt");
+        let target = dir.path().join("Organized/item.txt");
+        let first = sample_proposal(source_a, &target);
+        let second_target = dir.path().join("Organized/ITEM.txt");
+        let second = sample_proposal(source_b, &second_target);
+        let decisions = vec![
+            ReviewDecision::Approve(first.id),
+            ReviewDecision::Approve(second.id),
+        ];
+        let error = validate_destination_ledger(&[first, second], &decisions, &[])
+            .expect_err("case-folded targets must be held before apply");
+        assert!(error.to_string().contains("overlapping destinations"));
+    }
+
+    #[test]
+    fn destination_ledger_catches_loose_target_inside_bundle_target() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("incoming/readme.txt");
+        let bundle_root = dir.path().join("incoming/project");
+        let target_parent = dir.path().join("organized");
+        let bundle_member_target = target_parent.join("project/readme.txt");
+        let loose = sample_proposal(source, &bundle_member_target);
+        let structural_member =
+            sample_proposal(bundle_root.join("readme.txt"), &bundle_member_target);
+        let structural = BundleProposal::new(
+            bundle_root,
+            BundleKind::RustCrate,
+            target_parent,
+            vec![structural_member],
+            0.9,
+            "project".to_string(),
+        )
+        .unwrap();
+        let decisions = vec![ReviewDecision::Approve(loose.id)];
+        let error =
+            validate_destination_ledger(&[loose], &decisions, std::slice::from_ref(&structural))
+                .expect_err("a member cannot target inside a structural bundle root");
+        assert!(error.to_string().contains("overlapping destinations"));
+    }
+
+    #[test]
+    fn destination_ledger_rejects_existing_final_target() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("source.txt");
+        let target = dir.path().join("organized/existing.txt");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, b"already here").unwrap();
+        let proposal = sample_proposal(source, &target);
+        let decisions = vec![ReviewDecision::Approve(proposal.id)];
+        let error = validate_destination_ledger(&[proposal], &decisions, &[])
+            .expect_err("existing final target must be held");
+        assert!(error.to_string().contains("existing path"));
     }
 }

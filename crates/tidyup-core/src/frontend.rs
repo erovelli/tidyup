@@ -50,9 +50,9 @@ pub trait ProgressReporter: Send + Sync {
 /// Review strategy: how the frontend gathers decisions on classification proposals.
 ///
 /// Implementations:
-/// - **CLI interactive** — ratatui or prompt-per-file (`tidyup migrate --interactive`)
-/// - **CLI auto**        — accept-all, reject-below-threshold, etc. (`--yes`, `--min-confidence`)
-/// - **UI**              — the diff-view page, returning the full decision set when user clicks Apply
+/// - **CLI interactive** — prompt per loose item and atomic bundle
+/// - **CLI auto** — restricted threshold approval under `--yes`
+/// - **UI** — one diff-style complete plan, returned when the user clicks Execute
 #[async_trait]
 pub trait ReviewHandler: Send + Sync {
     /// Present all proposals. Return one decision per proposal.

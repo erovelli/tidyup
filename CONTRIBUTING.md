@@ -15,7 +15,7 @@ cargo run -p tidyup-cli -- --help
 
 - **Rust 1.95** — selected automatically via `rust-toolchain.toml`; no manual setup needed.
 - **`cargo install cargo-deny cargo-hack`** — required by the supplemental gates `cargo xtask deny` (license/source policy) and `cargo xtask feature-matrix`.
-- **ONNX Runtime (`libonnxruntime`)** — needed to build/run the embedding path (`tidyup-embeddings-ort`) and the model-dependent tests/eval. Fetch the model bundles with `cargo xtask download-models` before running them.
+- **ONNX Runtime (`libonnxruntime`)** — loaded dynamically when running the real embedding path and model-dependent eval/bench commands; ordinary model-free compilation and CI tests do not load it. Fetch model bundles with `cargo xtask download-models` before model-backed runs.
 
 Two hard gates a PR must clear, both documented in `CLAUDE.md`:
 
@@ -42,7 +42,7 @@ Before adding a new crate, ask: does it have (a) heavy disjoint deps, (b) featur
 - [ ] New public items are documented
 - [ ] No new `unwrap()` / `expect()` / `todo!()` outside tests (tests opt out with `#[allow(clippy::unwrap_used)]` at the `mod tests` level)
 - [ ] New deps added to root `[workspace.dependencies]` (no per-crate version pins)
-- [ ] Affected docs (`README.md` / `ARCHITECTURE.md` / `CLASSIFICATION.md` / `DESIGN.md`) updated in the same commit
+- [ ] Affected root docs, crate READMEs, rustdoc, and `SEMANTIC_ORGANIZATION_PLAN.md` status updated in the same commit
 
 This mirrors `.github/pull_request_template.md`; keep the two in sync.
 

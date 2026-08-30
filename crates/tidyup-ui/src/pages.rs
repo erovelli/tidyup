@@ -207,6 +207,7 @@ pub(crate) fn Review() -> Element {
     let folder_count = count_folders(&model.left_rows);
 
     let filtered: Vec<ChangeProposal> = filter_proposals(&proposals, *filter.read());
+    let indexed_count = usize::try_from(*signals.indexed_count.read()).unwrap_or(usize::MAX);
 
     rsx! {
         div {
@@ -214,7 +215,7 @@ pub(crate) fn Review() -> Element {
             PhaseBanner { signals }
 
             SummaryCards {
-                indexed: proposals.len(),
+                indexed: indexed_count,
                 pending: if pending { proposals.len() } else { 0 },
                 applied: applied_count,
             }
@@ -1264,6 +1265,7 @@ fn CombinedReview(state: SharedState) -> Element {
         .map(|bundle| bundle.members.len())
         .sum::<usize>();
     let total_files = loose_count.saturating_add(collection_files);
+    let indexed_count = usize::try_from(*signals.indexed_count.read()).unwrap_or(usize::MAX);
     let approved_n = approvals.values().filter(|v| **v).count();
     let mut plan_changes = proposals.clone();
     let locked_ids: Vec<Uuid> = bundles
@@ -1298,7 +1300,7 @@ fn CombinedReview(state: SharedState) -> Element {
         div {
             h1 { class: "page-title", "Review" }
             PhaseBanner { signals }
-            SummaryCards { indexed: total_files, pending: total_files, applied: 0 }
+            SummaryCards { indexed: indexed_count, pending: total_files, applied: 0 }
             div {
                 class: "card",
                 h2 { class: "card-title", "Complete organization plan" }
@@ -1642,6 +1644,7 @@ fn RunRow(run: RunRecord, busy: Busy) -> Element {
         .as_ref()
         .map_or_else(String::new, |p| p.display().to_string());
     let can_rollback = matches!(run.state, RunState::Completed) && busy == Busy::Idle;
+    let capability_summary = run.capabilities.summary();
     let run_id = run.id;
 
     let rollback_state = state.clone();
@@ -1657,6 +1660,9 @@ fn RunRow(run: RunRecord, busy: Busy) -> Element {
                 "{source}"
                 if !target.is_empty() {
                     span { " → {target}" }
+                }
+                if !capability_summary.is_empty() {
+                    span { class: "small muted", "{capability_summary}" }
                 }
             }
             button {
@@ -1689,7 +1695,7 @@ pub(crate) fn Settings() -> Element {
             let toml_text =
                 toml::to_string_pretty(&cfg).unwrap_or_else(|e| format!("<error: {e}>"));
 
-            // Tier 3 (LLM fallback) — the three privacy gates, surfaced.
+            // Optional LLM reranker — the three privacy gates, surfaced.
             let llm_active = state.signals.llm_fallback_active;
             let feature_compiled = cfg!(feature = "llm-fallback");
             let config_enabled = cfg.inference.llm_fallback;
@@ -1706,13 +1712,13 @@ pub(crate) fn Settings() -> Element {
                 "Enable for this session"
             };
             let tier3_status = if !feature_compiled {
-                "This desktop build was compiled without the `llm-fallback` feature, so Tier 3 is unavailable. Rebuild with `--features llm-fallback` to enable it.".to_string()
+                "This desktop build was compiled without the `llm-fallback` feature, so the optional reranker is unavailable. Rebuild with `--features llm-fallback` to enable it.".to_string()
             } else if !config_enabled {
-                "Set `[inference] llm_fallback = true` in the config file to allow Tier 3. It stays off until you do.".to_string()
+                "Set `[inference] llm_fallback = true` in the config file to allow optional LLM reranking. It stays off until you do.".to_string()
             } else if is_active {
-                "Tier 3 LLM fallback is active for this session. Ambiguous files may be classified on-device by the local LLM.".to_string()
+                "The optional LLM reranker is active for this session. Ambiguous embedding results may be reranked on-device.".to_string()
             } else {
-                "Tier 3 is available. Enable it for this session to let the local LLM resolve low-confidence classifications.".to_string()
+                "The optional LLM reranker is available. Enable it for this session to refine low-confidence classifications.".to_string()
             };
 
             rsx! {
@@ -1737,7 +1743,7 @@ pub(crate) fn Settings() -> Element {
 
                     div {
                         class: "card",
-                        h2 { class: "card-title", "Tier 3 — LLM fallback" }
+                        h2 { class: "card-title", "Optional LLM reranker" }
                         p {
                             class: "small muted",
                             style: "margin: 0 0 12px;",
@@ -1979,6 +1985,9 @@ fn LastReportCard(signals: SignalBundle) -> Element {
             ReportSummary {
                 title: "Scan complete",
                 run_id: r.run_id,
+                indexed: r.indexed,
+                indexing_failed: r.indexing_failed,
+                capabilities: r.capabilities.summary(),
                 proposed: r.proposed,
                 applied: r.applied,
                 bundles: r.bundles,
@@ -1991,6 +2000,9 @@ fn LastReportCard(signals: SignalBundle) -> Element {
             ReportSummary {
                 title: "Migration complete",
                 run_id: r.run_id,
+                indexed: r.source_indexed + r.target_indexed,
+                indexing_failed: r.indexing_failed,
+                capabilities: r.capabilities.summary(),
                 proposed: r.proposed,
                 applied: r.applied,
                 bundles: r.bundles,
@@ -2036,6 +2048,9 @@ fn LastReportCard(signals: SignalBundle) -> Element {
 fn ReportSummary(
     title: &'static str,
     run_id: Uuid,
+    indexed: usize,
+    indexing_failed: usize,
+    capabilities: String,
     proposed: usize,
     applied: usize,
     bundles: usize,
@@ -2048,10 +2063,15 @@ fn ReportSummary(
             class: "card",
             h2 { class: "card-title", "{title}" }
             div { class: "small muted", "Run {run_id}" }
+            div { class: "small muted", "{capabilities}" }
             div {
                 class: "button-row",
                 style: "margin-top: 8px;",
                 span { class: "chip chip-neutral", "{proposed} proposed" }
+                span { class: "chip chip-neutral", "{indexed} indexed" }
+                if indexing_failed > 0 {
+                    span { class: "chip chip-low", "{indexing_failed} indexing failure(s)" }
+                }
                 span { class: "chip chip-high",    "{applied} applied" }
                 if skipped > 0 { span { class: "chip chip-medium", "{skipped} skipped" } }
                 if failed  > 0 { span { class: "chip chip-low",    "{failed} failed" } }
@@ -2068,7 +2088,7 @@ fn ReportSummary(
 // Async actions. Each spawns a task that drives a service to completion.
 // ---------------------------------------------------------------------------
 
-/// Read the current Tier 3 (LLM fallback) activation from the session toggle.
+/// Read optional LLM-reranker activation from the session toggle.
 /// The Settings surface only lets the toggle reach `true` when the cargo feature
 /// and the config gate are both satisfied, so this read is the third privacy
 /// gate. Read in component scope (not inside the spawned task) to keep the
@@ -2204,7 +2224,7 @@ fn launch_rollback(state: &SharedState, run_id: Uuid) {
     spawn_forever(async move {
         let result = async {
             let cfg = config::load()?;
-            // Rollback never classifies — no Tier 3 needed.
+            // Rollback never classifies, so no optional reranker is needed.
             let ctx = build(&cfg, false, InferenceActivation::default()).await?;
             let reporter = DioxusReporter::new(signals);
             let service = RollbackService::new(Arc::clone(&ctx));

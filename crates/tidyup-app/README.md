@@ -2,4 +2,6 @@
 
 Application services for [tidyup](https://github.com/erovelli/tidyup) — the plug-and-play handles shared by the CLI and desktop UI. Both frontends construct identical `MigrationService`/`ScanService`/`RollbackService` instances and differ only in their `ProgressReporter` and `ReviewHandler` implementations.
 
-Also hosts layered configuration (`tidyup_app::config`) since config has no heavy deps of its own.
+Services persist a forward-compatible run capability manifest and a stage-batched per-file processing ledger before review, attach canonical indexed identities to proposals, and enforce write-ahead journaling, destination collision checks, review-boundary bundle reconciliation, atomic file-set application, and reversible shelving. Interactive frontends can override `ReviewHandler::review_all` to present loose changes and bundles as one plan; `--yes` still follows the service's restricted auto-approval policy, never auto-applying renames or soft/file-set bundles. Dry-run reports successful “would apply” dispositions without filesystem, shelf, or applied-state mutation (diagnostic provenance may still be stored), and the rollback service exposes retention pruning for both shelves and semantic artifacts.
+
+Also hosts layered configuration (`tidyup_app::config`) and materializes the pipeline classifier configuration from it. `[classifier] min_confidence` controls loose move-only auto-approval; recognized opaque structural bundles use the separate application constant `DEFAULT_BUNDLE_MIN_CONFIDENCE`.

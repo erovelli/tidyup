@@ -22,6 +22,11 @@ pub struct ExtractedContent {
 /// transcribe (e.g., binary blobs, encrypted PDFs).
 #[async_trait]
 pub trait ContentExtractor: Send + Sync {
+    /// Stable implementation identity recorded in a run capability manifest.
+    fn capability_id(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
     fn supports(&self, path: &Path, mime: Option<&str>) -> bool;
     async fn extract(&self, path: &Path) -> Result<ExtractedContent>;
 }

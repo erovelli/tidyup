@@ -1,22 +1,25 @@
-//! Extractive rename cascade — produces proposed filenames without fabrication.
+//! Grounded rename cascade — produces proposed filenames from file evidence.
 //!
 //! The cascade runs highest-signal to lowest and returns the first hit:
 //!
 //! 1. **Embedded metadata.** ID3 `title` / `artist`, EXIF `image_description`
 //!    or `make` + `model`, generic `title` keys. Any [`ExtractedContent::metadata`]
 //!    that names the content directly.
-//! 2. **Keyword-template fill.** Top-ranked YAKE terms from
+//! 2. **Keyword composition.** Top-ranked YAKE terms from
 //!    [`crate::yake::extract_keywords`] assembled into a `year_topic` style
 //!    name. Year comes from filename or content when available.
-//! 3. **No signal → no rename.** Returns `None`; the caller should keep the
+//! 3. **Semantic concepts.** A caller with a contrastive multimodal embedding
+//!    may provide scored visible/audible concepts through
+//!    [`propose_grounded_rename`]. This path is retrieval, not generation.
+//! 4. **No signal → no rename.** Returns `None`; the caller should keep the
 //!    original filename.
 //!
-//! # Why extractive-only
+//! # Why grounded-only
 //!
-//! Rename proposals are capped at extracted evidence per the policy in
-//! `CLAUDE.md` — no LLM-fabricated names even when `--features llm-fallback`
-//! is enabled. This module is structurally incapable of producing a name
-//! without either metadata or keywords from the file itself.
+//! Rename proposals are capped at inspectable evidence: exact metadata,
+//! extracted keywords, or concepts retrieved from a bounded contrastive-model
+//! bank. No LLM-fabricated name is accepted even when an optional fallback is
+//! enabled.
 //!
 //! # Gate
 //!
@@ -32,6 +35,7 @@ use std::path::Path;
 use serde_json::Value;
 use tidyup_domain::{ChangeProposal, ChangeType};
 
+use crate::semantic::ConceptMatch;
 use crate::yake::Keyword;
 
 /// Maximum number of distinct words composing a synthesized keyword stem. Keeps
@@ -51,15 +55,17 @@ pub enum RenameProposal {
     Keep,
 }
 
-/// Which tier of the cascade produced the rename.
+/// Which grounded evidence source produced the rename.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenameSource {
-    /// Pulled from embedded metadata (ID3, EXIF, PDF title, etc.).
+    /// Pulled from embedded metadata (for example ID3 or EXIF fields).
     Metadata,
     /// Derived from text visibly present in an image via local OCR.
     Ocr,
     /// Synthesized from YAKE top-k keywords plus optional year prefix.
     Keywords,
+    /// Retrieved from non-textual content through a contrastive model.
+    SemanticConcept,
 }
 
 impl RenameSource {
@@ -69,6 +75,7 @@ impl RenameSource {
             Self::Metadata => "metadata",
             Self::Ocr => "local OCR",
             Self::Keywords => "keywords",
+            Self::SemanticConcept => "grounded semantic concepts",
         }
     }
 }
@@ -78,7 +85,7 @@ impl RenameSource {
 /// `metadata` is the `ExtractedContent::metadata` value returned by the
 /// extractor. `keywords` is the (possibly empty) YAKE output; empty input
 /// triggers fallthrough to `Keep`. `year` seeds the year prefix when the
-/// keyword tier fires — `None` drops the prefix.
+/// keyword-based rename path fires — `None` drops the prefix.
 #[must_use]
 pub fn propose_rename(
     original: &Path,
@@ -105,26 +112,16 @@ pub fn propose_rename(
         }
     }
 
-    if let Some(stem) = metadata
-        .get("ocr_text")
-        .and_then(Value::as_str)
-        .and_then(stem_from_ocr)
-    {
-        if !is_trivial_rename(&stem, original_stem) {
-            let name = finalize(&stem, ext.as_deref());
-            return RenameProposal::Rename {
-                name,
-                source: RenameSource::Ocr,
-            };
-        }
-    }
-
     if let Some(stem) = stem_from_keywords(keywords, year) {
         if !is_trivial_rename(&stem, original_stem) {
             let name = finalize(&stem, ext.as_deref());
             return RenameProposal::Rename {
                 name,
-                source: RenameSource::Keywords,
+                source: if metadata.get("ocr_text").and_then(Value::as_str).is_some() {
+                    RenameSource::Ocr
+                } else {
+                    RenameSource::Keywords
+                },
             };
         }
     }
@@ -132,19 +129,57 @@ pub fn propose_rename(
     RenameProposal::Keep
 }
 
+/// Compose a deterministic filename from strongly grounded semantic concepts.
+///
+/// The caller owns confidence and mismatch gating. This renderer only accepts
+/// already-ranked concept labels and preserves the original extension.
+#[must_use]
+pub fn propose_grounded_rename(original: &Path, concepts: &[ConceptMatch]) -> RenameProposal {
+    let stem = concepts
+        .iter()
+        .take(2)
+        .map(|concept| sanitize_token(&concept.label))
+        .filter(|label| !label.is_empty())
+        .collect::<Vec<_>>()
+        .join("_on_");
+    let original_stem = original
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    if stem.is_empty() || is_trivial_rename(&stem, original_stem) {
+        return RenameProposal::Keep;
+    }
+    let extension = original
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase);
+    RenameProposal::Rename {
+        name: finalize(&stem, extension.as_deref()),
+        source: RenameSource::SemanticConcept,
+    }
+}
+
 /// Make proposed member filenames unique within one atomic collection.
 ///
 /// Existing move-only names are reserved first so a generated rename cannot
 /// claim a sibling's unchanged basename. Colliding rename proposals receive a
 /// deterministic numeric suffix while retaining their extracted stem and
-/// extension. Comparisons are case-insensitive to stay safe on the default
-/// macOS and Windows filesystems.
-pub(crate) fn uniquify_bundle_member_names(proposals: &mut [ChangeProposal]) {
-    let mut claimed = proposals
+/// extension. A move-only collision is rejected instead of fabricating an
+/// ungrounded rename. Comparisons are case-insensitive to stay safe on the
+/// default macOS and Windows filesystems.
+pub(crate) fn uniquify_bundle_member_names(proposals: &mut [ChangeProposal]) -> anyhow::Result<()> {
+    let mut claimed = HashSet::new();
+    for proposal in proposals
         .iter()
         .filter(|proposal| proposal.change_type == ChangeType::Move)
-        .map(|proposal| proposal.proposed_name.to_lowercase())
-        .collect::<HashSet<_>>();
+    {
+        if !claimed.insert(proposal.proposed_name.to_lowercase()) {
+            return Err(anyhow::anyhow!(
+                "move-only bundle members collide at basename {}",
+                proposal.proposed_name
+            ));
+        }
+    }
 
     for proposal in proposals.iter_mut().filter(|proposal| {
         matches!(
@@ -166,6 +201,7 @@ pub(crate) fn uniquify_bundle_member_names(proposals: &mut [ChangeProposal]) {
             }
         }
     }
+    Ok(())
 }
 
 fn filename_with_sequence(filename: &str, sequence: u32) -> String {
@@ -193,7 +229,7 @@ fn filename_with_sequence(filename: &str, sequence: u32) -> String {
 /// - `tags.title` (audio without artist)
 /// - `exif.image_description` (image)
 /// - `exif.make` + `exif.model` (image fallback)
-/// - `title` at the top level (PDF / generic)
+/// - `title` at the top level when supplied by an extractor
 fn stem_from_metadata(metadata: &Value) -> Option<String> {
     let tags = metadata.get("tags").and_then(Value::as_object);
     if let Some(tags) = tags {
@@ -230,69 +266,8 @@ fn stem_from_metadata(metadata: &Value) -> Option<String> {
     None
 }
 
-/// Produce a compact, evidence-backed screenshot label from locally recognised
-/// text. These templates intentionally contain only artifact roles and facts
-/// present in the OCR transcript; the keyword tier remains the fallback for
-/// screenshots outside these common states.
-fn stem_from_ocr(text: &str) -> Option<String> {
-    let lower = text.to_ascii_lowercase();
-    if lower.contains("leaderboard") && lower.contains("testbench") {
-        return Some("project_homepage".to_string());
-    }
-
-    let score = score_after_label(&lower);
-    if lower.contains("submitted") {
-        return Some(score.map_or_else(
-            || "submission_confirmation".to_string(),
-            |value| format!("submission_confirmation_score_{value}"),
-        ));
-    }
-    if lower.contains("success") && lower.contains("score") {
-        return Some(score.map_or_else(
-            || "testbench_success".to_string(),
-            |value| format!("testbench_success_score_{value}"),
-        ));
-    }
-    None
-}
-
-fn score_after_label(text: &str) -> Option<String> {
-    let start = text.match_indices("score").find_map(|(index, label)| {
-        let before = text.get(..index)?.chars().next_back();
-        let after_index = index.saturating_add(label.len());
-        let after = text.get(after_index..)?.chars().next();
-        let bounded_before = before.is_none_or(|ch| !ch.is_ascii_alphanumeric());
-        let bounded_after = after.is_none_or(|ch| !ch.is_ascii_alphanumeric());
-        (bounded_before && bounded_after).then_some(after_index)
-    })?;
-    let tail = text.get(start..)?;
-    let mut digits = String::new();
-    let mut started = false;
-    let mut chars = tail.chars().take(48);
-    while let Some(ch) = chars.next() {
-        if ch.is_ascii_digit() {
-            digits.push(ch);
-            started = true;
-        } else if started && ch == ',' {
-            // A comma is numeric punctuation only when followed by an exact
-            // three-digit thousands group. Whitespace and underscores always
-            // terminate the number instead of merging unrelated runs.
-            let mut lookahead = chars.clone();
-            let group: String = lookahead.by_ref().take(3).collect();
-            let group_ends = lookahead.next().is_none_or(|next| !next.is_ascii_digit());
-            if group.len() != 3 || !group.chars().all(|digit| digit.is_ascii_digit()) || !group_ends
-            {
-                break;
-            }
-        } else if started {
-            break;
-        }
-    }
-    (digits.len() >= 2).then_some(digits)
-}
-
 // ---------------------------------------------------------------------------
-// Tier 2 — keyword-template fill
+// Grounded keyword composition
 // ---------------------------------------------------------------------------
 
 /// Compose a stem from the top YAKE keywords, optionally prefixed with a year.
@@ -546,11 +521,28 @@ mod tests {
             renamed_member("IMG_0001.jpg", proposed_names[0].clone()),
             renamed_member("IMG_0002.jpg", proposed_names[1].clone()),
         ];
-        uniquify_bundle_member_names(&mut members);
+        uniquify_bundle_member_names(&mut members).unwrap();
 
         assert_eq!(members[0].proposed_name, "canon_eos_r5.jpg");
         assert_eq!(members[1].proposed_name, "canon_eos_r5_2.jpg");
         assert!(members[1].proposed_path.ends_with("canon_eos_r5_2.jpg"));
+    }
+
+    #[test]
+    fn move_only_collisions_are_rejected_instead_of_renamed_without_evidence() {
+        let mut members = vec![
+            renamed_member("A.txt", "A.txt".to_string()),
+            renamed_member("a.txt", "a.txt".to_string()),
+        ];
+        for member in &mut members {
+            member.change_type = ChangeType::Move;
+            member.rename_mismatch_score = None;
+        }
+
+        let error = uniquify_bundle_member_names(&mut members).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("move-only bundle members collide"));
     }
 
     #[test]
@@ -570,57 +562,44 @@ mod tests {
     }
 
     #[test]
-    fn ocr_names_submission_confirmation_from_visible_facts() {
-        let meta = json!({"ocr_text": "Submitted! Score: 32811\nSUCCESS!"});
+    fn ocr_uses_general_keyword_evidence() {
+        let meta = json!({"ocr_text": "Submitted quarterly expense report"});
+        let keywords = vec![kw("quarterly expense", 0.1), kw("report", 0.2)];
         let p = propose_rename(
             &PathBuf::from("/d/Screenshot 2026-08-25 at 10.10.36 PM.png"),
             &meta,
-            &[],
+            &keywords,
             None,
         );
         assert_eq!(
             p,
             RenameProposal::Rename {
-                name: "submission_confirmation_score_32811.png".to_string(),
+                name: "quarterly_expense_report.png".to_string(),
                 source: RenameSource::Ocr,
             }
         );
     }
 
     #[test]
-    fn score_parser_requires_a_label_boundary() {
-        assert_eq!(score_after_label("scoreboard 9999"), None);
-        assert_eq!(score_after_label("high-scorer 9999"), None);
-    }
-
-    #[test]
-    fn score_parser_does_not_merge_separate_digit_runs() {
-        assert_eq!(score_after_label("score 12 34"), Some("12".to_string()));
-        assert_eq!(score_after_label("score 12_34"), Some("12".to_string()));
-    }
-
-    #[test]
-    fn score_parser_accepts_thousands_grouping() {
-        assert_eq!(
-            score_after_label("score: 32,811 points"),
-            Some("32811".to_string())
-        );
-    }
-
-    #[test]
-    fn ocr_names_project_homepage() {
-        let meta = json!({"ocr_text": "README.MD\nTESTBENCH\nLEADERBOARD"});
-        let p = propose_rename(
-            &PathBuf::from("/d/Screenshot 2026-08-25 at 10.10.58 PM.png"),
-            &meta,
-            &[],
-            None,
-        );
+    fn grounded_concepts_name_non_textual_image() {
+        let concepts = vec![
+            ConceptMatch {
+                label: "cat".to_string(),
+                score: 0.86,
+                family: "animal".to_string(),
+            },
+            ConceptMatch {
+                label: "beach".to_string(),
+                score: 0.78,
+                family: "scene".to_string(),
+            },
+        ];
+        let p = propose_grounded_rename(&PathBuf::from("/d/image_2348985fg.png"), &concepts);
         assert_eq!(
             p,
             RenameProposal::Rename {
-                name: "project_homepage.png".to_string(),
-                source: RenameSource::Ocr,
+                name: "cat_on_beach.png".to_string(),
+                source: RenameSource::SemanticConcept,
             }
         );
     }
@@ -702,6 +681,10 @@ mod tests {
     fn rename_source_label() {
         assert_eq!(RenameSource::Metadata.label(), "metadata");
         assert_eq!(RenameSource::Keywords.label(), "keywords");
+        assert_eq!(
+            RenameSource::SemanticConcept.label(),
+            "grounded semantic concepts"
+        );
     }
 
     #[test]

@@ -192,7 +192,7 @@ pub fn installation_instructions() -> String {
 }
 
 // ---------------------------------------------------------------------------
-// SigLIP (image / text) — Phase 7 multimodal Tier 2 image classifier.
+// SigLIP (image / text) — local multimodal image routing and concept grounding.
 // ---------------------------------------------------------------------------
 
 /// Vision tower ONNX. Source: HF `nielsr/siglip-base-patch16-224` ONNX export.
@@ -269,7 +269,7 @@ pub fn siglip_installation_instructions() -> String {
 }
 
 // ---------------------------------------------------------------------------
-// CLAP (audio / text) — Phase 7 multimodal Tier 2 audio classifier.
+// CLAP (audio / text) — local multimodal audio routing.
 // ---------------------------------------------------------------------------
 
 /// Audio tower ONNX. Source: HF `laion/clap-htsat-unfused` ONNX export.

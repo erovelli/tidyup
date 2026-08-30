@@ -113,7 +113,7 @@ pub struct InferenceConfig {
     /// (requires `--features llm-fallback`), `"remote-openai"` / `"remote-anthropic"`
     /// / `"remote-ollama"` (requires `--features remote`).
     pub backends: Vec<String>,
-    /// Allow the Tier-3 LLM fallback to run *if* the crate was compiled with
+    /// Allow the optional LLM reranker to run *if* the crate was compiled with
     /// `--features llm-fallback` and the per-invocation flag is set. Never enabled
     /// by default.
     pub llm_fallback: bool,
@@ -152,7 +152,7 @@ pub struct RemoteBackendConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct EmbeddingConfig {
     /// Hugging Face model id or local path. Default: `bge-small-en-v1.5` — ~35 MB
-    /// Q8 ONNX, pure-Rust via `ort`.
+    /// Q8 ONNX, executed locally through `ort` / ONNX Runtime.
     pub model_id: String,
 }
 
@@ -175,10 +175,19 @@ impl Default for EmbeddingConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RenameConfig {
-    /// Lower bound on Tier-2 classification confidence. Default 0.85.
+    /// Lower bound on deterministic semantic-routing evidence. Default 0.85.
     pub min_classification_confidence: f32,
     /// Lower bound on `1.0 - cosine(embed(filename), content_embedding)`. Default 0.60.
     pub min_mismatch_score: f32,
+    /// Lower bound on the fraction of retrieved non-textual concept labels
+    /// absent from the filename. Separate scale from text cosine mismatch.
+    pub min_grounded_mismatch: f32,
+    /// Lower bound on a contrastive model's raw concept score for grounded
+    /// image/audio naming. This is model-scale evidence, not a probability.
+    pub min_grounding_confidence: f32,
+    /// Required separation between the last selected concept and the next
+    /// unselected concept.
+    pub min_grounding_gap: f32,
 }
 
 impl Default for RenameConfig {
@@ -186,6 +195,9 @@ impl Default for RenameConfig {
         Self {
             min_classification_confidence: 0.85,
             min_mismatch_score: 0.60,
+            min_grounded_mismatch: 0.60,
+            min_grounding_confidence: 0.30,
+            min_grounding_gap: 0.02,
         }
     }
 }
@@ -410,6 +422,7 @@ backup_retention_days = 90
         assert_eq!(cfg.bundle_detection, BundleDetectionConfig::default());
         assert!((cfg.rename.min_classification_confidence - 0.85).abs() < f32::EPSILON);
         assert!((cfg.rename.min_mismatch_score - 0.60).abs() < f32::EPSILON);
+        assert!((cfg.rename.min_grounded_mismatch - 0.60).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -419,6 +432,7 @@ backup_retention_days = 90
         assert!(s.contains("[rename]"));
         assert!(s.contains("min_classification_confidence = 0.85"));
         assert!(s.contains("min_mismatch_score = 0.6"));
+        assert!(s.contains("min_grounded_mismatch = 0.6"));
     }
 
     #[test]
