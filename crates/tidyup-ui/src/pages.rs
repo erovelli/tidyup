@@ -176,7 +176,7 @@ pub(crate) fn Review() -> Element {
     let bundles = signals.bundles.read().clone();
     let pending = *signals.review_pending.read();
 
-    let threshold = use_signal(|| 75_u32);
+    let threshold = use_signal(|| 0.75_f32);
     let filter = use_signal(|| FilterMode::All);
     // Interactive diff state. Hover highlights both endpoints + the curve;
     // click on a row or curve "selects" the proposal and surfaces inline
@@ -556,15 +556,16 @@ fn SummaryCard(value: String, label: &'static str) -> Element {
 fn DiffHeader(
     proposals_count: usize,
     folder_count: usize,
-    threshold: Signal<u32>,
+    threshold: Signal<f32>,
     pending: bool,
     state: SharedState,
 ) -> Element {
     let threshold_val = *threshold.read();
+    let threshold_label = format!("{threshold_val:.2}");
     let on_input = move |ev: Event<FormData>| {
         let mut t = threshold;
-        if let Ok(n) = ev.value().parse::<u32>() {
-            t.set(n.min(100));
+        if let Ok(n) = ev.value().parse::<f32>() {
+            t.set(n.clamp(0.0, 1.0));
         }
     };
 
@@ -595,13 +596,13 @@ fn DiffHeader(
                     input {
                         r#type: "number",
                         min: "0",
-                        max: "100",
-                        step: "1",
-                        value: "{threshold_val}",
+                        max: "1",
+                        step: "0.01",
+                        value: "{threshold_label}",
                         oninput: on_input,
                         class: "threshold-number",
                     }
-                    span { class: "threshold-unit", "%" }
+                    span { class: "threshold-unit", "similarity" }
                 }
                 button {
                     r#type: "button",
@@ -622,10 +623,9 @@ fn DiffHeader(
     }
 }
 
-fn execute_with_threshold(state: &SharedState, threshold_pct: u32) {
+fn execute_with_threshold(state: &SharedState, threshold: f32) {
     let signals = state.signals;
     let proposals = signals.proposals.read().clone();
-    let threshold = f32::from(u16::try_from(threshold_pct).unwrap_or(100)) / 100.0;
     let mut decisions = signals.decisions;
     decisions.with_mut(|map| {
         for p in &proposals {
@@ -653,10 +653,9 @@ fn execute_with_threshold(state: &SharedState, threshold_pct: u32) {
     submit_review(state);
 }
 
-fn execute_combined_with_threshold(state: &SharedState, threshold_pct: u32) {
+fn execute_combined_with_threshold(state: &SharedState, threshold: f32) {
     let signals = state.signals;
     let proposals = signals.proposals.read().clone();
-    let threshold = f32::from(u16::try_from(threshold_pct).unwrap_or(100)) / 100.0;
     let mut decisions = signals.decisions;
     decisions.with_mut(|map| {
         for proposal in &proposals {
@@ -1127,7 +1126,7 @@ fn FilterTabs(filter: Signal<FilterMode>, proposals: Vec<ChangeProposal>) -> Ele
         div {
             class: "filter-tabs",
             FilterPill { label: "All",           count: all_n,    active: current == FilterMode::All,         onclick: set(FilterMode::All) }
-            FilterPill { label: "High ≥80%",     count: high_n,   active: current == FilterMode::High,        onclick: set(FilterMode::High) }
+            FilterPill { label: "High ≥0.80",    count: high_n,   active: current == FilterMode::High,        onclick: set(FilterMode::High) }
             FilterPill { label: "Medium",        count: mid_n,    active: current == FilterMode::Medium,      onclick: set(FilterMode::Medium) }
             FilterPill { label: "Needs review",  count: review_n, active: current == FilterMode::NeedsReview, onclick: set(FilterMode::NeedsReview) }
         }
@@ -1267,8 +1266,9 @@ fn CombinedReview(state: SharedState) -> Element {
     let proposals = signals.proposals.read().clone();
     let bundles = signals.bundles.read().clone();
     let approvals = signals.bundle_approvals.read().clone();
-    let threshold = use_signal(|| 75_u32);
+    let threshold = use_signal(|| 0.75_f32);
     let threshold_val = *threshold.read();
+    let threshold_label = format!("{threshold_val:.2}");
     let loose_count = proposals.len();
     let collection_count = bundles.len();
     let collection_files = bundles
@@ -1302,8 +1302,8 @@ fn CombinedReview(state: SharedState) -> Element {
     };
     let on_threshold = move |event: Event<FormData>| {
         let mut value = threshold;
-        if let Ok(number) = event.value().parse::<u32>() {
-            value.set(number.min(100));
+        if let Ok(number) = event.value().parse::<f32>() {
+            value.set(number.clamp(0.0, 1.0));
         }
     };
 
@@ -1328,13 +1328,13 @@ fn CombinedReview(state: SharedState) -> Element {
                         input {
                             r#type: "number",
                             min: "0",
-                            max: "100",
-                            step: "1",
-                            value: "{threshold_val}",
+                            max: "1",
+                            step: "0.01",
+                            value: "{threshold_label}",
                             oninput: on_threshold,
                             class: "threshold-number",
                         }
-                        span { class: "threshold-unit", "%" }
+                        span { class: "threshold-unit", "similarity" }
                     }
                     button {
                         class: "button button-primary",
@@ -2463,7 +2463,10 @@ const fn phase_label(phase: tidyup_domain::Phase) -> &'static str {
 }
 
 fn confidence_chip(c: f32) -> (&'static str, String) {
-    let pct = format!("{:.0}% confidence", c * 100.0);
+    // The shipped classifier uses `Calibration::Identity`, so this is raw
+    // semantic evidence, not a probability. Keep the relative tier styling
+    // but never dress a cosine score up as a percentage.
+    let similarity = format!("similarity {c:.2}");
     let cls = if c >= 0.85 {
         "chip-high"
     } else if c >= 0.6 {
@@ -2471,7 +2474,7 @@ fn confidence_chip(c: f32) -> (&'static str, String) {
     } else {
         "chip-low"
     };
-    (cls, pct)
+    (cls, similarity)
 }
 
 fn percent_u32(current: u64, total: Option<u64>) -> Option<u32> {
@@ -2526,6 +2529,14 @@ mod tests {
             matches!(row, TreeRow::Folder { name, depth: 1, .. } if name == "Career")
         }));
         assert_eq!(count_folders(&model.left_rows), 2);
+    }
+
+    #[test]
+    fn raw_similarity_is_never_formatted_as_a_percentage() {
+        let (_, label) = confidence_chip(0.81);
+        assert_eq!(label, "similarity 0.81");
+        assert!(!label.contains('%'));
+        assert!(!label.contains("confidence"));
     }
 
     #[test]
