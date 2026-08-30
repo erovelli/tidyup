@@ -45,8 +45,14 @@ pub(crate) struct LogMessage {
 /// to render the post-apply summary panel.
 #[derive(Debug, Clone)]
 pub(crate) enum LastReport {
-    Scan(ScanReport),
-    Migration(MigrationReport),
+    Scan {
+        report: ScanReport,
+        dry_run: bool,
+    },
+    Migration {
+        report: MigrationReport,
+        dry_run: bool,
+    },
     Rollback(RollbackReport),
 }
 
