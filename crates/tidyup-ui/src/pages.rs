@@ -1994,6 +1994,8 @@ fn LastReportCard(signals: SignalBundle) -> Element {
                 bundles_applied: r.bundles_applied,
                 skipped: r.skipped,
                 failed: r.failed,
+                already_in_place: r.already_in_place,
+                visual_candidates_over_cap: r.visual_candidates_over_cap,
             }
         },
         LastReport::Migration(r) => rsx! {
@@ -2009,6 +2011,9 @@ fn LastReportCard(signals: SignalBundle) -> Element {
                 bundles_applied: r.bundles_applied,
                 skipped: r.skipped,
                 failed: r.failed,
+                // Migration always moves out of the source tree.
+                already_in_place: 0,
+                visual_candidates_over_cap: r.visual_candidates_over_cap,
             }
         },
         LastReport::Rollback(r) => rsx! {
@@ -2057,6 +2062,12 @@ fn ReportSummary(
     bundles_applied: usize,
     skipped: usize,
     failed: usize,
+    /// Scan only: classified, but already where it belongs.
+    already_in_place: usize,
+    /// Images the per-directory clustering cap excluded from collection
+    /// discovery. Surfaced because they are otherwise indistinguishable from
+    /// images the run simply found nothing to group with.
+    visual_candidates_over_cap: usize,
 ) -> Element {
     rsx! {
         div {
@@ -2078,6 +2089,17 @@ fn ReportSummary(
                 if bundles > 0 {
                     span { class: "chip chip-neutral", "{bundles} bundle(s)" }
                     span { class: "chip chip-high",    "{bundles_applied} bundle(s) applied" }
+                }
+                if already_in_place > 0 {
+                    span { class: "chip chip-neutral", "{already_in_place} already in place" }
+                }
+            }
+            if visual_candidates_over_cap > 0 {
+                p {
+                    class: "small muted",
+                    "{visual_candidates_over_cap} image(s) exceeded the per-directory clustering \
+                     limit and were classified individually. They were never compared for \
+                     collection grouping, so a large folder may group some images and not others."
                 }
             }
         }

@@ -58,6 +58,10 @@ pub struct MigrationReport {
     pub proposed: usize,
     pub bundles: usize,
     pub unclassified: usize,
+    /// Images the per-directory clustering work cap excluded from
+    /// visual-collection discovery. They are still classified individually;
+    /// what they lost was the chance to be grouped.
+    pub visual_candidates_over_cap: usize,
     pub approved: usize,
     pub applied: usize,
     pub skipped: usize,
@@ -251,8 +255,12 @@ impl MigrationService {
         let text_backend = self.ctx.text.as_deref();
         // Classifier config (rename thresholds + optional reranker) is
         // materialised from the loaded TidyupConfig at context-build time.
+        // Reuse the identities indexing just streamed: the proposal keeps the
+        // FileId and the BLAKE3 already computed instead of re-hashing.
+        let identities = tidyup_pipeline::indexing::SourceIdentities::new(&source_indexed.indexed);
         let mut outcome = run_migration(
             &request.source,
+            &identities,
             &profile_cache,
             self.ctx.embeddings.as_ref(),
             text_backend,
@@ -275,6 +283,9 @@ impl MigrationService {
             &outcome.proposals,
             &outcome.bundles,
             &outcome.unclassified,
+            // Migration moves every source file into the target tree, so no
+            // file can resolve to the location it already occupies.
+            &[],
         )
         .await?;
 
@@ -368,6 +379,7 @@ impl MigrationService {
             proposed: outcome.proposals.len(),
             bundles: outcome.bundles.len(),
             unclassified: outcome.unclassified.len(),
+            visual_candidates_over_cap: outcome.visual_candidates_over_cap,
             approved,
             applied: loose_report.applied,
             skipped: loose_report.skipped,

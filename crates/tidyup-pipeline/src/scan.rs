@@ -112,6 +112,17 @@ pub struct ScanOutcome {
     /// Files the semantic router could not classify. Listed here so callers can
     /// surface them rather than silently drop.
     pub unclassified: Vec<PathBuf>,
+    /// Files already sitting at the destination the classifier chose.
+    ///
+    /// Scan reorganizes in place, so a correctly filed file resolves to its own
+    /// current path. That is a successful classification, not a move: emitting
+    /// it as a proposal would fill review with no-ops and — because the
+    /// destination ledger refuses an approved target that already exists —
+    /// abort the whole plan over a file that needed nothing done to it.
+    pub already_in_place: Vec<PathBuf>,
+    /// Images excluded from visual-collection discovery by the per-directory
+    /// work cap. See [`crate::clustering::ClusterOutcome`].
+    pub visual_candidates_over_cap: usize,
 }
 
 /// Drive the scan pipeline end-to-end.
@@ -137,6 +148,7 @@ pub struct ScanOutcome {
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn run_scan(
     source_root: &Path,
+    identities: &crate::indexing::SourceIdentities,
     output_root: &Path,
     candidates: &[ScanCandidate],
     embeddings: &dyn EmbeddingBackend,
@@ -153,7 +165,7 @@ pub async fn run_scan(
     // / document series. Runs after the structural scanner; these move as
     // file-sets (each member individually, atomically) — see
     // `BundleKind::moves_as_file_set`.
-    let (content_bundles, loose_files) = crate::clustering::cluster_loose_semantic(
+    let clustered = crate::clustering::cluster_loose_semantic(
         &tree.loose_files,
         extractors,
         &crate::clustering::ClusterConfig::default(),
@@ -169,15 +181,19 @@ pub async fn run_scan(
     .await;
     progress.phase_finished(Phase::Indexing).await;
 
+    let content_bundles = clustered.bundles;
+    let loose_files = clustered.loose;
     let mut outcome = ScanOutcome {
         proposals: Vec::new(),
         bundles: Vec::new(),
         unclassified: Vec::new(),
+        already_in_place: Vec::new(),
+        visual_candidates_over_cap: clustered.visual_candidates_over_cap,
     };
 
     // Structural bundles preserve their internal layout and names.
     for bundle in &tree.bundles {
-        match build_bundle_proposal(bundle, output_root, candidates, embeddings).await {
+        match build_bundle_proposal(bundle, identities, output_root, candidates, embeddings).await {
             Ok(bp) => outcome.bundles.push(bp),
             Err(e) => {
                 outcome.unclassified.extend(bundle.members.iter().cloned());
@@ -195,6 +211,7 @@ pub async fn run_scan(
     for bundle in &content_bundles {
         match build_content_bundle_proposal(
             bundle,
+            identities,
             output_root,
             candidates,
             embeddings,
@@ -241,11 +258,20 @@ pub async fn run_scan(
         .await
         {
             Ok(Some(classified)) => {
-                let mut proposal = build_proposal(path, output_root, &classified);
+                let mut proposal = build_proposal(path, output_root, &classified, identities);
                 // Report calibrated confidence (no-op under the default Identity
                 // calibration; applies Platt scaling when a fitted set is set).
                 proposal.confidence = config.calibration.calibrate(proposal.confidence);
-                outcome.proposals.push(proposal);
+                if proposal.proposed_path == *path {
+                    // Scan is in-place housekeeping: the interesting output is
+                    // what sits in the wrong place. A file the classifier would
+                    // put exactly where it already is needs no operation, and
+                    // proposing one would make the destination ledger reject the
+                    // run for targeting an existing path.
+                    outcome.already_in_place.push(path.clone());
+                } else {
+                    outcome.proposals.push(proposal);
+                }
             }
             Ok(None) => {
                 outcome.unclassified.push(path.clone());
@@ -823,7 +849,12 @@ fn find_year(s: &str) -> Option<i32> {
     crate::text_util::find_year(s)
 }
 
-fn build_proposal(source: &Path, output_root: &Path, c: &ClassifiedFile) -> ChangeProposal {
+fn build_proposal(
+    source: &Path,
+    output_root: &Path,
+    c: &ClassifiedFile,
+    identities: &crate::indexing::SourceIdentities,
+) -> ChangeProposal {
     let final_name = match &c.rename {
         RenameProposal::Rename { name, .. } => name.clone(),
         RenameProposal::Keep => source
@@ -842,7 +873,7 @@ fn build_proposal(source: &Path, output_root: &Path, c: &ClassifiedFile) -> Chan
 
     ChangeProposal {
         id: Uuid::new_v4(),
-        file_id: None,
+        file_id: identities.file_id(source),
         change_type,
         original_path: source.to_path_buf(),
         proposed_path,
@@ -856,7 +887,7 @@ fn build_proposal(source: &Path, output_root: &Path, c: &ClassifiedFile) -> Chan
         bundle_id: None,
         classification_confidence: c.classification_confidence,
         rename_mismatch_score: c.rename_mismatch_score,
-        content_hash: crate::hashing::content_hash_of(source),
+        content_hash: identities.content_hash(source),
     }
 }
 
@@ -882,6 +913,7 @@ fn destination_dir(
 
 async fn build_bundle_proposal(
     bundle: &DetectedBundle,
+    identities: &crate::indexing::SourceIdentities,
     output_root: &Path,
     candidates: &[ScanCandidate],
     embeddings: &dyn EmbeddingBackend,
@@ -941,7 +973,7 @@ async fn build_bundle_proposal(
             .to_string();
         members.push(ChangeProposal {
             id: Uuid::new_v4(),
-            file_id: None,
+            file_id: identities.file_id(m),
             change_type: ChangeType::Move,
             original_path: m.clone(),
             proposed_path,
@@ -955,7 +987,7 @@ async fn build_bundle_proposal(
             bundle_id: None, // stamped by BundleProposal::new
             classification_confidence: None,
             rename_mismatch_score: None,
-            content_hash: crate::hashing::content_hash_of(m),
+            content_hash: identities.content_hash(m),
         });
     }
 
@@ -972,6 +1004,7 @@ async fn build_bundle_proposal(
 #[allow(clippy::too_many_arguments)]
 async fn build_content_bundle_proposal(
     bundle: &DetectedBundle,
+    identities: &crate::indexing::SourceIdentities,
     output_root: &Path,
     candidates: &[ScanCandidate],
     embeddings: &dyn EmbeddingBackend,
@@ -1006,7 +1039,7 @@ async fn build_content_bundle_proposal(
         )
         .await?
         .ok_or_else(|| anyhow::anyhow!("no classification for {}", member.display()))?;
-        let mut proposal = build_proposal(member, output_root, &classified);
+        let mut proposal = build_proposal(member, output_root, &classified, identities);
         confidence_sum += proposal.confidence;
         if !allow_renames {
             proposal.change_type = ChangeType::Move;
@@ -1297,6 +1330,47 @@ mod tests {
         candidates
     }
 
+    /// Scan sorts in place, so a file already sitting in the folder the
+    /// classifier picks needs no operation. Emitting a proposal for it would
+    /// both fill review with no-ops and make the destination ledger abort the
+    /// run for targeting a path that already exists.
+    #[tokio::test]
+    async fn file_already_at_its_destination_produces_no_proposal() {
+        let td = TempDir::new().unwrap();
+        fs::create_dir_all(td.path().join("Money")).unwrap();
+        // Already filed correctly: routes to `Money/`, and is already there.
+        let settled = td.path().join("Money").join("filed.blob");
+        fs::write(&settled, b"tax invoice statement").unwrap();
+        // Misfiled: routes to `Builds/`, currently sitting under `Money/`.
+        let misplaced = td.path().join("Money").join("stray.blob");
+        fs::write(&misplaced, b"software project milestone").unwrap();
+
+        let embeddings = TopicEmbeddings;
+        let candidates = topic_candidates(&embeddings).await;
+        let extractors: Vec<Arc<dyn ContentExtractor>> = vec![Arc::new(PlainExtractor)];
+        let out = run_scan(
+            td.path(),
+            &crate::indexing::SourceIdentities::default(),
+            td.path(),
+            &candidates,
+            &embeddings,
+            &MultimodalContext::default(),
+            None,
+            &extractors,
+            &ClassifierConfig::default(),
+            &NullProgress,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.already_in_place, vec![settled]);
+        assert_eq!(out.proposals.len(), 1, "only the misplaced file moves");
+        assert_eq!(out.proposals[0].original_path, misplaced);
+        assert!(out.proposals[0]
+            .proposed_path
+            .starts_with(td.path().join("Builds")));
+    }
+
     #[tokio::test]
     async fn identical_suffixes_route_by_semantics_not_type() {
         let td = TempDir::new().unwrap();
@@ -1308,6 +1382,7 @@ mod tests {
         let extractors: Vec<Arc<dyn ContentExtractor>> = vec![Arc::new(PlainExtractor)];
         let out = run_scan(
             td.path(),
+            &crate::indexing::SourceIdentities::default(),
             td.path(),
             &candidates,
             &embeddings,
@@ -1346,6 +1421,7 @@ mod tests {
         let extractors: Vec<Arc<dyn ContentExtractor>> = vec![Arc::new(PlainExtractor)];
         let out = run_scan(
             td.path(),
+            &crate::indexing::SourceIdentities::default(),
             td.path(),
             &candidates,
             &embeddings,
@@ -1375,6 +1451,7 @@ mod tests {
         let ex: Vec<Arc<dyn ContentExtractor>> = vec![Arc::new(PlainExtractor)];
         let out = run_scan(
             td.path(),
+            &crate::indexing::SourceIdentities::default(),
             td.path(),
             &candidates,
             &eb,
@@ -1408,6 +1485,7 @@ mod tests {
         let ex: Vec<Arc<dyn ContentExtractor>> = vec![Arc::new(PlainExtractor)];
         let out = run_scan(
             td.path(),
+            &crate::indexing::SourceIdentities::default(),
             td.path(),
             &candidates,
             &eb,
@@ -1462,6 +1540,7 @@ mod tests {
 
         let out = run_scan(
             td.path(),
+            &crate::indexing::SourceIdentities::default(),
             td.path(),
             &candidates,
             &FailingEmbeddings,
@@ -1495,6 +1574,7 @@ mod tests {
         };
         let out = run_scan(
             td.path(),
+            &crate::indexing::SourceIdentities::default(),
             td.path(),
             &candidates,
             &eb,
@@ -1523,6 +1603,7 @@ mod tests {
         // Empty candidate list → Tier 2 can't fire, and extension is unknown.
         let out = run_scan(
             td.path(),
+            &crate::indexing::SourceIdentities::default(),
             td.path(),
             &[],
             &eb,
@@ -1575,6 +1656,7 @@ mod tests {
         };
         let out = run_scan(
             td.path(),
+            &crate::indexing::SourceIdentities::default(),
             td.path(),
             &candidates,
             &eb,
@@ -1715,6 +1797,7 @@ mod tests {
         };
         let outcome = run_scan(
             temp.path(),
+            &crate::indexing::SourceIdentities::default(),
             temp.path(),
             &[],
             &BucketEmbeddings,
@@ -1778,6 +1861,7 @@ mod tests {
         let ex: Vec<Arc<dyn ContentExtractor>> = vec![];
         let out = run_scan(
             td.path(),
+            &crate::indexing::SourceIdentities::default(),
             td.path(),
             &[],
             &eb,
@@ -1834,6 +1918,7 @@ mod tests {
         let ex: Vec<Arc<dyn ContentExtractor>> = vec![];
         let out = run_scan(
             td.path(),
+            &crate::indexing::SourceIdentities::default(),
             td.path(),
             &[],
             &eb,
@@ -1995,6 +2080,7 @@ mod tests {
 
         let out = run_scan(
             td.path(),
+            &crate::indexing::SourceIdentities::default(),
             td.path(),
             &candidates,
             &eb,
@@ -2050,6 +2136,7 @@ mod tests {
 
         let out = run_scan(
             td.path(),
+            &crate::indexing::SourceIdentities::default(),
             td.path(),
             &candidates,
             &eb,
@@ -2149,6 +2236,7 @@ mod tests {
 
         let out = run_scan(
             td.path(),
+            &crate::indexing::SourceIdentities::default(),
             td.path(),
             &candidates,
             &eb,

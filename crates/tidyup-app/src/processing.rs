@@ -74,6 +74,7 @@ pub(crate) async fn record_source_outcomes(
     proposals: &[ChangeProposal],
     bundles: &[BundleProposal],
     unclassified: &[PathBuf],
+    already_in_place: &[PathBuf],
 ) -> tidyup_core::Result<()> {
     let classified: HashSet<&std::path::Path> = proposals
         .iter()
@@ -87,6 +88,8 @@ pub(crate) async fn record_source_outcomes(
         .collect();
     let unclassified: HashSet<&std::path::Path> =
         unclassified.iter().map(PathBuf::as_path).collect();
+    let already_in_place: HashSet<&std::path::Path> =
+        already_in_place.iter().map(PathBuf::as_path).collect();
 
     let records = indexed
         .iter()
@@ -97,6 +100,15 @@ pub(crate) async fn record_source_outcomes(
                         FileProcessingStage::Planning,
                         FileProcessingState::Classified,
                         Some("included in the reviewable organization plan".to_string()),
+                    )
+                } else if already_in_place.contains(file.path.as_path()) {
+                    // Classified successfully; the answer was "stay put". This
+                    // must not fall through to `Indexed`, which would report a
+                    // correctly filed file as excluded from planning.
+                    (
+                        FileProcessingStage::Planning,
+                        FileProcessingState::Classified,
+                        Some("already at its classified destination; no move needed".to_string()),
                     )
                 } else if unclassified.contains(file.path.as_path()) {
                     (

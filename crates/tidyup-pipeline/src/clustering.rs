@@ -104,6 +104,24 @@ fn modality_from_mime(mime: Option<&str>) -> Modality {
     }
 }
 
+/// Result of one clustering pass.
+#[derive(Debug, Clone, Default)]
+pub struct ClusterOutcome {
+    /// Content bundles detected across every directory.
+    pub bundles: Vec<DetectedBundle>,
+    /// Files absorbed into no cluster; they continue as loose semantic inputs.
+    pub loose: Vec<PathBuf>,
+    /// Images that were never offered to visual-neighbor discovery because
+    /// their directory exceeded [`ClusterConfig::max_semantic_candidates`].
+    ///
+    /// These files are still classified and still appear in the plan, so no
+    /// item is lost. What is lost is their *chance to be grouped*: a directory
+    /// over the cap has some of its images considered for collections and the
+    /// rest not, which a caller must surface rather than leave as a silent
+    /// difference in quality.
+    pub visual_candidates_over_cap: usize,
+}
+
 /// Cluster loose files into content bundles, returning the detected bundles plus
 /// the leftover loose files (those absorbed into no cluster).
 ///
@@ -112,7 +130,7 @@ pub async fn cluster_loose(
     loose: &[PathBuf],
     extractors: &[Arc<dyn ContentExtractor>],
     config: &ClusterConfig,
-) -> (Vec<DetectedBundle>, Vec<PathBuf>) {
+) -> ClusterOutcome {
     let cache = SemanticRunCache::default();
     cluster_loose_semantic(
         loose,
@@ -134,7 +152,7 @@ pub async fn cluster_loose_semantic(
     extractors: &[Arc<dyn ContentExtractor>],
     config: &ClusterConfig,
     semantic: SemanticClusterContext<'_>,
-) -> (Vec<DetectedBundle>, Vec<PathBuf>) {
+) -> ClusterOutcome {
     // Group inputs by parent directory (BTreeMap for deterministic order).
     let mut by_dir: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
     for path in loose {
@@ -142,15 +160,16 @@ pub async fn cluster_loose_semantic(
         by_dir.entry(parent).or_default().push(path.clone());
     }
 
-    let mut bundles = Vec::new();
-    let mut leftovers = Vec::new();
+    let mut outcome = ClusterOutcome::default();
     for (dir, files) in by_dir {
-        let (dir_bundles, dir_leftover) =
-            cluster_dir(&dir, &files, extractors, config, semantic).await;
-        bundles.extend(dir_bundles);
-        leftovers.extend(dir_leftover);
+        let dir_outcome = cluster_dir(&dir, &files, extractors, config, semantic).await;
+        outcome.bundles.extend(dir_outcome.bundles);
+        outcome.loose.extend(dir_outcome.loose);
+        outcome.visual_candidates_over_cap = outcome
+            .visual_candidates_over_cap
+            .saturating_add(dir_outcome.visual_candidates_over_cap);
     }
-    (bundles, leftovers)
+    outcome
 }
 
 async fn cluster_dir(
@@ -159,7 +178,7 @@ async fn cluster_dir(
     extractors: &[Arc<dyn ContentExtractor>],
     config: &ClusterConfig,
     semantic: SemanticClusterContext<'_>,
-) -> (Vec<DetectedBundle>, Vec<PathBuf>) {
+) -> ClusterOutcome {
     // High-precision semantic collections run before modality-specific passes:
     // a shared rare entity stem is meaningful across extensions (for example
     // `atomsnotelectrons_submission.txt` + `atomsnotelectrons_testbench.png`).
@@ -188,9 +207,10 @@ async fn cluster_dir(
     let (burst_bundles, burst_left) = cluster_photo_bursts(dir, &images, extractors, config).await;
     bundles.extend(burst_bundles);
 
-    let (visual_bundles, visual_left) =
-        cluster_visual_neighbors(dir, &burst_left, config, semantic, &modalities).await;
-    bundles.extend(visual_bundles);
+    let visual = cluster_visual_neighbors(dir, &burst_left, config, semantic, &modalities).await;
+    let visual_candidates_over_cap = visual.over_cap;
+    let visual_left = visual.leftovers;
+    bundles.extend(visual.bundles);
 
     let (album_bundles, album_left) = cluster_music_albums(dir, &audio, extractors, config).await;
     bundles.extend(album_bundles);
@@ -206,7 +226,11 @@ async fn cluster_dir(
     leftover.extend(visual_left);
     leftover.extend(album_left);
 
-    (bundles, leftover)
+    ClusterOutcome {
+        bundles,
+        loose: leftover,
+        visual_candidates_over_cap,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -336,23 +360,36 @@ async fn cluster_semantic_collections(
 // General visual-neighbor collections
 // ---------------------------------------------------------------------------
 
+/// Visual-neighbor pass result. `over_cap` counts images the per-directory work
+/// cap excluded from consideration entirely.
+struct VisualClusters {
+    bundles: Vec<DetectedBundle>,
+    leftovers: Vec<PathBuf>,
+    over_cap: usize,
+}
+
 async fn cluster_visual_neighbors(
     dir: &Path,
     files: &[PathBuf],
     config: &ClusterConfig,
     semantic: SemanticClusterContext<'_>,
     modalities: &HashMap<PathBuf, Modality>,
-) -> (Vec<DetectedBundle>, Vec<PathBuf>) {
+) -> VisualClusters {
     let Some(backend) = semantic.image else {
-        return (Vec::new(), files.to_vec());
+        return VisualClusters::untouched(files);
     };
     if semantic.image_concepts.is_empty() {
-        return (Vec::new(), files.to_vec());
+        return VisualClusters::untouched(files);
     }
 
     let (image_paths, candidate_count) =
         bounded_visual_candidates(files, modalities, config.max_semantic_candidates);
-    if candidate_count > image_paths.len() {
+    let over_cap = candidate_count.saturating_sub(image_paths.len());
+    if over_cap > 0 {
+        // Debug logging alone made this invisible: the excluded images are
+        // still classified, so nothing looks wrong, but a directory over the
+        // cap groups some of its images and not others. The count is returned
+        // so the run report can say so out loud.
         tracing::debug!(
             directory = %dir.display(),
             candidates = candidate_count,
@@ -442,7 +479,23 @@ async fn cluster_visual_neighbors(
         .filter(|path| !consumed.contains(*path))
         .cloned()
         .collect();
-    (bundles, leftovers)
+    VisualClusters {
+        bundles,
+        leftovers,
+        over_cap,
+    }
+}
+
+impl VisualClusters {
+    /// No visual capability, so every input passes through ungrouped and
+    /// nothing was excluded by the work cap.
+    fn untouched(files: &[PathBuf]) -> Self {
+        Self {
+            bundles: Vec::new(),
+            leftovers: files.to_vec(),
+            over_cap: 0,
+        }
+    }
 }
 
 fn bounded_visual_candidates(
@@ -1146,7 +1199,11 @@ mod tests {
             p("/inbox/invoice-03.pdf"),
             p("/inbox/taxes.pdf"),
         ];
-        let (bundles, leftover) = cluster_loose(&files, &[], &ClusterConfig::default()).await;
+        let ClusterOutcome {
+            bundles,
+            loose: leftover,
+            ..
+        } = cluster_loose(&files, &[], &ClusterConfig::default()).await;
         assert_eq!(bundles.len(), 1);
         let b = &bundles[0];
         assert!(matches!(b.kind, BundleKind::DocumentSeries { .. }));
@@ -1159,7 +1216,11 @@ mod tests {
     #[tokio::test]
     async fn cluster_loose_leaves_small_groups_loose() {
         let files = vec![p("/d/invoice-01.pdf"), p("/d/invoice-02.pdf")];
-        let (bundles, leftover) = cluster_loose(&files, &[], &ClusterConfig::default()).await;
+        let ClusterOutcome {
+            bundles,
+            loose: leftover,
+            ..
+        } = cluster_loose(&files, &[], &ClusterConfig::default()).await;
         assert!(bundles.is_empty());
         assert_eq!(leftover.len(), 2);
     }
@@ -1189,7 +1250,11 @@ mod tests {
                 embedding: vec![0.8, 0.2],
             },
         ];
-        let (bundles, leftover) = cluster_loose_semantic(
+        let ClusterOutcome {
+            bundles,
+            loose: leftover,
+            ..
+        } = cluster_loose_semantic(
             &files,
             &[],
             &ClusterConfig::default(),
@@ -1239,7 +1304,11 @@ mod tests {
             extracted.metadata["exif"]["date"].as_str(),
             Some("2024-01-15 10:30:45")
         );
-        let (bundles, leftover) = cluster_loose_semantic(
+        let ClusterOutcome {
+            bundles,
+            loose: leftover,
+            ..
+        } = cluster_loose_semantic(
             &files,
             &extractors,
             &ClusterConfig::default(),
@@ -1264,7 +1333,11 @@ mod tests {
             p("/desktop/atomsnotelectrons_testbench.png"),
             p("/desktop/unrelated.pdf"),
         ];
-        let (bundles, leftover) = cluster_loose(&files, &[], &ClusterConfig::default()).await;
+        let ClusterOutcome {
+            bundles,
+            loose: leftover,
+            ..
+        } = cluster_loose(&files, &[], &ClusterConfig::default()).await;
         assert_eq!(bundles.len(), 1);
         assert!(matches!(
             bundles[0].kind,
@@ -1281,7 +1354,11 @@ mod tests {
             p("/desktop/quasarforge_velvet.omega"),
             p("/desktop/unrelated.data"),
         ];
-        let (bundles, leftover) = cluster_loose(&files, &[], &ClusterConfig::default()).await;
+        let ClusterOutcome {
+            bundles,
+            loose: leftover,
+            ..
+        } = cluster_loose(&files, &[], &ClusterConfig::default()).await;
         assert_eq!(bundles.len(), 1);
         assert_eq!(bundles[0].target_subdir.as_deref(), Some("Quasarforge"));
         assert_eq!(bundles[0].members.len(), 2);
@@ -1300,7 +1377,11 @@ mod tests {
                 p("/desktop/Screen-Shot-2.png"),
             ],
         ] {
-            let (bundles, leftover) = cluster_loose(&files, &[], &ClusterConfig::default()).await;
+            let ClusterOutcome {
+                bundles,
+                loose: leftover,
+                ..
+            } = cluster_loose(&files, &[], &ClusterConfig::default()).await;
             assert!(bundles.is_empty());
             assert_eq!(leftover.len(), 2);
         }
@@ -1318,7 +1399,11 @@ mod tests {
                 p("/desktop/2026-08-25_photo.png"),
             ],
         ] {
-            let (bundles, leftover) = cluster_loose(&files, &[], &ClusterConfig::default()).await;
+            let ClusterOutcome {
+                bundles,
+                loose: leftover,
+                ..
+            } = cluster_loose(&files, &[], &ClusterConfig::default()).await;
             assert!(bundles.is_empty());
             assert_eq!(leftover.len(), 2);
         }
@@ -1334,7 +1419,11 @@ mod tests {
             p("/desktop/zprint/Side Piece.stl"),
             p("/desktop/zprint/Side Piece.3mf"),
         ];
-        let (bundles, leftover) = cluster_loose(&files, &[], &ClusterConfig::default()).await;
+        let ClusterOutcome {
+            bundles,
+            loose: leftover,
+            ..
+        } = cluster_loose(&files, &[], &ClusterConfig::default()).await;
         assert_eq!(bundles.len(), 1);
         assert!(leftover.is_empty());
         assert_eq!(bundles[0].target_subdir.as_deref(), Some("zprint"));
@@ -1352,7 +1441,11 @@ mod tests {
             p("/dcim/IMG_0002.jpg"),
             p("/dcim/IMG_0003.jpg"),
         ];
-        let (bundles, leftover) = cluster_loose(&files, &[], &ClusterConfig::default()).await;
+        let ClusterOutcome {
+            bundles,
+            loose: leftover,
+            ..
+        } = cluster_loose(&files, &[], &ClusterConfig::default()).await;
         assert!(
             bundles.is_empty(),
             "EXIF-less photos must not form any bundle, got {:?}",
@@ -1370,7 +1463,11 @@ mod tests {
             p("/music/track-02.mp3"),
             p("/music/track-03.mp3"),
         ];
-        let (bundles, leftover) = cluster_loose(&files, &[], &ClusterConfig::default()).await;
+        let ClusterOutcome {
+            bundles,
+            loose: leftover,
+            ..
+        } = cluster_loose(&files, &[], &ClusterConfig::default()).await;
         assert!(bundles.is_empty(), "untagged audio must not form a bundle");
         assert_eq!(leftover.len(), 3);
     }
@@ -1385,7 +1482,11 @@ mod tests {
             p("/b/page-1.txt"),
             p("/b/page-2.txt"),
         ];
-        let (bundles, leftover) = cluster_loose(&files, &[], &ClusterConfig::default()).await;
+        let ClusterOutcome {
+            bundles,
+            loose: leftover,
+            ..
+        } = cluster_loose(&files, &[], &ClusterConfig::default()).await;
         // /a has 3 (clusters), /b has 2 (stays loose).
         assert_eq!(bundles.len(), 1);
         assert_eq!(bundles[0].members.len(), 3);

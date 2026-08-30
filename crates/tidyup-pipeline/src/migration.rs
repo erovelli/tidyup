@@ -85,6 +85,9 @@ pub struct MigrationOutcome {
     /// profile cache, or below-threshold with too small an ambiguity gap and
     /// no reliable semantic evidence).
     pub unclassified: Vec<PathBuf>,
+    /// Images excluded from visual-collection discovery by the per-directory
+    /// work cap. See [`crate::clustering::ClusterOutcome`].
+    pub visual_candidates_over_cap: usize,
 }
 
 /// Drive the migration cascade end-to-end.
@@ -106,6 +109,7 @@ pub struct MigrationOutcome {
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn run_migration(
     source_root: &Path,
+    identities: &crate::indexing::SourceIdentities,
     profiles: &ProfileCache,
     embeddings: &dyn EmbeddingBackend,
     text_backend: Option<&dyn TextBackend>,
@@ -117,7 +121,7 @@ pub async fn run_migration(
     let semantic_cache = SemanticRunCache::new(multimodal.artifact_store);
     progress.phase_started(Phase::Indexing, None).await;
     let tree = scanner::scan(source_root);
-    let (content_bundles, loose_files) = crate::clustering::cluster_loose_semantic(
+    let clustered = crate::clustering::cluster_loose_semantic(
         &tree.loose_files,
         extractors,
         &crate::clustering::ClusterConfig::default(),
@@ -130,9 +134,12 @@ pub async fn run_migration(
     .await;
     progress.phase_finished(Phase::Indexing).await;
 
+    let content_bundles = clustered.bundles;
+    let loose_files = clustered.loose;
     let mut outcome = MigrationOutcome {
         proposals: Vec::new(),
         bundles: Vec::new(),
+        visual_candidates_over_cap: clustered.visual_candidates_over_cap,
         classifications: Vec::new(),
         unclassified: Vec::new(),
     };
@@ -140,7 +147,7 @@ pub async fn run_migration(
     // Bundles first: they bypass per-file routing, while the aggregate still
     // targets the best-matching leaf folder.
     for bundle in &tree.bundles {
-        match build_bundle_proposal(bundle, profiles, embeddings).await {
+        match build_bundle_proposal(bundle, identities, profiles, embeddings).await {
             Ok(bp) => outcome.bundles.push(bp),
             Err(e) => {
                 outcome.unclassified.extend(bundle.members.iter().cloned());
@@ -160,6 +167,7 @@ pub async fn run_migration(
     for bundle in &content_bundles {
         match build_content_bundle_proposal(
             bundle,
+            identities,
             profiles,
             embeddings,
             text_backend,
@@ -205,7 +213,7 @@ pub async fn run_migration(
         .await
         {
             Ok(Some(verdict)) => {
-                let mut proposal = build_proposal(path, &verdict);
+                let mut proposal = build_proposal(path, &verdict, identities);
                 // Calibrated confidence (no-op under the default Identity).
                 proposal.confidence = config.calibration.calibrate(proposal.confidence);
                 outcome.proposals.push(proposal);
@@ -837,7 +845,11 @@ fn find_year(s: &str) -> Option<i32> {
     crate::text_util::find_year(s)
 }
 
-fn build_proposal(source: &Path, v: &Verdict) -> ChangeProposal {
+fn build_proposal(
+    source: &Path,
+    v: &Verdict,
+    identities: &crate::indexing::SourceIdentities,
+) -> ChangeProposal {
     let final_name = match &v.rename {
         RenameProposal::Rename { name, .. } => name.clone(),
         RenameProposal::Keep => source
@@ -853,7 +865,7 @@ fn build_proposal(source: &Path, v: &Verdict) -> ChangeProposal {
     };
     ChangeProposal {
         id: Uuid::new_v4(),
-        file_id: None,
+        file_id: identities.file_id(source),
         change_type,
         original_path: source.to_path_buf(),
         proposed_path,
@@ -867,13 +879,14 @@ fn build_proposal(source: &Path, v: &Verdict) -> ChangeProposal {
         bundle_id: None,
         classification_confidence: v.classification_confidence,
         rename_mismatch_score: v.rename_mismatch_score,
-        content_hash: crate::hashing::content_hash_of(source),
+        content_hash: identities.content_hash(source),
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn build_content_bundle_proposal(
     bundle: &DetectedBundle,
+    identities: &crate::indexing::SourceIdentities,
     profiles: &ProfileCache,
     embeddings: &dyn EmbeddingBackend,
     text_backend: Option<&dyn TextBackend>,
@@ -883,7 +896,7 @@ async fn build_content_bundle_proposal(
     semantic_cache: &SemanticRunCache<'_>,
 ) -> Result<BundleProposal> {
     if profiles.last_scan.leaf_folders.is_empty() {
-        return cold_start_content_bundle(bundle, &profiles.target_root);
+        return cold_start_content_bundle(bundle, &profiles.target_root, identities);
     }
 
     let mut classified = Vec::with_capacity(bundle.members.len());
@@ -922,14 +935,14 @@ async fn build_content_bundle_proposal(
     )
     .await
     .ok_or_else(|| anyhow::anyhow!("no semantic destination for collection {label}"))?;
-    let collection_root = target_parent.join(&label);
+    let collection_root = target_parent.parent.join(&label);
     let allow_renames = bundle.kind.allows_member_renames();
 
     let mut confidence_sum = 0.0_f32;
     let mut proposals = Vec::with_capacity(classified.len());
     for (source, verdict) in classified {
         confidence_sum += verdict.confidence;
-        let mut proposal = build_proposal(&source, &verdict);
+        let mut proposal = build_proposal(&source, &verdict, identities);
         if !allow_renames {
             proposal.change_type = ChangeType::Move;
             proposal.proposed_name = source
@@ -941,29 +954,44 @@ async fn build_content_bundle_proposal(
         }
         proposal.proposed_path = collection_root.join(&proposal.proposed_name);
         proposal.reasoning = format!("{}; {}", bundle.reasoning, proposal.reasoning);
+        if target_parent.abstained {
+            proposal.needs_review = true;
+        }
         proposals.push(proposal);
     }
     uniquify_bundle_member_names(&mut proposals)?;
 
     let count = u16::try_from(proposals.len()).unwrap_or(u16::MAX);
-    let confidence = if count == 0 {
+    // An abstention reports zero confidence in the *placement*, matching the
+    // cold-start path. Per-member scores stay on their own proposals; averaging
+    // them into the bundle would dress up a destination the ranking rejected.
+    let confidence = if target_parent.abstained || count == 0 {
         0.0
     } else {
         confidence_sum / f32::from(count)
     };
+    let reasoning = if target_parent.abstained {
+        format!(
+            "{}; no folder cleared the placement threshold and runner-up gap, so the collection is held at the target root for review",
+            bundle.reasoning
+        )
+    } else {
+        bundle.reasoning.clone()
+    };
     Ok(BundleProposal::new(
         bundle.root.clone(),
         bundle.kind.clone(),
-        target_parent,
+        target_parent.parent,
         proposals,
         confidence,
-        bundle.reasoning.clone(),
+        reasoning,
     )?)
 }
 
 fn cold_start_content_bundle(
     bundle: &DetectedBundle,
     target_root: &Path,
+    identities: &crate::indexing::SourceIdentities,
 ) -> Result<BundleProposal> {
     let label = bundle.target_subdir.clone().unwrap_or_else(|| {
         bundle
@@ -985,7 +1013,7 @@ fn cold_start_content_bundle(
                 .to_string();
             ChangeProposal {
                 id: Uuid::new_v4(),
-                file_id: None,
+                file_id: identities.file_id(source),
                 change_type: ChangeType::Move,
                 original_path: source.clone(),
                 proposed_path: collection_root.join(&proposed_name),
@@ -1002,7 +1030,7 @@ fn cold_start_content_bundle(
                 bundle_id: None,
                 classification_confidence: None,
                 rename_mismatch_score: None,
-                content_hash: crate::hashing::content_hash_of(source),
+                content_hash: identities.content_hash(source),
             }
         })
         .collect();
@@ -1019,6 +1047,15 @@ fn cold_start_content_bundle(
     )?)
 }
 
+/// Where a semantic collection should land, and whether the hierarchy actually
+/// supported that choice.
+struct CollectionTarget {
+    parent: PathBuf,
+    /// No folder cleared both the score threshold and the runner-up gap, so
+    /// `parent` is the target root rather than a ranked destination.
+    abstained: bool,
+}
+
 async fn choose_collection_target(
     bundle: &DetectedBundle,
     label: &str,
@@ -1027,13 +1064,30 @@ async fn choose_collection_target(
     embeddings: &dyn EmbeddingBackend,
     text_backend: Option<&dyn TextBackend>,
     config: &ClassifierConfig,
-) -> Option<PathBuf> {
+) -> Option<CollectionTarget> {
     let first = classified.first()?.1.destination_folder.clone();
     if classified
         .iter()
         .all(|(_, verdict)| verdict.destination_folder == first)
     {
-        return Some(first);
+        // Unanimity is only evidence if at least one member actually cleared
+        // its own placement gate. A collection where every member was pushed
+        // to the same folder by a below-threshold score has agreement without
+        // confidence, and taking the shortcut here would route it around the
+        // abstention check below.
+        let any_member_confident = classified
+            .iter()
+            .any(|(_, verdict)| !verdict.result.needs_review);
+        if any_member_confident {
+            return Some(CollectionTarget {
+                parent: first,
+                abstained: false,
+            });
+        }
+        return Some(CollectionTarget {
+            parent: profiles.target_root.clone(),
+            abstained: true,
+        });
     }
 
     let filenames = classified
@@ -1057,10 +1111,11 @@ async fn choose_collection_target(
     );
     let embedding = embeddings.embed_text(&query).await.ok()?;
     let ranked = rank_profiles(&embedding, profiles, &bundle.root, &config.weights);
-    let (mut folder, score, _) = ranked.first()?.clone();
-    let gap = ranked.get(1).map_or(score, |(_, second, _)| score - second);
-    let uncertain = score < config.embedding_threshold || gap < config.ambiguity_gap;
-    if uncertain && config.enable_llm_fallback {
+    let (mut folder, mut score, _) = ranked.first()?.clone();
+    let mut gap = ranked.get(1).map_or(score, |(_, second, _)| score - second);
+    if (score < config.embedding_threshold || gap < config.ambiguity_gap)
+        && config.enable_llm_fallback
+    {
         if let Some(backend) = text_backend {
             if let Ok(Some((reranked, _))) = tier3_rerank(
                 backend,
@@ -1076,18 +1131,38 @@ async fn choose_collection_target(
                 if let Some((llm_folder, llm_score, _)) = reranked.first() {
                     if *llm_score > score {
                         folder.clone_from(llm_folder);
+                        score = *llm_score;
+                        gap = reranked
+                            .get(1)
+                            .map_or(score, |(_, second, _)| score - *second);
                     }
                 }
             }
         }
     }
-    Some(folder)
+
+    // Abstain rather than file the collection under the least-wrong folder.
+    // Migration has to move everything under the source, so abstention means
+    // the target root with mandatory review — the honest "I could not place
+    // this" — not a confident-looking destination nobody chose. The default
+    // build has no LLM, so this is the ordinary path, not an edge case.
+    if score < config.embedding_threshold || gap < config.ambiguity_gap {
+        return Some(CollectionTarget {
+            parent: profiles.target_root.clone(),
+            abstained: true,
+        });
+    }
+    Some(CollectionTarget {
+        parent: folder,
+        abstained: false,
+    })
 }
 
 /// Bundle placement: embed structural and naming evidence and pick the
 /// top-scoring learned profile. Bundle detection controls atomicity only.
 async fn build_bundle_proposal(
     bundle: &DetectedBundle,
+    identities: &crate::indexing::SourceIdentities,
     profiles: &ProfileCache,
     embeddings: &dyn EmbeddingBackend,
 ) -> Result<BundleProposal> {
@@ -1120,7 +1195,7 @@ async fn build_bundle_proposal(
             .to_string();
         members.push(ChangeProposal {
             id: Uuid::new_v4(),
-            file_id: None,
+            file_id: identities.file_id(m),
             change_type: ChangeType::Move,
             original_path: m.clone(),
             proposed_path,
@@ -1134,7 +1209,7 @@ async fn build_bundle_proposal(
             bundle_id: None,
             classification_confidence: None,
             rename_mismatch_score: None,
-            content_hash: crate::hashing::content_hash_of(m),
+            content_hash: identities.content_hash(m),
         });
     }
 
@@ -1450,6 +1525,7 @@ mod tests {
 
         let out = run_migration(
             src.path(),
+            &crate::indexing::SourceIdentities::default(),
             &profiles,
             &eb,
             None,
@@ -1489,6 +1565,7 @@ mod tests {
 
         let out = run_migration(
             src.path(),
+            &crate::indexing::SourceIdentities::default(),
             &profiles,
             &eb,
             None,
@@ -1528,6 +1605,7 @@ mod tests {
 
         let out = run_migration(
             src.path(),
+            &crate::indexing::SourceIdentities::default(),
             &profiles,
             &eb,
             None,
@@ -1568,6 +1646,7 @@ mod tests {
 
         let out = run_migration(
             src.path(),
+            &crate::indexing::SourceIdentities::default(),
             &empty_cache(tgt.path()),
             &BucketEmbeddings,
             None,
@@ -1605,6 +1684,7 @@ mod tests {
 
         let out = run_migration(
             src.path(),
+            &crate::indexing::SourceIdentities::default(),
             &empty_cache(tgt.path()),
             &BucketEmbeddings,
             None,
@@ -1626,6 +1706,61 @@ mod tests {
             .members
             .iter()
             .all(|member| member.change_type == ChangeType::Move));
+    }
+
+    /// A populated hierarchy that nothing clears must abstain, not file the
+    /// collection under the least-wrong folder. Migration has to move every
+    /// source file, so abstention means the target root plus mandatory review.
+    /// The default build has no LLM, so this is the ordinary path.
+    #[tokio::test]
+    async fn undecidable_collection_abstains_to_the_target_root() {
+        let src = TempDir::new().unwrap();
+        let tgt = TempDir::new().unwrap();
+        fs::write(
+            src.path().join("atomsnotelectrons_submission.txt"),
+            b"submission",
+        )
+        .unwrap();
+        fs::write(
+            src.path().join("atomsnotelectrons_testbench.png"),
+            b"testbench",
+        )
+        .unwrap();
+        let extractors: Vec<Arc<dyn ContentExtractor>> = vec![Arc::new(PlainExtractor)];
+
+        // A threshold no score can reach: the hierarchy is populated and
+        // rankable, but nothing in it is a defensible destination.
+        let config = ClassifierConfig {
+            embedding_threshold: 1.1,
+            ..ClassifierConfig::default()
+        };
+        let out = run_migration(
+            src.path(),
+            &crate::indexing::SourceIdentities::default(),
+            &sample_cache(tgt.path(), &BucketEmbeddings).await,
+            &BucketEmbeddings,
+            None,
+            MigrationMultimodal::default(),
+            &extractors,
+            &config,
+            &NullProgress,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.bundles.len(), 1);
+        let bundle = &out.bundles[0];
+        assert_eq!(
+            bundle.target_parent,
+            tgt.path(),
+            "an undecidable collection belongs at the target root, not a ranked folder"
+        );
+        assert!((bundle.confidence - 0.0).abs() < f32::EPSILON);
+        assert!(bundle.reasoning.contains("held at the target root"));
+        assert!(
+            bundle.members.iter().all(|member| member.needs_review),
+            "every member of an abstained collection must be reviewed"
+        );
     }
 
     #[tokio::test]
@@ -1654,6 +1789,7 @@ mod tests {
 
         let out = run_migration(
             src.path(),
+            &crate::indexing::SourceIdentities::default(),
             &profiles,
             &FailingEmbeddings,
             None,
@@ -1682,6 +1818,7 @@ mod tests {
 
         let out = run_migration(
             src.path(),
+            &crate::indexing::SourceIdentities::default(),
             &profiles,
             &eb,
             None,
@@ -1803,6 +1940,7 @@ mod tests {
 
         let out = run_migration(
             src.path(),
+            &crate::indexing::SourceIdentities::default(),
             &profiles,
             &eb,
             Some(&llm),
@@ -1858,6 +1996,7 @@ mod tests {
 
         let out = run_migration(
             src.path(),
+            &crate::indexing::SourceIdentities::default(),
             &profiles,
             &eb,
             Some(&llm),
@@ -2097,6 +2236,7 @@ mod tests {
         };
         let out = run_migration(
             src.path(),
+            &crate::indexing::SourceIdentities::default(),
             &profiles,
             &eb,
             None,
@@ -2167,6 +2307,7 @@ mod tests {
         };
         let out = run_migration(
             src.path(),
+            &crate::indexing::SourceIdentities::default(),
             &profiles,
             &eb,
             None,
@@ -2219,6 +2360,7 @@ mod tests {
         };
         let out = run_migration(
             src.path(),
+            &crate::indexing::SourceIdentities::default(),
             &profiles,
             &eb,
             None,

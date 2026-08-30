@@ -75,6 +75,13 @@ pub struct ScanReport {
     pub bundles: usize,
     /// Files the cascade couldn't classify.
     pub unclassified: usize,
+    /// Files already at the destination the classifier chose. Successfully
+    /// classified, no operation proposed — scan sorts in place.
+    pub already_in_place: usize,
+    /// Images the per-directory clustering work cap excluded from
+    /// visual-collection discovery. They are still classified individually;
+    /// what they lost was the chance to be grouped.
+    pub visual_candidates_over_cap: usize,
     /// Loose proposals the user approved in review.
     pub approved: usize,
     /// Loose proposals successfully moved (post-review + shelve).
@@ -256,8 +263,12 @@ impl ScanService {
         // The classifier config (rename thresholds + optional reranker) is
         // materialised from the loaded TidyupConfig at context-build time; see
         // `classifier_config_for`.
+        // Reuse the identities indexing just streamed: the proposal keeps the
+        // FileId and the BLAKE3 already computed instead of re-hashing.
+        let identities = tidyup_pipeline::indexing::SourceIdentities::new(&indexed.indexed);
         let mut outcome = run_scan(
             &request.root,
+            &identities,
             &output_root,
             candidates,
             self.ctx.embeddings.as_ref(),
@@ -281,6 +292,7 @@ impl ScanService {
             &outcome.proposals,
             &outcome.bundles,
             &outcome.unclassified,
+            &outcome.already_in_place,
         )
         .await?;
 
@@ -373,6 +385,8 @@ impl ScanService {
             proposed: outcome.proposals.len(),
             bundles: outcome.bundles.len(),
             unclassified: outcome.unclassified.len(),
+            already_in_place: outcome.already_in_place.len(),
+            visual_candidates_over_cap: outcome.visual_candidates_over_cap,
             approved,
             applied: loose_report.applied,
             skipped: loose_report.skipped,

@@ -112,6 +112,14 @@ pub enum FileProcessingState {
     Indexed,
     Classified,
     Unclassified,
+    /// Reserved. Semantic evaluation ran out of its synchronous budget before
+    /// reaching a decision, so the item is neither classified nor refused.
+    ///
+    /// **No code path produces this today.** It is the terminal state the
+    /// per-stage deadline will write once stage spans and budget threading
+    /// exist; until then a slow file simply takes as long as it takes. Treat a
+    /// `Deferred` row as forward-compatibility only — the states are persisted
+    /// by name, so readers must already tolerate it.
     Deferred,
     Failed,
 }

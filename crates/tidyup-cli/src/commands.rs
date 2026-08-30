@@ -122,23 +122,28 @@ async fn run_migrate(
 
     emit_summary(
         json,
-        "migrate",
-        report.run_id,
-        report.source_indexed,
-        Some(report.target_indexed),
-        report.indexing_failed,
-        &report.capabilities,
-        report.proposed,
-        report.bundles,
-        report.unclassified,
-        report.approved,
-        report.applied,
-        report.skipped,
-        report.failed,
-        report.bundles_applied,
-        report.bundles_skipped,
-        report.bundles_failed,
-        dry_run,
+        &RunSummary {
+            mode: "migrate",
+            run_id: report.run_id,
+            indexed: report.source_indexed,
+            target_indexed: Some(report.target_indexed),
+            indexing_failed: report.indexing_failed,
+            capabilities: &report.capabilities,
+            proposed: report.proposed,
+            bundles: report.bundles,
+            unclassified: report.unclassified,
+            // Migration always moves out of the source tree.
+            already_in_place: 0,
+            visual_candidates_over_cap: report.visual_candidates_over_cap,
+            approved: report.approved,
+            applied: report.applied,
+            skipped: report.skipped,
+            failed: report.failed,
+            bundles_applied: report.bundles_applied,
+            bundles_skipped: report.bundles_skipped,
+            bundles_failed: report.bundles_failed,
+            dry_run,
+        },
     );
     Ok(())
 }
@@ -194,23 +199,27 @@ async fn run_scan(
 
     emit_summary(
         json,
-        "scan",
-        report.run_id,
-        report.indexed,
-        None,
-        report.indexing_failed,
-        &report.capabilities,
-        report.proposed,
-        report.bundles,
-        report.unclassified,
-        report.approved,
-        report.applied,
-        report.skipped,
-        report.failed,
-        report.bundles_applied,
-        report.bundles_skipped,
-        report.bundles_failed,
-        dry_run,
+        &RunSummary {
+            mode: "scan",
+            run_id: report.run_id,
+            indexed: report.indexed,
+            target_indexed: None,
+            indexing_failed: report.indexing_failed,
+            capabilities: &report.capabilities,
+            proposed: report.proposed,
+            bundles: report.bundles,
+            unclassified: report.unclassified,
+            already_in_place: report.already_in_place,
+            visual_candidates_over_cap: report.visual_candidates_over_cap,
+            approved: report.approved,
+            applied: report.applied,
+            skipped: report.skipped,
+            failed: report.failed,
+            bundles_applied: report.bundles_applied,
+            bundles_skipped: report.bundles_skipped,
+            bundles_failed: report.bundles_failed,
+            dry_run,
+        },
     );
     Ok(())
 }
@@ -450,18 +459,22 @@ fn reviewer_for(yes: bool, cfg: &config::TidyupConfig) -> Box<dyn tidyup_core::R
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn emit_summary(
-    json: bool,
-    mode: &str,
+/// Everything one run reports. A struct rather than a positional argument list:
+/// the summary already carried eighteen parameters, and the two new
+/// accounting fields would have made a mis-ordered `usize` a silent bug.
+struct RunSummary<'a> {
+    mode: &'a str,
     run_id: uuid::Uuid,
     indexed: usize,
     target_indexed: Option<usize>,
     indexing_failed: usize,
-    capabilities: &tidyup_domain::CapabilityManifest,
+    capabilities: &'a tidyup_domain::CapabilityManifest,
     proposed: usize,
     bundles: usize,
     unclassified: usize,
+    /// Scan only: classified, but already where it belongs.
+    already_in_place: usize,
+    visual_candidates_over_cap: usize,
     approved: usize,
     applied: usize,
     skipped: usize,
@@ -470,7 +483,30 @@ fn emit_summary(
     bundles_skipped: usize,
     bundles_failed: usize,
     dry_run: bool,
-) {
+}
+
+fn emit_summary(json: bool, s: &RunSummary<'_>) {
+    let RunSummary {
+        mode,
+        run_id,
+        indexed,
+        target_indexed,
+        indexing_failed,
+        capabilities,
+        proposed,
+        bundles,
+        unclassified,
+        already_in_place,
+        visual_candidates_over_cap,
+        approved,
+        applied,
+        skipped,
+        failed,
+        bundles_applied,
+        bundles_skipped,
+        bundles_failed,
+        dry_run,
+    } = *s;
     if json {
         let v = serde_json::json!({
             "event": format!("{mode}_summary"),
@@ -483,6 +519,8 @@ fn emit_summary(
             "proposed": proposed,
             "bundles": bundles,
             "unclassified": unclassified,
+            "already_in_place": already_in_place,
+            "visual_candidates_over_cap": visual_candidates_over_cap,
             "approved": approved,
             "applied": applied,
             "skipped": skipped,
@@ -509,8 +547,21 @@ fn emit_summary(
     println!(
         "  bundles:   {bundles} (applied {bundles_applied}, skipped {bundles_skipped}, failed {bundles_failed})"
     );
+    if already_in_place > 0 {
+        println!("  already in place: {already_in_place} (classified, nothing to move)");
+    }
     if unclassified > 0 {
         println!("  unclassified: {unclassified}");
+    }
+    if visual_candidates_over_cap > 0 {
+        // Say this out loud. These files are classified and present in the
+        // plan, so nothing looks missing — but they were never offered to
+        // collection discovery, so a large folder groups some images and not
+        // others for reasons the user cannot see.
+        println!(
+            "  note: {visual_candidates_over_cap} image(s) exceeded the per-directory clustering cap \
+and were classified individually without collection grouping"
+        );
     }
     if !dry_run && (applied > 0 || bundles_applied > 0) {
         println!("Undo with: tidyup rollback {run_id}");

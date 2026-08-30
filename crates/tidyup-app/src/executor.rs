@@ -929,38 +929,56 @@ pub fn validate_destination_ledger(
     let mut reserved: Vec<(Vec<String>, String)> = Vec::new();
 
     for decision in decisions {
-        let (id, target) = match decision {
+        let (id, target, source) = match decision {
             ReviewDecision::Approve(id) => {
                 let Some(proposal) = by_id.get(id) else {
                     continue;
                 };
-                (*id, proposal.proposed_path.as_path())
+                (
+                    *id,
+                    proposal.proposed_path.as_path(),
+                    proposal.original_path.as_path(),
+                )
             }
             ReviewDecision::Override {
                 proposal_id,
                 new_target,
             } => {
-                if !by_id.contains_key(proposal_id) {
+                let Some(proposal) = by_id.get(proposal_id) else {
                     continue;
-                }
-                (*proposal_id, new_target.as_path())
+                };
+                (
+                    *proposal_id,
+                    new_target.as_path(),
+                    proposal.original_path.as_path(),
+                )
             }
             ReviewDecision::Reject(_) => continue,
         };
-        reserve_destination(&mut reserved, id, target)?;
+        reserve_destination(&mut reserved, id, target, source)?;
     }
 
     for bundle in approved_bundles {
         if bundle.kind.moves_as_file_set() {
             for member in &bundle.members {
-                reserve_destination(&mut reserved, member.id, &member.proposed_path)?;
+                reserve_destination(
+                    &mut reserved,
+                    member.id,
+                    &member.proposed_path,
+                    &member.original_path,
+                )?;
             }
         } else {
             let leaf = bundle
                 .root
                 .file_name()
                 .ok_or_else(|| anyhow!("bundle root has no filename: {}", bundle.root.display()))?;
-            reserve_destination(&mut reserved, bundle.id, &bundle.target_parent.join(leaf))?;
+            reserve_destination(
+                &mut reserved,
+                bundle.id,
+                &bundle.target_parent.join(leaf),
+                &bundle.root,
+            )?;
         }
     }
     Ok(())
@@ -970,6 +988,7 @@ fn reserve_destination(
     reserved: &mut Vec<(Vec<String>, String)>,
     id: Uuid,
     target: &Path,
+    source: &Path,
 ) -> Result<()> {
     let key = normalized_destination(target);
     for (other_key, other) in reserved.iter() {
@@ -984,7 +1003,11 @@ fn reserve_destination(
             ));
         }
     }
-    if target.exists() {
+    // A target that exists *because it is the source* is a no-op, not a
+    // collision. Scan reorganizes in place, so an override back to the file's
+    // current location must not abort the whole plan; the destination is still
+    // reserved so nothing else can claim it.
+    if key != normalized_destination(source) && target.exists() {
         return Err(anyhow!(
             "approved operation targets an existing path {}; refusing to overwrite",
             target.display()
@@ -2092,6 +2115,36 @@ mod tests {
         let decisions = vec![ReviewDecision::Approve(proposal.id)];
         let error = validate_destination_ledger(&[proposal], &decisions, &[])
             .expect_err("existing final target must be held");
+        assert!(error.to_string().contains("existing path"));
+    }
+
+    /// A target that exists because it *is* the source is a no-op, not a
+    /// collision. Scan reorganizes in place, so without this the ledger would
+    /// abort an entire run over one file that needed nothing done to it.
+    #[test]
+    fn destination_ledger_allows_target_equal_to_source() {
+        let dir = TempDir::new().unwrap();
+        let settled = dir.path().join("organized/settled.txt");
+        std::fs::create_dir_all(settled.parent().unwrap()).unwrap();
+        std::fs::write(&settled, b"already filed").unwrap();
+        let proposal = sample_proposal(settled.clone(), &settled);
+        let decisions = vec![ReviewDecision::Approve(proposal.id)];
+        validate_destination_ledger(&[proposal], &decisions, &[])
+            .expect("a file already at its destination must not fail the plan");
+    }
+
+    /// The self-target exemption is narrow: two different sources resolving to
+    /// one path is still a collision, and an unrelated occupant still blocks.
+    #[test]
+    fn destination_ledger_still_rejects_other_sources_targeting_a_live_path() {
+        let dir = TempDir::new().unwrap();
+        let settled = dir.path().join("organized/settled.txt");
+        std::fs::create_dir_all(settled.parent().unwrap()).unwrap();
+        std::fs::write(&settled, b"already filed").unwrap();
+        let intruder = sample_proposal(dir.path().join("elsewhere.txt"), &settled);
+        let decisions = vec![ReviewDecision::Approve(intruder.id)];
+        let error = validate_destination_ledger(&[intruder], &decisions, &[])
+            .expect_err("a different source must not overwrite an occupied path");
         assert!(error.to_string().contains("existing path"));
     }
 }

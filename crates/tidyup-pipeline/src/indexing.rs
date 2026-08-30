@@ -5,6 +5,7 @@
 //! pass in the pipeline lets both scan and migration populate the same
 //! `FileIndex` without coupling the application layer to `SQLite`.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -22,6 +23,56 @@ use walkdir::WalkDir;
 pub struct IndexSummary {
     pub indexed: Vec<IndexedFile>,
     pub failed: usize,
+}
+
+/// Identities collected before classification, addressable by source path.
+///
+/// Indexing already streams every file to compute its `BLAKE3` and persists a
+/// stable [`FileId`] that survives re-scans. Handing that result to the
+/// pipeline means a proposal reuses both instead of hashing the file a second
+/// time and leaving its `file_id` empty — which had left the run's two ledgers
+/// (processing records and change proposals) joinable only by path, the one
+/// field a move changes.
+#[derive(Debug, Clone, Default)]
+pub struct SourceIdentities {
+    by_path: HashMap<PathBuf, IndexedFile>,
+}
+
+impl SourceIdentities {
+    /// Index the pass's readable files by path.
+    #[must_use]
+    pub fn new(indexed: &[IndexedFile]) -> Self {
+        Self {
+            by_path: indexed
+                .iter()
+                .map(|file| (file.path.clone(), file.clone()))
+                .collect(),
+        }
+    }
+
+    /// Stable identity for `path`, when indexing produced one.
+    #[must_use]
+    pub fn file_id(&self, path: &Path) -> Option<FileId> {
+        self.by_path.get(path).map(|file| file.id.clone())
+    }
+
+    /// The hash captured at indexing time, for the executor's apply-time TOCTOU
+    /// check.
+    ///
+    /// This widens the guarded window rather than narrowing it: the hash now
+    /// dates from before classification instead of after it, so a file edited
+    /// *during* the run is caught at apply instead of being moved under a
+    /// classification derived from content that no longer exists.
+    ///
+    /// Falls back to hashing on demand for a path indexing could not read, so
+    /// an unindexed file keeps the guard it had before.
+    #[must_use]
+    pub fn content_hash(&self, path: &Path) -> Option<String> {
+        self.by_path.get(path).map_or_else(
+            || crate::hashing::content_hash_of(path),
+            |file| Some(file.content_hash.0.clone()),
+        )
+    }
 }
 
 /// Walk `root`, upsert every readable regular file, and persist a run-scoped
@@ -296,6 +347,49 @@ mod tests {
         assert_ne!(
             after.content_hash.0,
             blake3::hash(b"first").to_hex().to_string()
+        );
+    }
+
+    /// The proposal must carry the identity indexing already established, so
+    /// the run's processing records and change proposals join on `FileId`
+    /// rather than on a path a move is about to invalidate.
+    #[tokio::test]
+    async fn source_identities_reuse_the_indexed_identity_and_hash() {
+        let dir = TempDir::new().unwrap();
+        let path = write(dir.path(), "doc.txt", b"payload");
+        let store = SqliteStore::open_in_memory().unwrap();
+        let (_, summary) = run(&store, dir.path()).await;
+
+        let identities = SourceIdentities::new(&summary.indexed);
+        let indexed = summary
+            .indexed
+            .iter()
+            .find(|file| file.path == path)
+            .expect("indexed the file");
+        assert_eq!(identities.file_id(&path), Some(indexed.id.clone()));
+        assert_eq!(
+            identities.content_hash(&path),
+            Some(blake3::hash(b"payload").to_hex().to_string()),
+            "the hash must come from indexing, not a second read"
+        );
+    }
+
+    /// A path indexing could not read still needs the apply-time TOCTOU guard,
+    /// so an unknown path falls back to hashing on demand.
+    #[tokio::test]
+    async fn source_identities_fall_back_for_an_unindexed_path() {
+        let dir = TempDir::new().unwrap();
+        let path = write(dir.path(), "late.txt", b"appeared later");
+        let identities = SourceIdentities::default();
+
+        assert_eq!(identities.file_id(&path), None);
+        assert_eq!(
+            identities.content_hash(&path),
+            Some(blake3::hash(b"appeared later").to_hex().to_string())
+        );
+        assert_eq!(
+            identities.content_hash(&dir.path().join("absent.txt")),
+            None
         );
     }
 }
