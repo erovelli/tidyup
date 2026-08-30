@@ -38,6 +38,28 @@ fn escape_like(s: &str) -> String {
     out
 }
 
+/// Build the `LIKE` prefix patterns that match everything under `root`.
+///
+/// The separator has to come from the platform: hardcoding `/` produced a
+/// pattern (`C:\\dir/%`) that matches nothing on Windows, where stored paths
+/// use `\\`. A `PathBuf` on Windows can also carry forward slashes, so a
+/// second pattern covers that; on Unix `/` is the only separator and the
+/// alternate is identical, making the extra `OR` a no-op rather than a way for
+/// a literal-backslash filename to be mistaken for a subtree.
+///
+/// Trailing separators are trimmed so a filesystem root (`/`, `C:\\`) does not
+/// produce a doubled separator that matches nothing.
+fn subtree_like_patterns(root: &str) -> (String, String) {
+    let escaped = escape_like(root.trim_end_matches(std::path::is_separator));
+    let primary = format!("{escaped}{}%", escape_like(std::path::MAIN_SEPARATOR_STR));
+    let alternate = if cfg!(windows) {
+        format!("{escaped}{}%", escape_like("/"))
+    } else {
+        primary.clone()
+    };
+    (primary, alternate)
+}
+
 fn row_to_file(row: &Row<'_>) -> rusqlite::Result<IndexedFile> {
     let id_str: String = row.get("id")?;
     let path_str: String = row.get("path")?;
@@ -220,16 +242,17 @@ impl FileIndex for SqliteStore {
     async fn list_under(&self, root: &Path) -> tidyup_core::Result<Vec<IndexedFile>> {
         let conn = self.conn();
         let root_str = path_str(root)?.to_string();
+        let (primary, alternate) = subtree_like_patterns(&root_str);
         let result = tokio::task::spawn_blocking(move || -> Result<Vec<IndexedFile>> {
             let rows = {
                 let guard = conn.lock().map_err(|e| anyhow!("lock poisoned: {e}"))?;
-                let prefix = format!("{}/%", escape_like(&root_str));
                 let mut stmt = guard.prepare(&format!(
-                    "SELECT {COLS} FROM files WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\' \
+                    "SELECT {COLS} FROM files WHERE path = ?1 \
+                     OR path LIKE ?2 ESCAPE '\\' OR path LIKE ?3 ESCAPE '\\' \
                      ORDER BY path"
                 ))?;
                 let fetched: Vec<IndexedFile> = stmt
-                    .query_map(params![root_str, prefix], row_to_file)?
+                    .query_map(params![root_str, primary, alternate], row_to_file)?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 fetched
             };
@@ -717,6 +740,46 @@ mod tests {
         let store = SqliteStore::open_in_memory().unwrap();
         assert!(store.by_path(Path::new("/nope")).await.unwrap().is_none());
         assert!(store.get(&FileId(Uuid::new_v4())).await.unwrap().is_none());
+    }
+
+    /// The previous implementation hardcoded `/` in the `LIKE` prefix, so on
+    /// Windows (where `PathBuf` yields `\\`) a real subtree matched nothing and
+    /// `list_under` silently returned zero rows. Building the paths with `join`
+    /// exercises the platform separator, so this fails on Windows if the
+    /// hardcoded separator ever comes back. The trailing-separator case below
+    /// regresses on every platform.
+    #[tokio::test]
+    async fn list_under_matches_platform_native_separators() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let root = if cfg!(windows) {
+            PathBuf::from("C:\\workspace\\code")
+        } else {
+            PathBuf::from("/workspace/code")
+        };
+        let nested = root.join("sub").join("b.rs");
+        for path in [root.join("a.rs"), nested.clone()] {
+            store
+                .upsert(&sample_file(path.to_str().unwrap(), Uuid::new_v4()))
+                .await
+                .unwrap();
+        }
+        // A sibling sharing the root's textual prefix must not be swept in.
+        let sibling = root.with_file_name("codex").join("c.rs");
+        store
+            .upsert(&sample_file(sibling.to_str().unwrap(), Uuid::new_v4()))
+            .await
+            .unwrap();
+
+        let listed = store.list_under(&root).await.unwrap();
+        let paths: Vec<_> = listed.iter().map(|f| f.path.clone()).collect();
+        assert_eq!(paths, [root.join("a.rs"), nested]);
+
+        // A root handed in with a trailing separator addresses the same subtree;
+        // without trimming it the pattern doubles the separator and matches
+        // nothing.
+        let with_trailing =
+            PathBuf::from(format!("{}{}", root.display(), std::path::MAIN_SEPARATOR));
+        assert_eq!(store.list_under(&with_trailing).await.unwrap().len(), 2);
     }
 
     #[tokio::test]
