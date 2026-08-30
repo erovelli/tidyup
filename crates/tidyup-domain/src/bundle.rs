@@ -7,9 +7,9 @@
 //! Invariants (enforced by the constructor):
 //! - A bundle has at least one member.
 //! - Every member carries `bundle_id == Some(bundle.id)` (stamped on construction).
-//! - Every member has `change_type == ChangeType::Move`; bundle members never receive rename
-//!   proposals.
-//! - No member carries a `rename_mismatch_score` — rename signals are meaningless for members.
+//! - Structural bundle members preserve their names. Semantic collections may carry
+//!   evidence-backed `RenameAndMove` proposals for loose members.
+//! - Rename scores are accepted only for semantic collections.
 //!
 //! Individual member proposals are never approved, applied, or rolled back independently of
 //! their bundle. See `CLAUDE.md` → "Bundle detection and atomicity".
@@ -35,7 +35,13 @@ pub enum BundleKind {
     JupyterNotebookSet,
     PhotoBurst,
     MusicAlbum,
-    DocumentSeries { pattern: String },
+    DocumentSeries {
+        pattern: String,
+    },
+    /// Loose, cross-format artifacts linked by filename/content/session evidence.
+    SemanticCollection {
+        label: String,
+    },
     Generic,
 }
 
@@ -53,12 +59,13 @@ impl BundleKind {
             Self::PhotoBurst => "PhotoBurst",
             Self::MusicAlbum => "MusicAlbum",
             Self::DocumentSeries { .. } => "DocumentSeries",
+            Self::SemanticCollection { .. } => "SemanticCollection",
             Self::Generic => "Generic",
         }
     }
 
-    /// Parse the discriminator produced by `as_str`. Payload-carrying variants require explicit
-    /// rehydration by the caller (only the discriminator is on the wire).
+    /// Parse the discriminator produced by `as_str`. Payload-carrying variants use an empty
+    /// payload because only the stable discriminator is on the wire; callers may rehydrate it.
     pub fn parse(s: &str) -> Result<Self, ParseError> {
         match s {
             "GitRepository" => Ok(Self::GitRepository),
@@ -70,6 +77,9 @@ impl BundleKind {
             "JupyterNotebookSet" => Ok(Self::JupyterNotebookSet),
             "PhotoBurst" => Ok(Self::PhotoBurst),
             "MusicAlbum" => Ok(Self::MusicAlbum),
+            "SemanticCollection" => Ok(Self::SemanticCollection {
+                label: String::new(),
+            }),
             "Generic" => Ok(Self::Generic),
             other => Err(ParseError::UnknownBundleKind(other.to_string())),
         }
@@ -87,8 +97,18 @@ impl BundleKind {
     pub const fn moves_as_file_set(&self) -> bool {
         matches!(
             self,
-            Self::PhotoBurst | Self::MusicAlbum | Self::DocumentSeries { .. }
+            Self::PhotoBurst
+                | Self::MusicAlbum
+                | Self::DocumentSeries { .. }
+                | Self::SemanticCollection { .. }
         )
+    }
+
+    /// Whether loose members may be renamed while the collection is still
+    /// reviewed and applied atomically.
+    #[must_use]
+    pub const fn allows_member_renames(&self) -> bool {
+        matches!(self, Self::SemanticCollection { .. })
     }
 }
 
@@ -119,14 +139,10 @@ pub struct BundleProposal {
 pub enum BundleError {
     #[error("bundle must have at least one member")]
     Empty,
-    #[error(
-        "bundle member has change_type {actual}; bundles only allow Move (rename suggestions \
-         are never generated for bundle members)"
-    )]
+    #[error("bundle member has change_type {actual}; this bundle kind preserves member names")]
     MemberNotMove { actual: &'static str },
     #[error(
-        "bundle member carries a rename_mismatch_score; rename signals are meaningless for \
-         bundle members"
+        "bundle member carries a rename_mismatch_score; this bundle kind preserves member names"
     )]
     MemberHasRenameScore,
 }
@@ -151,12 +167,15 @@ impl BundleProposal {
         let id = Uuid::new_v4();
         let mut stamped = Vec::with_capacity(members.len());
         for mut member in members {
-            if member.change_type != ChangeType::Move {
+            let valid_change = member.change_type == ChangeType::Move
+                || (kind.allows_member_renames()
+                    && member.change_type == ChangeType::RenameAndMove);
+            if !valid_change {
                 return Err(BundleError::MemberNotMove {
                     actual: member.change_type.as_str(),
                 });
             }
-            if member.rename_mismatch_score.is_some() {
+            if member.rename_mismatch_score.is_some() && !kind.allows_member_renames() {
                 return Err(BundleError::MemberHasRenameScore);
             }
             member.bundle_id = Some(id);
@@ -217,6 +236,9 @@ mod tests {
             BundleKind::JupyterNotebookSet,
             BundleKind::PhotoBurst,
             BundleKind::MusicAlbum,
+            BundleKind::SemanticCollection {
+                label: String::new(),
+            },
             BundleKind::Generic,
         ];
         for k in kinds {
@@ -232,6 +254,10 @@ mod tests {
         assert!(BundleKind::MusicAlbum.moves_as_file_set());
         assert!(BundleKind::DocumentSeries {
             pattern: "invoice".into()
+        }
+        .moves_as_file_set());
+        assert!(BundleKind::SemanticCollection {
+            label: "atoms not electrons".into()
         }
         .moves_as_file_set());
         // Marker (directory) bundles move by renaming their root.
@@ -320,6 +346,27 @@ mod tests {
                 actual: "RenameAndMove"
             }
         ));
+    }
+
+    #[test]
+    fn semantic_collection_accepts_member_rename() {
+        let mut renamed = sample_member("screenshot.png");
+        renamed.change_type = ChangeType::RenameAndMove;
+        renamed.proposed_name = "submission-confirmation.png".to_string();
+        renamed.proposed_path = PathBuf::from("/projects/atoms/submission-confirmation.png");
+        renamed.rename_mismatch_score = Some(0.9);
+        let bundle = BundleProposal::new(
+            PathBuf::from("/src"),
+            BundleKind::SemanticCollection {
+                label: "atoms".to_string(),
+            },
+            PathBuf::from("/projects"),
+            vec![renamed],
+            0.9,
+            "shared entity stem".to_string(),
+        )
+        .unwrap();
+        assert_eq!(bundle.members[0].change_type, ChangeType::RenameAndMove);
     }
 
     #[test]

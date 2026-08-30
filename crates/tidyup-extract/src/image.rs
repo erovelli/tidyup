@@ -5,6 +5,8 @@
 //! tags (camera make/model, timestamp, GPS, orientation) — the format mirrors
 //! docorg so the classifier sees a stable prose-ish string rather than nested
 //! JSON.
+//! On macOS, optional Vision OCR is restricted to plausible screenshot names
+//! under a configurable byte cap; ordinary photos never launch the helper.
 //!
 //! Dimensions use `image::image_dimensions`, which reads only the image header
 //! for most formats. The `image` crate doesn't support HEIC/AVIF out of the
@@ -25,14 +27,39 @@ const IMAGE_EXTENSIONS: &[&str] = &[
     "heif", "raw", "cr2", "nef", "arw", "dng",
 ];
 
+/// Default upper bound for an image passed whole to the Vision helper (20 MiB).
+pub const DEFAULT_MAX_OCR_BYTES: u64 = 20 * 1024 * 1024;
+
 /// Extractor for image files. Produces dimensions + EXIF metadata; no pixels.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct ImageExtractor;
+#[derive(Debug, Clone, Copy)]
+pub struct ImageExtractor {
+    ocr_enabled: bool,
+    max_ocr_bytes: u64,
+}
+
+impl Default for ImageExtractor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl ImageExtractor {
     #[must_use]
     pub const fn new() -> Self {
-        Self
+        Self {
+            ocr_enabled: true,
+            max_ocr_bytes: DEFAULT_MAX_OCR_BYTES,
+        }
+    }
+
+    /// Configure bounded local OCR. A zero byte cap disables OCR;
+    /// dimensions and EXIF extraction remain available in every case.
+    #[must_use]
+    pub const fn with_ocr(ocr_enabled: bool, max_ocr_bytes: u64) -> Self {
+        Self {
+            ocr_enabled,
+            max_ocr_bytes,
+        }
     }
 }
 
@@ -51,24 +78,33 @@ impl ContentExtractor for ImageExtractor {
 
     async fn extract(&self, path: &Path) -> Result<ExtractedContent> {
         let owned: PathBuf = path.to_path_buf();
-        let probe = tokio::task::spawn_blocking(move || probe(&owned)).await?;
+        let ocr_enabled = self.ocr_enabled;
+        let max_ocr_bytes = self.max_ocr_bytes;
+        let probe =
+            tokio::task::spawn_blocking(move || probe(&owned, ocr_enabled, max_ocr_bytes)).await?;
 
         let ImageProbe {
             dimensions,
             exif,
+            ocr_text,
             error,
         } = probe;
 
-        let text = if exif.is_empty() {
-            None
-        } else {
-            Some(
+        let mut text_parts = Vec::new();
+        if !exif.is_empty() {
+            text_parts.push(
                 exif.iter()
                     .map(|(k, v)| format!("{k}: {v}"))
                     .collect::<Vec<_>>()
                     .join(", "),
-            )
-        };
+            );
+        }
+        if let Some(ocr) = &ocr_text {
+            if !ocr.is_empty() {
+                text_parts.push(ocr.clone());
+            }
+        }
+        let text = (!text_parts.is_empty()).then(|| text_parts.join("\n"));
 
         let mut exif_obj = serde_json::Map::new();
         for (k, v) in &exif {
@@ -84,6 +120,9 @@ impl ContentExtractor for ImageExtractor {
             },
         );
         metadata.insert("exif".to_string(), serde_json::Value::Object(exif_obj));
+        if let Some(ocr) = ocr_text {
+            metadata.insert("ocr_text".to_string(), serde_json::Value::String(ocr));
+        }
         if let Some(e) = error {
             metadata.insert("error".to_string(), serde_json::Value::String(e));
         }
@@ -99,11 +138,27 @@ impl ContentExtractor for ImageExtractor {
 struct ImageProbe {
     dimensions: Option<(u32, u32)>,
     exif: Vec<(&'static str, String)>,
+    ocr_text: Option<String>,
     error: Option<String>,
 }
 
-fn probe(path: &Path) -> ImageProbe {
+// The OCR bounds are only read on macOS builds where the Vision helper
+// compiled. Elsewhere they are inert, and `-D warnings` would otherwise reject
+// them as unused; keep the real names so the macOS branch stays readable.
+#[cfg_attr(
+    not(all(target_os = "macos", macos_vision_ocr)),
+    allow(unused_variables)
+)]
+fn probe(path: &Path, ocr_enabled: bool, max_ocr_bytes: u64) -> ImageProbe {
     let dimensions = image::image_dimensions(path).ok();
+
+    #[cfg(all(target_os = "macos", macos_vision_ocr))]
+    let ocr_text = should_run_ocr(path, ocr_enabled, max_ocr_bytes)
+        .then(|| crate::macos_ocr::recognize(path).ok())
+        .flatten()
+        .filter(|text| !text.is_empty());
+    #[cfg(not(all(target_os = "macos", macos_vision_ocr)))]
+    let ocr_text = None;
 
     let (exif, error) = match extract_exif(path) {
         Ok(tags) => (tags, None),
@@ -113,8 +168,34 @@ fn probe(path: &Path) -> ImageProbe {
     ImageProbe {
         dimensions,
         exif,
+        ocr_text,
         error,
     }
+}
+
+#[cfg(any(all(target_os = "macos", macos_vision_ocr), test))]
+fn should_run_ocr(path: &Path, enabled: bool, max_bytes: u64) -> bool {
+    enabled
+        && max_bytes > 0
+        && plausible_screenshot_name(path)
+        && std::fs::metadata(path).is_ok_and(|metadata| metadata.len() <= max_bytes)
+}
+
+#[cfg(any(all(target_os = "macos", macos_vision_ocr), test))]
+fn plausible_screenshot_name(path: &Path) -> bool {
+    let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    let tokens: Vec<String> = stem
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    tokens.first().is_some_and(|token| {
+        ["screenshot", "screencapture", "screengrab"]
+            .iter()
+            .any(|prefix| token.starts_with(prefix))
+    }) || matches!(tokens.as_slice(), [first, second, ..] if first == "screen" && matches!(second.as_str(), "shot" | "capture" | "grab"))
 }
 
 fn extract_exif(path: &Path) -> std::result::Result<Vec<(&'static str, String)>, String> {
@@ -207,6 +288,35 @@ mod tests {
         let out = e.extract(Path::new("/no/such.jpg")).await.unwrap();
         assert!(out.metadata["dimensions"].is_null());
         assert!(out.metadata.get("error").is_some());
+    }
+
+    #[test]
+    fn ocr_is_limited_to_plausible_screenshots_under_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let screenshot = dir.path().join("Screen_Shot_1.png");
+        let photo = dir.path().join("IMG_0001.png");
+        std::fs::write(&screenshot, [0_u8; 16]).unwrap();
+        std::fs::write(&photo, [0_u8; 16]).unwrap();
+
+        assert!(should_run_ocr(&screenshot, true, 16));
+        assert!(!should_run_ocr(&screenshot, false, 16));
+        assert!(!should_run_ocr(&screenshot, true, 0));
+        assert!(!should_run_ocr(&screenshot, true, 15));
+        assert!(!should_run_ocr(&photo, true, 16));
+    }
+
+    #[test]
+    fn screenshot_name_variants_are_recognized_without_extension_routing() {
+        for name in [
+            "Screenshot 2026-08-25.png",
+            "screenshot_1.anything",
+            "Screen-Shot-2",
+            "screen_capture_3.tiff",
+            "screencapture4.png",
+        ] {
+            assert!(plausible_screenshot_name(Path::new(name)), "{name}");
+        }
+        assert!(!plausible_screenshot_name(Path::new("holiday_photo.png")));
     }
 
     #[test]

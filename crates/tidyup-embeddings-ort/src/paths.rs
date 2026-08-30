@@ -40,7 +40,7 @@ pub fn taxonomy_cache_path() -> Option<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
-// SigLIP — cross-modal image/text encoder used in Tier 2 image classification.
+// SigLIP — cross-modal image/text encoder for image routing and naming.
 // ---------------------------------------------------------------------------
 
 /// Subdirectory under the model cache that holds the `SigLIP` image bundle.
@@ -72,7 +72,7 @@ pub fn siglip_taxonomy_cache_path() -> Option<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
-// CLAP — cross-modal audio/text encoder used in Tier 2 audio classification.
+// CLAP — cross-modal audio/text encoder for audio routing.
 // ---------------------------------------------------------------------------
 
 /// Subdirectory under the model cache that holds the `CLAP` audio bundle.

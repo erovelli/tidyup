@@ -24,18 +24,18 @@
 
 use async_trait::async_trait;
 use dioxus::prelude::*;
-use tidyup_core::{frontend::ReviewHandler, Result};
-use tidyup_domain::{BundleProposal, ChangeProposal, ReviewDecision};
+use tidyup_core::{frontend::ReviewHandler, Result, ReviewOutcome};
+use tidyup_domain::{BundleProposal, ChangeProposal, Phase, ReviewDecision};
 use tokio::sync::oneshot;
-use uuid::Uuid;
 
-use crate::state::{BundleReviewSlot, ReviewSlot, SignalBundle};
+use crate::state::{BundleReviewSlot, CombinedReviewSlot, ReviewSlot, SignalBundle};
 
 #[allow(missing_debug_implementations)]
 pub(crate) struct DioxusReviewHandler {
     signals: SignalBundle,
     slot: ReviewSlot,
     bundle_slot: BundleReviewSlot,
+    combined_slot: CombinedReviewSlot,
 }
 
 impl DioxusReviewHandler {
@@ -43,11 +43,13 @@ impl DioxusReviewHandler {
         signals: SignalBundle,
         slot: ReviewSlot,
         bundle_slot: BundleReviewSlot,
+        combined_slot: CombinedReviewSlot,
     ) -> Self {
         Self {
             signals,
             slot,
             bundle_slot,
+            combined_slot,
         }
     }
 }
@@ -76,6 +78,12 @@ impl ReviewHandler for DioxusReviewHandler {
         }
 
         let mut pending = self.signals.review_pending;
+        let mut phase = self.signals.phase;
+        let mut current = self.signals.progress_current;
+        let mut total = self.signals.progress_total;
+        phase.set(Some(Phase::AwaitingReview));
+        current.set(0);
+        total.set(None);
         pending.set(true);
 
         let decisions = rx
@@ -93,13 +101,14 @@ impl ReviewHandler for DioxusReviewHandler {
 
     /// Atomic per-bundle review. Mirrors [`review`](Self::review): stash the
     /// bundles, park a oneshot, flip `review_pending`, and await the user's
-    /// approve/reject decisions. Returns the ids of the approved bundles —
-    /// there is no per-member decision and no override, since bundle members
-    /// carry their own paths and never receive rename proposals.
+    /// approve/reject decisions. Returns the approved bundle proposals so the
+    /// review surface can carry semantic-label and member-filename edits. The
+    /// executor reconciles those edits against the original aggregate before
+    /// any filesystem operation; approval remains one atomic bundle decision.
     ///
     /// The default trait impl approves nothing; implementing it here is what
     /// turns the desktop UI's bundles from "held" into reviewable.
-    async fn review_bundles(&self, bundles: Vec<BundleProposal>) -> Result<Vec<Uuid>> {
+    async fn review_bundles(&self, bundles: Vec<BundleProposal>) -> Result<Vec<BundleProposal>> {
         if bundles.is_empty() {
             return Ok(Vec::new());
         }
@@ -112,13 +121,19 @@ impl ReviewHandler for DioxusReviewHandler {
         let mut bundles_sig = self.signals.bundles;
         bundles_sig.set(bundles);
 
-        let (tx, rx) = oneshot::channel::<Vec<Uuid>>();
+        let (tx, rx) = oneshot::channel::<Vec<BundleProposal>>();
         {
             let mut guard = self.bundle_slot.lock().await;
             *guard = Some(tx);
         }
 
         let mut pending = self.signals.review_pending;
+        let mut phase = self.signals.phase;
+        let mut current = self.signals.progress_current;
+        let mut total = self.signals.progress_total;
+        phase.set(Some(Phase::AwaitingReview));
+        current.set(0);
+        total.set(None);
         pending.set(true);
 
         let approved = rx
@@ -130,5 +145,52 @@ impl ReviewHandler for DioxusReviewHandler {
         approvals_sig.with_mut(std::collections::HashMap::clear);
 
         Ok(approved)
+    }
+
+    async fn review_all(
+        &self,
+        proposals: Vec<ChangeProposal>,
+        bundles: Vec<BundleProposal>,
+    ) -> Result<ReviewOutcome> {
+        if bundles.is_empty() {
+            return Ok(ReviewOutcome {
+                decisions: self.review(proposals).await?,
+                approved_bundles: Vec::new(),
+            });
+        }
+        let mut decisions_sig = self.signals.decisions;
+        decisions_sig.with_mut(std::collections::HashMap::clear);
+        let mut approvals_sig = self.signals.bundle_approvals;
+        approvals_sig.with_mut(std::collections::HashMap::clear);
+        let mut proposals_sig = self.signals.proposals;
+        proposals_sig.set(proposals);
+        let mut bundles_sig = self.signals.bundles;
+        bundles_sig.set(bundles);
+
+        let (tx, rx) = oneshot::channel::<ReviewOutcome>();
+        {
+            let mut guard = self.combined_slot.lock().await;
+            *guard = Some(tx);
+        }
+
+        let mut pending = self.signals.review_pending;
+        let mut phase = self.signals.phase;
+        let mut current = self.signals.progress_current;
+        let mut total = self.signals.progress_total;
+        phase.set(Some(Phase::AwaitingReview));
+        current.set(0);
+        total.set(None);
+        pending.set(true);
+
+        let outcome = rx
+            .await
+            .map_err(|e| anyhow::anyhow!("combined review cancelled: {e}"))?;
+
+        pending.set(false);
+        proposals_sig.set(Vec::new());
+        bundles_sig.set(Vec::new());
+        decisions_sig.with_mut(std::collections::HashMap::clear);
+        approvals_sig.with_mut(std::collections::HashMap::clear);
+        Ok(outcome)
     }
 }

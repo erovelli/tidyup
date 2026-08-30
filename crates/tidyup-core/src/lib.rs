@@ -21,7 +21,7 @@ pub mod frontend;
 pub mod inference;
 pub mod storage;
 
-pub use frontend::{ConfigProvider, ProgressReporter, ReviewHandler};
+pub use frontend::{ConfigProvider, ProgressReporter, ReviewHandler, ReviewOutcome};
 
 /// Result alias used across port traits.
 pub type Result<T> = std::result::Result<T, anyhow::Error>;

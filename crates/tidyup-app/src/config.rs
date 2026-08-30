@@ -26,6 +26,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
+const DEFAULT_MAX_OCR_BYTES: u64 = 20 * 1024 * 1024;
+
 /// Top-level config. Every sub-section has `Default`, and `#[serde(default)]` lets
 /// partial TOML files merge without erroring on missing sections.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -34,8 +36,29 @@ pub struct TidyupConfig {
     pub storage: StorageConfig,
     pub classifier: ClassifierConfig,
     pub inference: InferenceConfig,
+    pub extraction: ExtractionConfig,
     pub rename: RenameConfig,
     pub bundle_detection: BundleDetectionConfig,
+}
+
+/// Resource bounds for local content extraction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExtractionConfig {
+    /// Run Apple's local Vision OCR for plausible screenshot files on supported
+    /// macOS builds. Dimensions and EXIF extraction are unaffected.
+    pub ocr_enabled: bool,
+    /// Maximum screenshot size handed whole to the OCR helper.
+    pub ocr_max_bytes: u64,
+}
+
+impl Default for ExtractionConfig {
+    fn default() -> Self {
+        Self {
+            ocr_enabled: true,
+            ocr_max_bytes: DEFAULT_MAX_OCR_BYTES,
+        }
+    }
 }
 
 /// Where we keep the sqlite DB + shelved backups + downloaded models.
@@ -57,12 +80,14 @@ impl Default for StorageConfig {
     }
 }
 
-/// Classification tier cascade. Default is heuristics + embeddings only — no LLM.
+/// Classification cascade. Semantic embeddings are always the primary path;
+/// the optional LLM is activated separately by the privacy gates below.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ClassifierConfig {
-    /// Ordered list of tier IDs to run. Recognised: `"heuristics"`, `"embeddings"`,
-    /// `"llm"`. The `"llm"` tier requires `--features llm-fallback` at build time
+    /// Legacy ordered tier list retained for config-file compatibility. New
+    /// configs contain only `"embeddings"`; unknown old IDs are ignored.
+    /// The `"llm"` tier requires `--features llm-fallback` at build time
     /// *and* `inference.llm_fallback = true` *and* a per-invocation activation flag.
     pub tiers: Vec<String>,
     /// Fallback auto-classify threshold for the composite score. Used when a tier
@@ -73,7 +98,7 @@ pub struct ClassifierConfig {
 impl Default for ClassifierConfig {
     fn default() -> Self {
         Self {
-            tiers: vec!["heuristics".to_string(), "embeddings".to_string()],
+            tiers: vec!["embeddings".to_string()],
             min_confidence: 0.75,
         }
     }
@@ -88,7 +113,7 @@ pub struct InferenceConfig {
     /// (requires `--features llm-fallback`), `"remote-openai"` / `"remote-anthropic"`
     /// / `"remote-ollama"` (requires `--features remote`).
     pub backends: Vec<String>,
-    /// Allow the Tier-3 LLM fallback to run *if* the crate was compiled with
+    /// Allow the optional LLM reranker to run *if* the crate was compiled with
     /// `--features llm-fallback` and the per-invocation flag is set. Never enabled
     /// by default.
     pub llm_fallback: bool,
@@ -127,7 +152,7 @@ pub struct RemoteBackendConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct EmbeddingConfig {
     /// Hugging Face model id or local path. Default: `bge-small-en-v1.5` — ~35 MB
-    /// Q8 ONNX, pure-Rust via `ort`.
+    /// Q8 ONNX, executed locally through `ort` / ONNX Runtime.
     pub model_id: String,
 }
 
@@ -142,18 +167,27 @@ impl Default for EmbeddingConfig {
 /// Thresholds gating rename proposals.
 ///
 /// Both signals must clear their threshold before a rename is surfaced to review.
-/// Renames never auto-apply, even under `--yes`. Bundle members never receive
-/// rename proposals.
+/// Renames never auto-apply, even under `--yes`. Semantic-collection members
+/// may receive rename proposals, but the entire bundle then requires review.
 ///
 /// Mirrors [`tidyup_domain::migration::RenameConfig`] on the TOML side; the pipeline
 /// materialises the domain type from this when services are wired up.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RenameConfig {
-    /// Lower bound on Tier-2 classification confidence. Default 0.85.
+    /// Lower bound on deterministic semantic-routing evidence. Default 0.85.
     pub min_classification_confidence: f32,
     /// Lower bound on `1.0 - cosine(embed(filename), content_embedding)`. Default 0.60.
     pub min_mismatch_score: f32,
+    /// Lower bound on the fraction of retrieved non-textual concept labels
+    /// absent from the filename. Separate scale from text cosine mismatch.
+    pub min_grounded_mismatch: f32,
+    /// Lower bound on a contrastive model's raw concept score for grounded
+    /// image/audio naming. This is model-scale evidence, not a probability.
+    pub min_grounding_confidence: f32,
+    /// Required separation between the last selected concept and the next
+    /// unselected concept.
+    pub min_grounding_gap: f32,
 }
 
 impl Default for RenameConfig {
@@ -161,6 +195,9 @@ impl Default for RenameConfig {
         Self {
             min_classification_confidence: 0.85,
             min_mismatch_score: 0.60,
+            min_grounded_mismatch: 0.60,
+            min_grounding_confidence: 0.30,
+            min_grounding_gap: 0.02,
         }
     }
 }
@@ -339,6 +376,7 @@ mod tests {
             !cfg.classifier.tiers.iter().any(|t| t == "llm"),
             "default tiers must not include llm"
         );
+        assert_eq!(cfg.classifier.tiers, ["embeddings"]);
         assert!(
             !cfg.inference
                 .backends
@@ -379,10 +417,12 @@ backup_retention_days = 90
         assert_eq!(cfg.storage.backup_retention_days, 90);
         // Unspecified sections should match defaults.
         assert_eq!(cfg.classifier, ClassifierConfig::default());
+        assert_eq!(cfg.extraction, ExtractionConfig::default());
         assert_eq!(cfg.rename, RenameConfig::default());
         assert_eq!(cfg.bundle_detection, BundleDetectionConfig::default());
         assert!((cfg.rename.min_classification_confidence - 0.85).abs() < f32::EPSILON);
         assert!((cfg.rename.min_mismatch_score - 0.60).abs() < f32::EPSILON);
+        assert!((cfg.rename.min_grounded_mismatch - 0.60).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -392,6 +432,18 @@ backup_retention_days = 90
         assert!(s.contains("[rename]"));
         assert!(s.contains("min_classification_confidence = 0.85"));
         assert!(s.contains("min_mismatch_score = 0.6"));
+        assert!(s.contains("min_grounded_mismatch = 0.6"));
+    }
+
+    #[test]
+    fn extraction_section_round_trips_at_bounded_defaults() {
+        let cfg = TidyupConfig::default();
+        let serialised = toml::to_string_pretty(&cfg).unwrap();
+        assert!(serialised.contains("[extraction]"));
+        assert!(serialised.contains("ocr_enabled = true"));
+        assert!(serialised.contains("ocr_max_bytes = 20971520"));
+        let back: TidyupConfig = toml::from_str(&serialised).unwrap();
+        assert_eq!(back.extraction, ExtractionConfig::default());
     }
 
     #[test]

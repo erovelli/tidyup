@@ -26,11 +26,8 @@ use rusqlite::Connection;
 mod backups;
 mod changes;
 mod files;
-pub mod indexer;
 mod runs;
 mod schema;
-
-pub use indexer::index_directory;
 
 /// Default storage backend. Cheaply cloneable — the connection is shared.
 #[derive(Clone, Debug)]
@@ -106,13 +103,13 @@ mod tests {
             let conn = store.conn.lock().unwrap();
             conn.query_row(
                 "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN \
-                 ('files', 'runs', 'bundles', 'change_proposals', 'backups')",
+                 ('files', 'semantic_artifacts', 'runs', 'bundles', 'change_proposals', 'backups')",
                 [],
                 |r| r.get(0),
             )
             .unwrap()
         };
-        assert_eq!(count, 5);
+        assert_eq!(count, 6);
     }
 
     #[test]

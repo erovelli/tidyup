@@ -178,6 +178,17 @@ a { color: inherit; text-decoration: none; }
     align-items: stretch;
 }
 .path-input { flex: 1; min-width: 0; }
+.path-input.input-error {
+    background: color-mix(in srgb, var(--error-container) 22%, var(--surface-container-low));
+    outline: 2px solid var(--error-container);
+}
+.field-error {
+    color: var(--on-error-container);
+    background: var(--error-container);
+    border-radius: var(--radius-sm);
+    padding: 4px 8px;
+    font-size: 12px;
+}
 .path-browse {
     padding: 0 var(--space-md);
     font-size: 13px;

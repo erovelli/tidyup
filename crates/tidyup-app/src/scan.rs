@@ -8,12 +8,12 @@
 //!
 //! 1. Produce proposals via [`tidyup_pipeline::scan::run_scan`].
 //! 2. Persist proposals + bundles to the change log, tagged with a fresh `run_id`.
-//! 3. Review loose proposals via the supplied [`ReviewHandler`].
-//! 4. Apply approved loose proposals via the [`crate::executor`] (shelve → move →
-//!    mark applied).
-//! 5. Decide bundles via [`crate::executor::select_bundle_decisions`]: under
-//!    `--yes`, auto-apply those clearing the confidence threshold; otherwise
-//!    defer to the [`ReviewHandler`]'s interactive per-bundle approve/reject.
+//! 3. Interactive frontends review the complete loose+bundle plan through
+//!    [`ReviewHandler::review_all`]. Under `--yes`, loose move-only proposals
+//!    and eligible opaque structural bundles follow separate restricted
+//!    thresholds; file-set/generic bundles and renames remain pending.
+//! 4. Apply approved changes via the [`crate::executor`] using
+//!    shelve → write-ahead applied mark → move journaling.
 //!    Bundles move atomically or stay pending — never partially.
 
 use std::path::Path;
@@ -21,16 +21,20 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tidyup_core::frontend::Level;
-use tidyup_core::{ProgressReporter, Result, ReviewHandler};
-use tidyup_domain::{RunMode, RunRecord, RunState};
+use tidyup_core::{ProgressReporter, Result, ReviewHandler, ReviewOutcome};
+use tidyup_domain::{
+    CapabilityManifest, FileProcessingRole, FileProcessingStage, RunMode, RunRecord, RunState,
+};
 use tidyup_pipeline::scan::{
     run_scan, AudioContext, ImageContext, MultimodalContext, ScanCandidate,
 };
 use uuid::Uuid;
 
 use crate::executor::{
-    apply_bundles, apply_loose_decisions, select_bundle_decisions, ApplyReport, ExecutorDeps,
+    apply_bundles, apply_loose_decisions, select_bundle_decisions, validate_destination_ledger,
+    ApplyReport, ExecutorDeps, DEFAULT_BUNDLE_MIN_CONFIDENCE,
 };
+use crate::processing::{attach_indexed_identities, record_source_outcomes, report_indexing};
 use crate::ServiceContext;
 
 #[allow(missing_debug_implementations)]
@@ -43,10 +47,11 @@ pub struct ScanRequest {
     pub root: std::path::PathBuf,
     pub taxonomy_path: Option<std::path::PathBuf>,
     pub dry_run: bool,
-    /// When true (the `--yes` path), auto-apply bundles whose confidence clears
-    /// `bundle_min_confidence` without prompting. When false, bundles are
-    /// surfaced to the `ReviewHandler` for interactive per-bundle approval. Set
-    /// by the CLI only if `--yes` is passed.
+    /// When true (the `--yes` path), auto-apply eligible opaque structural
+    /// bundles whose confidence clears `bundle_min_confidence` without
+    /// prompting. Soft/file-set and generic bundles remain review-only. When
+    /// false, bundles are surfaced to the `ReviewHandler` for interactive
+    /// per-bundle approval. Set by the CLI only if `--yes` is passed.
     #[serde(default)]
     pub auto_approve_bundles: bool,
     /// Lower bound on confidence for auto-applied bundles.
@@ -55,17 +60,28 @@ pub struct ScanRequest {
 }
 
 const fn default_bundle_confidence() -> f32 {
-    0.85
+    DEFAULT_BUNDLE_MIN_CONFIDENCE
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanReport {
+    /// Readable files whose stable identity was persisted for this run.
+    pub indexed: usize,
+    /// Paths discovered but not readable/hashable during identity indexing.
+    pub indexing_failed: usize,
     /// Loose (non-bundle) proposals produced.
     pub proposed: usize,
     /// Bundles produced.
     pub bundles: usize,
     /// Files the cascade couldn't classify.
     pub unclassified: usize,
+    /// Files already at the destination the classifier chose. Successfully
+    /// classified, no operation proposed — scan sorts in place.
+    pub already_in_place: usize,
+    /// Images the per-directory clustering work cap excluded from
+    /// visual-collection discovery. They are still classified individually;
+    /// what they lost was the chance to be grouped.
+    pub visual_candidates_over_cap: usize,
     /// Loose proposals the user approved in review.
     pub approved: usize,
     /// Loose proposals successfully moved (post-review + shelve).
@@ -81,6 +97,8 @@ pub struct ScanReport {
     /// Bundle moves that failed.
     pub bundles_failed: usize,
     pub run_id: Uuid,
+    /// Semantic/extraction facilities actually available to this run.
+    pub capabilities: CapabilityManifest,
 }
 
 impl ScanService {
@@ -100,7 +118,7 @@ impl ScanService {
     /// `image_candidates` / `audio_candidates` are the per-modality scan
     /// taxonomies, embedded in the modality-specific space (`SigLIP` / `CLAP`).
     /// Pass `&[]` when the modality backend isn't loaded — the routing
-    /// short-circuits and the file falls through to the text Tier 2 path.
+    /// short-circuits and the file falls through to the general text path.
     ///
     /// # Errors
     /// Propagates pipeline, storage, review, and apply errors.
@@ -113,7 +131,8 @@ impl ScanService {
         progress: &dyn ProgressReporter,
         review: &dyn ReviewHandler,
     ) -> Result<ScanReport> {
-        let run = RunRecord::begin(RunMode::Scan, request.root.clone(), None);
+        let run = RunRecord::begin(RunMode::Scan, request.root.clone(), None)
+            .with_capabilities(self.ctx.capabilities.clone());
         let run_id = run.id;
         self.ctx.run_log.record_run(&run).await?;
 
@@ -136,8 +155,18 @@ impl ScanService {
                     .finish_run(run_id, RunState::Completed)
                     .await?;
             }
-            Err(_) => {
+            Err(error) => {
                 // Best-effort: record terminal state but don't mask original error.
+                let _ = self
+                    .ctx
+                    .file_index
+                    .fail_incomplete_processing(
+                        run_id,
+                        FileProcessingRole::Source,
+                        FileProcessingStage::Planning,
+                        &format!("run failed before a terminal file outcome: {error}"),
+                    )
+                    .await;
                 let _ = self.ctx.run_log.finish_run(run_id, RunState::Failed).await;
             }
         }
@@ -158,6 +187,55 @@ impl ScanService {
     ) -> Result<ScanReport> {
         let output_root = request.root.clone();
 
+        progress
+            .message(
+                Level::Info,
+                &format!("capabilities: {}", self.ctx.capabilities.summary()),
+            )
+            .await;
+
+        // Identity indexing is deliberately completed before semantic work so
+        // the persistent index remains the source of truth even when a later
+        // extractor, model, or router fails. The pipeline does not depend on
+        // SQLite; it writes through the FileIndex port.
+        let indexed = tidyup_pipeline::indexing::index_directory(
+            &request.root,
+            self.ctx.file_index.as_ref(),
+            run_id,
+            FileProcessingRole::Source,
+        )
+        .await?;
+        report_indexing(&indexed, progress).await;
+        progress
+            .message(
+                Level::Info,
+                &format!(
+                    "indexed {} file(s); {} indexing failure(s)",
+                    indexed.indexed.len(),
+                    indexed.failed
+                ),
+            )
+            .await;
+
+        let image_concepts = if let Some(backend) = self.ctx.image_embeddings.as_deref() {
+            match tidyup_pipeline::semantic::prepare_visual_concepts(backend).await {
+                Ok(concepts) => concepts,
+                Err(error) => {
+                    progress
+                        .message(
+                            Level::Warn,
+                            &format!(
+                                "visual concept preparation failed; semantic image renames disabled: {error}"
+                            ),
+                        )
+                        .await;
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
         let multimodal = MultimodalContext {
             image: self
                 .ctx
@@ -167,6 +245,7 @@ impl ScanService {
                 .map(|backend| ImageContext {
                     backend: backend.as_ref(),
                     candidates: image_candidates,
+                    concepts: &image_concepts,
                 }),
             audio: self
                 .ctx
@@ -177,14 +256,19 @@ impl ScanService {
                     backend: backend.as_ref(),
                     candidates: audio_candidates,
                 }),
+            artifact_store: Some(self.ctx.file_index.as_ref()),
         };
 
         let text_backend = self.ctx.text.as_deref();
-        // The classifier config (rename thresholds + Tier-3 activation) is
+        // The classifier config (rename thresholds + optional reranker) is
         // materialised from the loaded TidyupConfig at context-build time; see
         // `classifier_config_for`.
-        let outcome = run_scan(
+        // Reuse the identities indexing just streamed: the proposal keeps the
+        // FileId and the BLAKE3 already computed instead of re-hashing.
+        let identities = tidyup_pipeline::indexing::SourceIdentities::new(&indexed.indexed);
+        let mut outcome = run_scan(
             &request.root,
+            &identities,
             &output_root,
             candidates,
             self.ctx.embeddings.as_ref(),
@@ -196,24 +280,53 @@ impl ScanService {
         )
         .await?;
 
+        attach_indexed_identities(
+            &indexed.indexed,
+            &mut outcome.proposals,
+            &mut outcome.bundles,
+        );
+        record_source_outcomes(
+            self.ctx.file_index.as_ref(),
+            run_id,
+            &indexed.indexed,
+            &outcome.proposals,
+            &outcome.bundles,
+            &outcome.unclassified,
+            &outcome.already_in_place,
+        )
+        .await?;
+
         for proposal in &outcome.proposals {
             self.ctx
                 .change_log
                 .record_proposal(proposal, Some(run_id))
                 .await?;
         }
-        for bundle in &outcome.bundles {
-            self.ctx
-                .change_log
-                .record_bundle(bundle, Some(run_id))
-                .await?;
-        }
 
-        let decisions = if outcome.proposals.is_empty() {
-            Vec::new()
+        let review_outcome = if request.auto_approve_bundles {
+            let decisions = if outcome.proposals.is_empty() {
+                Vec::new()
+            } else {
+                review.review(outcome.proposals.clone()).await?
+            };
+            let approved_bundles = select_bundle_decisions(
+                &outcome.bundles,
+                true,
+                request.bundle_min_confidence,
+                review,
+            )
+            .await?;
+            ReviewOutcome {
+                decisions,
+                approved_bundles,
+            }
         } else {
-            review.review(outcome.proposals.clone()).await?
+            review
+                .review_all(outcome.proposals.clone(), outcome.bundles.clone())
+                .await?
         };
+        let decisions = review_outcome.decisions;
+        let approved_bundles = review_outcome.approved_bundles;
         let approved = decisions
             .iter()
             .filter(|d| {
@@ -231,20 +344,15 @@ impl ScanService {
             progress,
         };
 
+        validate_destination_ledger(&outcome.proposals, &decisions, &approved_bundles)?;
+
         let loose_report: ApplyReport = if decisions.is_empty() {
             ApplyReport::default()
         } else {
             apply_loose_decisions(&outcome.proposals, &decisions, &deps, request.dry_run).await?
         };
 
-        let auto_apply_ids = select_bundle_decisions(
-            &outcome.bundles,
-            request.auto_approve_bundles,
-            request.bundle_min_confidence,
-            review,
-        )
-        .await?;
-        if !outcome.bundles.is_empty() && auto_apply_ids.is_empty() {
+        if !outcome.bundles.is_empty() && approved_bundles.is_empty() {
             let held = outcome.bundles.len();
             let detail = if request.auto_approve_bundles {
                 format!(
@@ -258,13 +366,27 @@ impl ScanService {
                 .message(Level::Info, &format!("{held} bundle(s) held; {detail}"))
                 .await;
         }
+        for original in &outcome.bundles {
+            let reviewed = approved_bundles
+                .iter()
+                .find(|bundle| bundle.id == original.id)
+                .unwrap_or(original);
+            self.ctx
+                .change_log
+                .record_bundle(reviewed, Some(run_id))
+                .await?;
+        }
         let bundle_report =
-            apply_bundles(&outcome.bundles, &auto_apply_ids, &deps, request.dry_run).await?;
+            apply_bundles(&outcome.bundles, &approved_bundles, &deps, request.dry_run).await?;
 
         Ok(ScanReport {
+            indexed: indexed.indexed.len(),
+            indexing_failed: indexed.failed,
             proposed: outcome.proposals.len(),
             bundles: outcome.bundles.len(),
             unclassified: outcome.unclassified.len(),
+            already_in_place: outcome.already_in_place.len(),
+            visual_candidates_over_cap: outcome.visual_candidates_over_cap,
             approved,
             applied: loose_report.applied,
             skipped: loose_report.skipped,
@@ -273,6 +395,7 @@ impl ScanService {
             bundles_skipped: bundle_report.bundles_skipped,
             bundles_failed: bundle_report.bundles_failed,
             run_id,
+            capabilities: self.ctx.capabilities.clone(),
         })
     }
 

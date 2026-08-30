@@ -21,7 +21,7 @@
 //! builds a fresh one inside a tokio task, matching the CLI's one-shot
 //! construction pattern.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -32,6 +32,7 @@ use tidyup_app::{
     migration::MigrationRequest, scan::ScanRequest, MigrationService, RollbackService, ScanService,
 };
 use tidyup_core::frontend::Level;
+use tidyup_core::ReviewOutcome;
 use tidyup_domain::{
     BundleProposal, ChangeProposal, ChangeType, ReviewDecision, RunRecord, RunState,
 };
@@ -172,12 +173,11 @@ pub(crate) fn Review() -> Element {
     let hovered = use_signal(|| Option::<Uuid>::None);
     let selected = use_signal(|| Option::<Uuid>::None);
 
-    // Atomic bundle-review pass. The service reviews loose proposals first
-    // (clearing `proposals` when done), then bundles — so `bundles` is non-empty
-    // only during the bundle phase. Route to a dedicated approve/reject surface.
+    // The desktop reviews the complete plan in one pass so semantic collections
+    // are never hidden behind an earlier loose-file review step.
     if !bundles.is_empty() {
         return rsx! {
-            BundleReview { state: state.clone() }
+            CombinedReview { state: state.clone() }
         };
     }
 
@@ -207,6 +207,7 @@ pub(crate) fn Review() -> Element {
     let folder_count = count_folders(&model.left_rows);
 
     let filtered: Vec<ChangeProposal> = filter_proposals(&proposals, *filter.read());
+    let indexed_count = usize::try_from(*signals.indexed_count.read()).unwrap_or(usize::MAX);
 
     rsx! {
         div {
@@ -214,7 +215,7 @@ pub(crate) fn Review() -> Element {
             PhaseBanner { signals }
 
             SummaryCards {
-                indexed: proposals.len(),
+                indexed: indexed_count,
                 pending: if pending { proposals.len() } else { 0 },
                 applied: applied_count,
             }
@@ -227,7 +228,7 @@ pub(crate) fn Review() -> Element {
                 state: state.clone(),
             }
 
-            DiffView { model, hovered, selected, signals }
+            DiffView { model, hovered, selected, signals, locked_ids: Vec::new() }
 
             DiffLegend {}
 
@@ -306,6 +307,7 @@ struct RightEntry {
     proposal_id: Uuid,
     display_name: String,
     confidence: f32,
+    rename: bool,
 }
 
 fn build_diff_model(proposals: &[ChangeProposal]) -> DiffModel {
@@ -318,7 +320,32 @@ fn build_diff_model(proposals: &[ChangeProposal]) -> DiffModel {
                 .unwrap_or_default()
         })
         .collect();
-    let root = common_ancestor(&parents);
+    let original_parents: Vec<PathBuf> = proposals
+        .iter()
+        .filter_map(|proposal| proposal.original_path.parent().map(Path::to_path_buf))
+        .collect();
+    let source_root = common_ancestor(&original_parents);
+    let proposed_root = common_ancestor(&parents);
+    // Scan mode reorganizes in place, so the common source root is the most
+    // useful anchor: it keeps the complete destination (`Work/Career`) visible.
+    // Migration can target an unrelated hierarchy; in that case retain the
+    // proposed common ancestor, backing up one level when every item lands in
+    // exactly the same directory so the destination never disappears.
+    let root = if !source_root.as_os_str().is_empty()
+        && parents
+            .iter()
+            .all(|parent| parent.starts_with(&source_root))
+    {
+        source_root
+    } else if !proposed_root.as_os_str().is_empty()
+        && parents.iter().all(|parent| parent == &proposed_root)
+    {
+        proposed_root
+            .parent()
+            .map_or_else(|| proposed_root.clone(), Path::to_path_buf)
+    } else {
+        proposed_root
+    };
     let root_label = root
         .file_name()
         .and_then(|s| s.to_str())
@@ -361,6 +388,10 @@ fn build_diff_model(proposals: &[ChangeProposal]) -> DiffModel {
                     ToString::to_string,
                 ),
             confidence: p.confidence,
+            rename: matches!(
+                p.change_type,
+                ChangeType::Rename | ChangeType::RenameAndMove
+            ),
         })
         .collect();
     right_entries.sort_by_key(|e| {
@@ -611,6 +642,31 @@ fn execute_with_threshold(state: &SharedState, threshold_pct: u32) {
     submit_review(state);
 }
 
+fn execute_combined_with_threshold(state: &SharedState, threshold_pct: u32) {
+    let signals = state.signals;
+    let proposals = signals.proposals.read().clone();
+    let threshold = f32::from(u16::try_from(threshold_pct).unwrap_or(100)) / 100.0;
+    let mut decisions = signals.decisions;
+    decisions.with_mut(|map| {
+        for proposal in &proposals {
+            if map.contains_key(&proposal.id) {
+                continue;
+            }
+            let is_rename = matches!(
+                proposal.change_type,
+                ChangeType::Rename | ChangeType::RenameAndMove
+            );
+            let decision = if !is_rename && proposal.confidence >= threshold {
+                ReviewDecision::Approve(proposal.id)
+            } else {
+                ReviewDecision::Reject(proposal.id)
+            };
+            map.insert(proposal.id, decision);
+        }
+    });
+    submit_combined_review(state);
+}
+
 /// Pre-computed render data for a single connector between the two columns.
 #[derive(Clone, PartialEq, Eq)]
 struct ConnectorRender {
@@ -655,7 +711,9 @@ fn DiffView(
     hovered: Signal<Option<Uuid>>,
     selected: Signal<Option<Uuid>>,
     signals: SignalBundle,
+    locked_ids: Vec<Uuid>,
 ) -> Element {
+    let locked_ids: HashSet<Uuid> = locked_ids.into_iter().collect();
     let left_height = rows_to_height(model.left_rows.len());
     let right_height = rows_to_height(model.right_entries.len());
     let svg_height = left_height.max(right_height);
@@ -673,7 +731,7 @@ fn DiffView(
                 id: entry.proposal_id,
                 d,
                 strong: entry.confidence >= 0.80,
-                dashed: false,
+                dashed: entry.rename,
             })
         })
         .collect();
@@ -737,6 +795,7 @@ fn DiffView(
                     for entry in model.right_entries.iter().cloned() {
                         CurrentRow {
                             key: "{entry.proposal_id}",
+                            locked: locked_ids.contains(&entry.proposal_id),
                             entry,
                             hovered,
                             selected,
@@ -929,6 +988,7 @@ fn CurrentRow(
     hovered: Signal<Option<Uuid>>,
     selected: Signal<Option<Uuid>>,
     signals: SignalBundle,
+    locked: bool,
 ) -> Element {
     let hovered_id = *hovered.read();
     let selected_id = *selected.read();
@@ -990,7 +1050,7 @@ fn CurrentRow(
             onmouseleave: on_leave,
             onclick: on_click,
             span { class: "current-name", "{entry.display_name}" }
-            if is_selected {
+            if is_selected && !locked {
                 span {
                     class: "current-actions",
                     button {
@@ -1006,6 +1066,9 @@ fn CurrentRow(
                         "Reject"
                     }
                 }
+            }
+            if is_selected && locked {
+                span { class: "chip chip-neutral", "approve with collection" }
             }
         }
     }
@@ -1186,43 +1249,86 @@ fn ProposalCard(proposal: ChangeProposal, signals: SignalBundle) -> Element {
     }
 }
 
-/// Atomic bundle-review surface. Shown when the service is awaiting per-bundle
-/// approve/reject decisions (the second review pass, after loose proposals).
+/// Unified review surface for individual changes and atomic bundles.
 #[component]
-fn BundleReview(state: SharedState) -> Element {
+fn CombinedReview(state: SharedState) -> Element {
     let signals = state.signals;
+    let proposals = signals.proposals.read().clone();
     let bundles = signals.bundles.read().clone();
     let approvals = signals.bundle_approvals.read().clone();
-    let total = bundles.len();
+    let threshold = use_signal(|| 75_u32);
+    let threshold_val = *threshold.read();
+    let loose_count = proposals.len();
+    let collection_count = bundles.len();
+    let collection_files = bundles
+        .iter()
+        .map(|bundle| bundle.members.len())
+        .sum::<usize>();
+    let total_files = loose_count.saturating_add(collection_files);
+    let indexed_count = usize::try_from(*signals.indexed_count.read()).unwrap_or(usize::MAX);
     let approved_n = approvals.values().filter(|v| **v).count();
+    let mut plan_changes = proposals.clone();
+    let locked_ids: Vec<Uuid> = bundles
+        .iter()
+        .flat_map(|bundle| bundle.members.iter().map(|member| member.id))
+        .collect();
+    plan_changes.extend(
+        bundles
+            .iter()
+            .flat_map(|bundle| bundle.members.iter().cloned()),
+    );
+    let model = build_diff_model(&plan_changes);
+    let hovered = use_signal(|| Option::<Uuid>::None);
+    let selected = use_signal(|| Option::<Uuid>::None);
 
     let on_apply = {
         let state = state.clone();
-        move |_| submit_bundle_review(&state)
+        move |_| execute_combined_with_threshold(&state, threshold_val)
     };
     let on_reject_all = {
         let state = state.clone();
-        move |_| reject_all_bundles_and_submit(&state)
+        move |_| reject_all_combined_and_submit(&state)
+    };
+    let on_threshold = move |event: Event<FormData>| {
+        let mut value = threshold;
+        if let Ok(number) = event.value().parse::<u32>() {
+            value.set(number.min(100));
+        }
     };
 
     rsx! {
         div {
-            h1 { class: "page-title", "Review — Bundles" }
+            h1 { class: "page-title", "Review" }
             PhaseBanner { signals }
+            SummaryCards { indexed: indexed_count, pending: total_files, applied: 0 }
             div {
                 class: "card",
-                h2 { class: "card-title", "{total} bundle(s) to review" }
+                h2 { class: "card-title", "Complete organization plan" }
                 p {
                     class: "card-subtitle muted",
-                    "Bundles move as atomic units — the whole group relocates or nothing does. Approve or reject each; anything left undecided is held (not moved)."
+                    "{loose_count} individual change(s) and {collection_count} semantic collection(s), covering {total_files} files. Collections move atomically and require explicit approval; anything undecided is held."
                 }
                 div {
                     class: "button-row",
                     style: "margin-top: 12px;",
+                    div {
+                        class: "threshold-input",
+                        span { class: "threshold-label", "Approve individual moves ≥" }
+                        input {
+                            r#type: "number",
+                            min: "0",
+                            max: "100",
+                            step: "1",
+                            value: "{threshold_val}",
+                            oninput: on_threshold,
+                            class: "threshold-number",
+                        }
+                        span { class: "threshold-unit", "%" }
+                    }
                     button {
                         class: "button button-primary",
                         onclick: on_apply,
-                        "Apply ({approved_n}/{total} approved)"
+                        "Execute ({approved_n}/{collection_count} collections approved)"
                     }
                     button {
                         class: "button button-secondary",
@@ -1231,11 +1337,25 @@ fn BundleReview(state: SharedState) -> Element {
                     }
                 }
             }
+            div { class: "section-heading", style: "margin-top: 24px;", "PLAN OVERVIEW" }
+            DiffView { model, hovered, selected, signals, locked_ids }
+            DiffLegend {}
+            div { class: "section-heading", style: "margin-top: 24px;", "SEMANTIC COLLECTIONS" }
             div {
                 class: "card-stack",
                 style: "margin-top: 16px;",
                 for b in bundles.iter().cloned() {
                     BundleReviewCard { key: "{b.id}", bundle: b, signals }
+                }
+            }
+            if !proposals.is_empty() {
+                div { class: "section-heading", style: "margin-top: 24px;", "INDIVIDUAL CHANGES" }
+                div {
+                    class: "card-stack",
+                    style: "margin-top: 16px;",
+                    for proposal in proposals.iter().cloned() {
+                        ProposalCard { key: "{proposal.id}", proposal, signals }
+                    }
                 }
             }
         }
@@ -1249,8 +1369,22 @@ fn BundleReviewCard(bundle: BundleProposal, signals: SignalBundle) -> Element {
     let decision = approvals.read().get(&bundle.id).copied();
 
     let root = bundle.root.display().to_string();
-    let target = bundle.target_parent.display().to_string();
+    let target_parents: Vec<PathBuf> = bundle
+        .members
+        .iter()
+        .filter_map(|member| member.proposed_path.parent().map(Path::to_path_buf))
+        .collect();
+    let target = common_ancestor(&target_parents).display().to_string();
     let kind = bundle.kind.as_str();
+    let title = match &bundle.kind {
+        tidyup_domain::BundleKind::SemanticCollection { label } => label.clone(),
+        _ => bundle
+            .root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("Bundle")
+            .to_string(),
+    };
     let chip = confidence_chip(bundle.confidence);
     let member_count = bundle.members.len();
 
@@ -1290,9 +1424,23 @@ fn BundleReviewCard(bundle: BundleProposal, signals: SignalBundle) -> Element {
             class: "{card_class}",
             div {
                 class: "proposal-meta",
-                div { class: "proposal-target", "{root}" }
-                div { class: "proposal-path", "{member_count} member(s) → {target}/" }
+                div { class: "proposal-target", "{title}" }
+                div { class: "proposal-path", "{root} → {target}/ ({member_count} files)" }
                 div { class: "proposal-reason", "{bundle.reasoning}" }
+                if bundle.kind.allows_member_renames() {
+                    div {
+                        class: "semantic-members",
+                        style: "margin-top: 12px; display: grid; gap: 8px;",
+                        for member in bundle.members.iter().cloned() {
+                            SemanticMemberEditor {
+                                key: "{member.id}",
+                                bundle_id,
+                                member,
+                                signals,
+                            }
+                        }
+                    }
+                }
                 div {
                     class: "button-row small",
                     style: "margin-top: 6px;",
@@ -1307,6 +1455,122 @@ fn BundleReviewCard(bundle: BundleProposal, signals: SignalBundle) -> Element {
             }
         }
     }
+}
+
+#[component]
+fn SemanticMemberEditor(bundle_id: Uuid, member: ChangeProposal, signals: SignalBundle) -> Element {
+    let mut validation_error = use_signal(|| None::<String>);
+    let member_id = member.id;
+    let original = member
+        .original_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let proposed = member.proposed_name.clone();
+    let on_input = move |event: Event<FormData>| {
+        validation_error.set(
+            update_semantic_member_name(signals, bundle_id, member_id, &event.value())
+                .err()
+                .map(str::to_string),
+        );
+    };
+    let validation_message = validation_error.read().clone();
+    let invalid = validation_message.is_some();
+    let input_class = if invalid {
+        "path-input input-error"
+    } else {
+        "path-input"
+    };
+    rsx! {
+        label {
+            class: "small muted",
+            style: "display: grid; grid-template-columns: minmax(180px, 1fr) 18px minmax(220px, 1fr); align-items: center; gap: 8px;",
+            span { title: "{original}", "{original}" }
+            span { "→" }
+            input {
+                r#type: "text",
+                class: "{input_class}",
+                value: "{proposed}",
+                oninput: on_input,
+                aria_label: "Proposed filename for {original}",
+                aria_invalid: invalid,
+            }
+            if let Some(ref message) = validation_message {
+                span {
+                    class: "field-error",
+                    style: "grid-column: 3;",
+                    "{message}"
+                }
+            }
+        }
+    }
+}
+
+fn update_semantic_member_name(
+    signals: SignalBundle,
+    bundle_id: Uuid,
+    member_id: Uuid,
+    raw_name: &str,
+) -> Result<(), &'static str> {
+    let bundles = signals.bundles;
+    let items = bundles.read();
+    let name = {
+        let bundle = items
+            .iter()
+            .find(|bundle| bundle.id == bundle_id)
+            .ok_or("This collection is no longer available.")?;
+        validate_semantic_member_name(bundle, member_id, raw_name)?
+    };
+    drop(items);
+    let mut bundles = bundles;
+    bundles.with_mut(|items| {
+        let Some(bundle) = items.iter_mut().find(|bundle| bundle.id == bundle_id) else {
+            return;
+        };
+        let Some(member) = bundle
+            .members
+            .iter_mut()
+            .find(|member| member.id == member_id)
+        else {
+            return;
+        };
+        member.proposed_name.clone_from(&name);
+        member.proposed_path.set_file_name(&name);
+        let original_name = member
+            .original_path
+            .file_name()
+            .and_then(|original| original.to_str())
+            .unwrap_or_default();
+        member.change_type = if original_name == name {
+            ChangeType::Move
+        } else {
+            ChangeType::RenameAndMove
+        };
+    });
+    Ok(())
+}
+
+fn validate_semantic_member_name(
+    bundle: &BundleProposal,
+    member_id: Uuid,
+    raw_name: &str,
+) -> Result<String, &'static str> {
+    let name = Path::new(raw_name)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToString::to_string)
+        .ok_or("Filename cannot be empty.")?;
+    if bundle
+        .members
+        .iter()
+        .any(|member| member.id != member_id && member.proposed_name.eq_ignore_ascii_case(&name))
+    {
+        return Err("Another file in this collection already uses that name.");
+    }
+    Ok(name)
 }
 
 // ---------------------------------------------------------------------------
@@ -1380,6 +1644,7 @@ fn RunRow(run: RunRecord, busy: Busy) -> Element {
         .as_ref()
         .map_or_else(String::new, |p| p.display().to_string());
     let can_rollback = matches!(run.state, RunState::Completed) && busy == Busy::Idle;
+    let capability_summary = run.capabilities.summary();
     let run_id = run.id;
 
     let rollback_state = state.clone();
@@ -1395,6 +1660,9 @@ fn RunRow(run: RunRecord, busy: Busy) -> Element {
                 "{source}"
                 if !target.is_empty() {
                     span { " → {target}" }
+                }
+                if !capability_summary.is_empty() {
+                    span { class: "small muted", "{capability_summary}" }
                 }
             }
             button {
@@ -1427,7 +1695,7 @@ pub(crate) fn Settings() -> Element {
             let toml_text =
                 toml::to_string_pretty(&cfg).unwrap_or_else(|e| format!("<error: {e}>"));
 
-            // Tier 3 (LLM fallback) — the three privacy gates, surfaced.
+            // Optional LLM reranker — the three privacy gates, surfaced.
             let llm_active = state.signals.llm_fallback_active;
             let feature_compiled = cfg!(feature = "llm-fallback");
             let config_enabled = cfg.inference.llm_fallback;
@@ -1444,13 +1712,13 @@ pub(crate) fn Settings() -> Element {
                 "Enable for this session"
             };
             let tier3_status = if !feature_compiled {
-                "This desktop build was compiled without the `llm-fallback` feature, so Tier 3 is unavailable. Rebuild with `--features llm-fallback` to enable it.".to_string()
+                "This desktop build was compiled without the `llm-fallback` feature, so the optional reranker is unavailable. Rebuild with `--features llm-fallback` to enable it.".to_string()
             } else if !config_enabled {
-                "Set `[inference] llm_fallback = true` in the config file to allow Tier 3. It stays off until you do.".to_string()
+                "Set `[inference] llm_fallback = true` in the config file to allow optional LLM reranking. It stays off until you do.".to_string()
             } else if is_active {
-                "Tier 3 LLM fallback is active for this session. Ambiguous files may be classified on-device by the local LLM.".to_string()
+                "The optional LLM reranker is active for this session. Ambiguous embedding results may be reranked on-device.".to_string()
             } else {
-                "Tier 3 is available. Enable it for this session to let the local LLM resolve low-confidence classifications.".to_string()
+                "The optional LLM reranker is available. Enable it for this session to refine low-confidence classifications.".to_string()
             };
 
             rsx! {
@@ -1475,7 +1743,7 @@ pub(crate) fn Settings() -> Element {
 
                     div {
                         class: "card",
-                        h2 { class: "card-title", "Tier 3 — LLM fallback" }
+                        h2 { class: "card-title", "Optional LLM reranker" }
                         p {
                             class: "small muted",
                             style: "margin: 0 0 12px;",
@@ -1538,7 +1806,7 @@ fn PathField(label: &'static str, value: Signal<String>, placeholder: &'static s
     let on_browse = move |_| {
         let mut v = value;
         let start = starting_dir.clone();
-        spawn_forever(async move {
+        spawn(async move {
             let mut dialog = rfd::AsyncFileDialog::new().set_title("Choose a directory");
             let start_path = std::path::PathBuf::from(&start);
             if start_path.is_dir() {
@@ -1717,24 +1985,35 @@ fn LastReportCard(signals: SignalBundle) -> Element {
             ReportSummary {
                 title: "Scan complete",
                 run_id: r.run_id,
+                indexed: r.indexed,
+                indexing_failed: r.indexing_failed,
+                capabilities: r.capabilities.summary(),
                 proposed: r.proposed,
                 applied: r.applied,
                 bundles: r.bundles,
                 bundles_applied: r.bundles_applied,
                 skipped: r.skipped,
                 failed: r.failed,
+                already_in_place: r.already_in_place,
+                visual_candidates_over_cap: r.visual_candidates_over_cap,
             }
         },
         LastReport::Migration(r) => rsx! {
             ReportSummary {
                 title: "Migration complete",
                 run_id: r.run_id,
+                indexed: r.source_indexed + r.target_indexed,
+                indexing_failed: r.indexing_failed,
+                capabilities: r.capabilities.summary(),
                 proposed: r.proposed,
                 applied: r.applied,
                 bundles: r.bundles,
                 bundles_applied: r.bundles_applied,
                 skipped: r.skipped,
                 failed: r.failed,
+                // Migration always moves out of the source tree.
+                already_in_place: 0,
+                visual_candidates_over_cap: r.visual_candidates_over_cap,
             }
         },
         LastReport::Rollback(r) => rsx! {
@@ -1774,28 +2053,53 @@ fn LastReportCard(signals: SignalBundle) -> Element {
 fn ReportSummary(
     title: &'static str,
     run_id: Uuid,
+    indexed: usize,
+    indexing_failed: usize,
+    capabilities: String,
     proposed: usize,
     applied: usize,
     bundles: usize,
     bundles_applied: usize,
     skipped: usize,
     failed: usize,
+    /// Scan only: classified, but already where it belongs.
+    already_in_place: usize,
+    /// Images the per-directory clustering cap excluded from collection
+    /// discovery. Surfaced because they are otherwise indistinguishable from
+    /// images the run simply found nothing to group with.
+    visual_candidates_over_cap: usize,
 ) -> Element {
     rsx! {
         div {
             class: "card",
             h2 { class: "card-title", "{title}" }
             div { class: "small muted", "Run {run_id}" }
+            div { class: "small muted", "{capabilities}" }
             div {
                 class: "button-row",
                 style: "margin-top: 8px;",
                 span { class: "chip chip-neutral", "{proposed} proposed" }
+                span { class: "chip chip-neutral", "{indexed} indexed" }
+                if indexing_failed > 0 {
+                    span { class: "chip chip-low", "{indexing_failed} indexing failure(s)" }
+                }
                 span { class: "chip chip-high",    "{applied} applied" }
                 if skipped > 0 { span { class: "chip chip-medium", "{skipped} skipped" } }
                 if failed  > 0 { span { class: "chip chip-low",    "{failed} failed" } }
                 if bundles > 0 {
                     span { class: "chip chip-neutral", "{bundles} bundle(s)" }
                     span { class: "chip chip-high",    "{bundles_applied} bundle(s) applied" }
+                }
+                if already_in_place > 0 {
+                    span { class: "chip chip-neutral", "{already_in_place} already in place" }
+                }
+            }
+            if visual_candidates_over_cap > 0 {
+                p {
+                    class: "small muted",
+                    "{visual_candidates_over_cap} image(s) exceeded the per-directory clustering \
+                     limit and were classified individually. They were never compared for \
+                     collection grouping, so a large folder may group some images and not others."
                 }
             }
         }
@@ -1806,7 +2110,7 @@ fn ReportSummary(
 // Async actions. Each spawns a task that drives a service to completion.
 // ---------------------------------------------------------------------------
 
-/// Read the current Tier 3 (LLM fallback) activation from the session toggle.
+/// Read optional LLM-reranker activation from the session toggle.
 /// The Settings surface only lets the toggle reach `true` when the cargo feature
 /// and the config gate are both satisfied, so this read is the third privacy
 /// gate. Read in component scope (not inside the spawned task) to keep the
@@ -1821,10 +2125,16 @@ fn launch_scan(state: &SharedState, source: PathBuf) {
     let signals = state.signals;
     let slot = state.review_slot.clone();
     let bundle_slot = state.bundle_review_slot.clone();
+    let combined_slot = state.combined_review_slot.clone();
     let activation = current_activation(signals);
 
     reset_run_state(signals);
     set_busy(signals, Busy::Scanning);
+    // Config and model loading happen below, before any service call and so
+    // before any phase event. Without this the banner renders nothing at all
+    // for the whole model load and the window looks inert right after the
+    // click that started the run.
+    set_phase(signals, tidyup_domain::Phase::Preparing);
 
     // `spawn_forever` (vs `spawn`): the reviewer flips `review_pending` mid-run,
     // which routes the app to `/review` and unmounts the calling page. A
@@ -1840,7 +2150,7 @@ fn launch_scan(state: &SharedState, source: PathBuf) {
             let audio_candidates =
                 build_audio_scan_candidates(ctx.audio_embeddings.as_deref()).await?;
             let reporter = DioxusReporter::new(signals);
-            let reviewer = DioxusReviewHandler::new(signals, slot, bundle_slot);
+            let reviewer = DioxusReviewHandler::new(signals, slot, bundle_slot, combined_slot);
 
             let service = ScanService::new(Arc::clone(&ctx));
             let report = service
@@ -1884,17 +2194,19 @@ fn launch_migrate(state: &SharedState, source: PathBuf, target: PathBuf) {
     let signals = state.signals;
     let slot = state.review_slot.clone();
     let bundle_slot = state.bundle_review_slot.clone();
+    let combined_slot = state.combined_review_slot.clone();
     let activation = current_activation(signals);
 
     reset_run_state(signals);
     set_busy(signals, Busy::Migrating);
+    set_phase(signals, tidyup_domain::Phase::Preparing);
 
     spawn_forever(async move {
         let result = async {
             let cfg = config::load()?;
             let ctx = build(&cfg, true, activation).await?;
             let reporter = DioxusReporter::new(signals);
-            let reviewer = DioxusReviewHandler::new(signals, slot, bundle_slot);
+            let reviewer = DioxusReviewHandler::new(signals, slot, bundle_slot, combined_slot);
 
             let service = MigrationService::new(Arc::clone(&ctx));
             let report = service
@@ -1940,7 +2252,7 @@ fn launch_rollback(state: &SharedState, run_id: Uuid) {
     spawn_forever(async move {
         let result = async {
             let cfg = config::load()?;
-            // Rollback never classifies — no Tier 3 needed.
+            // Rollback never classifies, so no optional reranker is needed.
             let ctx = build(&cfg, false, InferenceActivation::default()).await?;
             let reporter = DioxusReporter::new(signals);
             let service = RollbackService::new(Arc::clone(&ctx));
@@ -2000,46 +2312,63 @@ fn reject_all_and_submit(state: &SharedState) {
     submit_review(state);
 }
 
-/// Send the approved bundle ids to the parked `review_bundles` oneshot. Only
-/// bundles explicitly toggled to approve are sent — undecided and rejected
-/// bundles are held, the safe default (mirrors `submit_review`).
-fn submit_bundle_review(state: &SharedState) {
+fn submit_combined_review(state: &SharedState) {
     let signals = state.signals;
-    let slot = state.bundle_review_slot.clone();
+    let slot = state.combined_review_slot.clone();
     spawn_forever(async move {
         let tx_opt = {
             let mut guard = slot.lock().await;
             guard.take()
         };
         let Some(tx) = tx_opt else {
-            tracing::warn!("submit_bundle_review: no pending oneshot sender");
+            tracing::warn!("submit_combined_review: no pending oneshot sender");
             return;
         };
-        let approved: Vec<Uuid> = signals
-            .bundle_approvals
+        let decisions = signals.decisions.read().values().cloned().collect();
+        let approvals = signals.bundle_approvals.read().clone();
+        let approved_bundles = signals
+            .bundles
             .read()
             .iter()
-            .filter_map(|(id, approved)| (*approved).then_some(*id))
+            .filter(|bundle| approvals.get(&bundle.id) == Some(&true))
+            .cloned()
             .collect();
-        if tx.send(approved).is_err() {
-            tracing::warn!("submit_bundle_review: service receiver dropped before send");
+        if tx
+            .send(ReviewOutcome {
+                decisions,
+                approved_bundles,
+            })
+            .is_err()
+        {
+            tracing::warn!("submit_combined_review: service receiver dropped before send");
         }
     });
 }
 
-fn reject_all_bundles_and_submit(state: &SharedState) {
+fn reject_all_combined_and_submit(state: &SharedState) {
     let signals = state.signals;
+    let proposals = signals.proposals.read().clone();
     let bundles = signals.bundles.read().clone();
+    let mut decisions = signals.decisions;
+    decisions.with_mut(|map| {
+        map.clear();
+        for proposal in &proposals {
+            map.insert(proposal.id, ReviewDecision::Reject(proposal.id));
+        }
+    });
     let mut approvals = signals.bundle_approvals;
     approvals.with_mut(|map| {
         map.clear();
-        for b in &bundles {
-            map.insert(b.id, false);
+        for bundle in &bundles {
+            map.insert(bundle.id, false);
         }
     });
-    submit_bundle_review(state);
+    submit_combined_review(state);
 }
 
+/// Send the approved bundle ids to the parked `review_bundles` oneshot. Only
+/// bundles explicitly toggled to approve are sent — undecided and rejected
+/// bundles are held, the safe default (mirrors `submit_review`).
 fn refresh_runs(state: &SharedState) {
     let signals = state.signals;
     spawn_forever(async move {
@@ -2068,6 +2397,11 @@ async fn refresh_runs_inner(signals: SignalBundle) {
     }
 }
 
+fn set_phase(signals: SignalBundle, phase: tidyup_domain::Phase) {
+    let mut p = signals.phase;
+    p.set(Some(phase));
+}
+
 fn set_busy(signals: SignalBundle, busy: Busy) {
     let mut b = signals.busy;
     b.set(busy);
@@ -2090,7 +2424,9 @@ fn reset_run_state(signals: SignalBundle) {
 
 const fn phase_label(phase: tidyup_domain::Phase) -> &'static str {
     match phase {
+        tidyup_domain::Phase::Preparing => "Loading models",
         tidyup_domain::Phase::Indexing => "Indexing",
+        tidyup_domain::Phase::Clustering => "Grouping related files",
         tidyup_domain::Phase::Extracting => "Extracting content",
         tidyup_domain::Phase::ProfilingTarget => "Profiling target hierarchy",
         tidyup_domain::Phase::Classifying => "Classifying",
@@ -2120,4 +2456,76 @@ fn percent_u32(current: u64, total: Option<u64>) -> Option<u32> {
         .saturating_add(total / 2)
         .checked_div(total)?;
     u32::try_from(pct).ok()
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use tidyup_domain::ChangeStatus;
+
+    fn move_proposal(name: &str) -> ChangeProposal {
+        ChangeProposal {
+            id: Uuid::new_v4(),
+            file_id: None,
+            change_type: ChangeType::Move,
+            original_path: PathBuf::from("/Users/example/Desktop").join(name),
+            proposed_path: PathBuf::from("/Users/example/Desktop/Work/Career").join(name),
+            proposed_name: name.to_string(),
+            confidence: 0.95,
+            reasoning: "career-document filename".to_string(),
+            needs_review: false,
+            status: ChangeStatus::Pending,
+            created_at: Utc::now(),
+            applied_at: None,
+            bundle_id: None,
+            classification_confidence: Some(0.95),
+            rename_mismatch_score: None,
+            content_hash: None,
+        }
+    }
+
+    #[test]
+    fn diff_model_keeps_shared_scan_destination_visible() {
+        let proposals = vec![
+            move_proposal("Resume_Evan_Rovelli.pdf"),
+            move_proposal("Resume_Evan_Rovelli_Audible.pdf"),
+        ];
+        let model = build_diff_model(&proposals);
+        assert!(model.left_rows.iter().any(|row| {
+            matches!(row, TreeRow::Folder { name, depth: 0, .. } if name == "Work")
+        }));
+        assert!(model.left_rows.iter().any(|row| {
+            matches!(row, TreeRow::Folder { name, depth: 1, .. } if name == "Career")
+        }));
+        assert_eq!(count_folders(&model.left_rows), 2);
+    }
+
+    #[test]
+    fn semantic_member_editor_rejects_duplicate_sibling_name() {
+        let first = move_proposal("first.png");
+        let first_id = first.id;
+        let second = move_proposal("second.png");
+        let bundle = BundleProposal::new(
+            PathBuf::from("/Users/example/Desktop"),
+            tidyup_domain::BundleKind::SemanticCollection {
+                label: "project".to_string(),
+            },
+            PathBuf::from("/Users/example/Desktop/Work"),
+            vec![first, second],
+            0.8,
+            "shared project evidence".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            validate_semantic_member_name(&bundle, first_id, "SECOND.PNG"),
+            Err("Another file in this collection already uses that name."),
+        );
+        assert_eq!(
+            validate_semantic_member_name(&bundle, first_id, "renamed.png").unwrap(),
+            "renamed.png",
+        );
+    }
 }

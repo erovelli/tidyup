@@ -2,8 +2,8 @@
 //!
 //! Covers files whose MIME is `text/*` or whose extension names a textual
 //! format that conventionally resolves to `application/*` (source code,
-//! structured-data formats, shell scripts). For v0.1 classification the
-//! Tier-2 embedding model only needs a prefix of the content, so the
+//! structured-data formats, shell scripts). The text embedding model only
+//! needs a bounded prefix of the content, so the
 //! extractor caps reads at [`MAX_BYTES`] — ample for signal extraction
 //! without risking multi-GB log files blowing out memory.
 
@@ -22,8 +22,8 @@ pub const MAX_BYTES: u64 = 4 * 1024 * 1024;
 /// Extensions that are plain text but typically don't resolve to a `text/*`
 /// MIME via `mime_guess`. Kept deliberately conservative — the goal is
 /// recognising files this extractor can sensibly transcribe, not claiming
-/// every textual format. Richer formats (PDF, DOCX, XLSX) route to their
-/// dedicated extractors.
+/// every textual format. PDF and feature-gated XLSX files route to dedicated
+/// extractors; unsupported richer formats remain unclaimed.
 const TEXT_EXTENSIONS: &[&str] = &[
     // Source
     "rs",

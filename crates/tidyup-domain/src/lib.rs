@@ -18,19 +18,37 @@ pub mod run;
 pub use backup::{BackupRecord, BackupStatus, RestorePrecheck};
 pub use bundle::{BundleError, BundleKind, BundleProposal};
 pub use change::{ChangeProposal, ChangeStatus, ChangeType, ParseError};
-pub use file::{ContentHash, FileId, IndexedFile};
+pub use file::{
+    ContentHash, FileId, FileProcessingRecord, FileProcessingRole, FileProcessingStage,
+    FileProcessingState, IndexedFile, SemanticArtifact,
+};
 pub use migration::{
     Calibration, Candidate, ClassificationResult, ClassifierConfig, DatePattern, FolderMetadata,
     FolderNode, FolderProfile, OrganizationType, ProfileCache, RenameConfig, ScanDiff,
     ScoreBreakdown, ScoreWeights, TargetScan, Tier,
 };
-pub use run::{RunMode, RunRecord, RunState};
+pub use run::{
+    CapabilityEntry, CapabilityKind, CapabilityManifest, CapabilityStatus, RunMode, RunRecord,
+    RunState,
+};
 
 /// Phases emitted to frontends during a run. Drives the single progress contract
 /// shared between CLI (`indicatif`) and UI (Dioxus signals).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Phase {
+    /// Frontend-only marker for work that precedes the first service call —
+    /// loading config and models. Services never emit it, but without it the
+    /// window sits blank while a model loads, which reads as a hang.
+    Preparing,
+    /// Walking the tree and persisting a stable identity per file.
     Indexing,
+    /// Grouping loose siblings into content bundles.
+    ///
+    /// Distinct from [`Self::Indexing`] on purpose: both used to report as
+    /// "Indexing", so two different stages were indistinguishable and the
+    /// second one — which has no meaningful total — looked like the first one
+    /// having stalled.
+    Clustering,
     Extracting,
     ProfilingTarget,
     Classifying,
@@ -39,16 +57,13 @@ pub enum Phase {
     Rollback,
 }
 
-/// Build the text that Tier-2 embeds to classify a file, from its extracted
+/// Build the semantic text embedded to classify a file, from its extracted
 /// body and filename.
 ///
-/// This is the **single** canonical construction shared by the shipped scan
-/// pipeline and the offline eval harness, so the eval measures the same query
-/// the product embeds (previously they diverged — the product embedded the raw
-/// body while the eval embedded `filename + first-500-chars`, so the eval
-/// measured a different system). The model token-truncates internally, so no
-/// char cap is applied here. Prepending the filename gives Tier 2 the same
-/// naming signal Tier 1 keys on. An empty body falls back to the filename alone.
+/// This is the canonical construction used by the standalone embedding
+/// classifier and its offline evaluation harness. The runtime scan pipeline
+/// keeps name and body as separately weighted evidence channels. The model
+/// token-truncates internally, so no character cap is applied here.
 #[must_use]
 pub fn classification_query(body: &str, filename: &str) -> String {
     let body = body.trim();

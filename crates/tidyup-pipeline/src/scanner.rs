@@ -1,10 +1,10 @@
 //! Source-directory walker with bundle detection.
 //!
 //! The first pass of every pipeline run. The scanner walks the source tree,
-//! marks self-contained subtrees (`.git/`, `Cargo.toml`, `package.json`,
-//! `pyproject.toml`, `*.xcodeproj`, `build.gradle`, clusters of `.ipynb`
-//! files) as [`DetectedBundle`]s, and collects every other file as a loose
-//! entry.
+//! marks recognized self-contained subtrees as [`DetectedBundle`]s, and
+//! recursively collects ordinary files as loose entries. Unmarked directories
+//! are transparent to discovery so nested projects still win at their own
+//! marker roots and ordinary descendants reach semantic classification.
 //!
 //! # Opacity
 //!
@@ -16,12 +16,11 @@
 //!
 //! # Precedence
 //!
-//! When multiple markers coexist in the same directory the most specific
-//! wins — `Cargo.toml` outranks `.git/` because a Rust crate's relevance to
-//! a user is "a crate", not "a repository". Directories with no marker but
-//! containing *two or more* sibling `.ipynb` files become
-//! [`BundleKind::JupyterNotebookSet`], which is the weakest hard-bundle
-//! signal.
+//! When multiple markers coexist in the same directory the most specific wins.
+//! Directories with no marker but containing *two or more* sibling `.ipynb`
+//! files become [`BundleKind::JupyterNotebookSet`]. Unknown directories are
+//! traversed rather than turned into opaque bundles; preserving or adapting
+//! their relative placement is a later planning concern, not a walk boundary.
 //!
 //! # Scope
 //!
@@ -67,8 +66,8 @@ pub struct DetectedBundle {
     pub target_subdir: Option<String>,
 }
 
-/// Walk `root`, classify each directory as bundle-root or transparent, and
-/// collect loose files from transparent directories.
+/// Walk `root`, stop at recognized bundle roots, and recursively collect all
+/// other regular files as loose entries.
 ///
 /// Symlinks are never followed to avoid cycles and escape from the source
 /// tree. Unreadable subdirectories are logged and skipped rather than
@@ -272,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn loose_files_are_collected() {
+    fn files_inside_unknown_directories_remain_loose() {
         let td = TempDir::new().unwrap();
         touch(td.path(), "a.txt");
         touch(td.path(), "sub/b.md");
@@ -280,6 +279,15 @@ mod tests {
         let tree = scan(td.path());
         assert!(tree.bundles.is_empty());
         assert_eq!(tree.loose_files.len(), 3);
+        assert!(tree.loose_files.iter().any(|path| path.ends_with("a.txt")));
+        assert!(tree
+            .loose_files
+            .iter()
+            .any(|path| path.ends_with("sub/b.md")));
+        assert!(tree
+            .loose_files
+            .iter()
+            .any(|path| path.ends_with("sub/nested/c.pdf")));
     }
 
     #[test]
@@ -383,7 +391,7 @@ mod tests {
         touch(td.path(), "nb/lone.ipynb");
         let tree = scan(td.path());
         assert!(tree.bundles.is_empty());
-        assert_eq!(tree.loose_files.len(), 1);
+        assert_eq!(tree.loose_files, [td.path().join("nb/lone.ipynb")]);
     }
 
     #[test]
@@ -406,9 +414,7 @@ mod tests {
     }
 
     #[test]
-    fn nested_bundles_do_not_emit_outer_bundle() {
-        // A directory containing a bundle subdir is NOT itself a bundle unless
-        // it has its own marker. The outer dir should be transparent.
+    fn sibling_projects_under_an_intermediate_directory_are_detected_separately() {
         let td = TempDir::new().unwrap();
         touch(td.path(), "projects/one/Cargo.toml");
         touch(td.path(), "projects/one/src/lib.rs");
@@ -417,9 +423,39 @@ mod tests {
         let tree = scan(td.path());
         assert_eq!(tree.bundles.len(), 2);
         assert!(tree.loose_files.is_empty());
-        let kinds: Vec<&BundleKind> = tree.bundles.iter().map(|b| &b.kind).collect();
-        assert!(kinds.contains(&&BundleKind::RustCrate));
-        assert!(kinds.contains(&&BundleKind::NodeProject));
+        assert!(tree.bundles.iter().any(|bundle| {
+            bundle.root.ends_with("projects/one") && bundle.kind == BundleKind::RustCrate
+        }));
+        assert!(tree.bundles.iter().any(|bundle| {
+            bundle.root.ends_with("projects/two") && bundle.kind == BundleKind::NodeProject
+        }));
+    }
+
+    #[test]
+    fn project_nested_multiple_levels_below_root_is_detected() {
+        let td = TempDir::new().unwrap();
+        touch(td.path(), "dev/repos/myproject/Cargo.toml");
+        touch(td.path(), "dev/repos/myproject/src/main.rs");
+        let tree = scan(td.path());
+        assert_eq!(tree.bundles.len(), 1);
+        assert_eq!(tree.bundles[0].kind, BundleKind::RustCrate);
+        assert!(tree.bundles[0].root.ends_with("dev/repos/myproject"));
+        assert_eq!(tree.bundles[0].members.len(), 2);
+        assert!(tree.loose_files.is_empty());
+    }
+
+    #[test]
+    fn ordinary_files_in_plain_subdirectory_are_individual_loose_inputs() {
+        let td = TempDir::new().unwrap();
+        touch(td.path(), "plainfolder/notes.txt");
+        touch(td.path(), "plainfolder/agenda.txt");
+        let tree = scan(td.path());
+        assert!(tree.bundles.is_empty());
+        assert_eq!(tree.loose_files.len(), 2);
+        assert!(tree
+            .loose_files
+            .iter()
+            .all(|path| path.parent() == Some(td.path().join("plainfolder").as_path())));
     }
 
     #[test]
@@ -431,10 +467,15 @@ mod tests {
         touch(td.path(), "sub/real.md");
         let tree = scan(td.path());
         assert_eq!(tree.loose_files.len(), 2);
-        for p in &tree.loose_files {
-            let name = p.file_name().and_then(|s| s.to_str()).unwrap();
-            assert!(name == "doc.txt" || name == "real.md");
-        }
+        assert!(tree
+            .loose_files
+            .iter()
+            .any(|path| path.ends_with("doc.txt")));
+        assert!(tree
+            .loose_files
+            .iter()
+            .any(|path| path.ends_with("sub/real.md")));
+        assert!(tree.bundles.is_empty());
     }
 
     #[test]

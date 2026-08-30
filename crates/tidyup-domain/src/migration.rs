@@ -107,6 +107,11 @@ pub struct FolderProfile {
     pub content_centroid: Option<Vec<f32>>,
     /// Number of files that contributed to the content centroid.
     pub centroid_sample_count: u32,
+    /// Folder path/label embedded by the image backend's text tower. Unlike an
+    /// image centroid, this exists for an empty named folder and can therefore
+    /// route an image into a pre-created hierarchy without seed media.
+    #[serde(default)]
+    pub image_name_embedding: Option<Vec<f32>>,
     /// Mean `SigLIP` image embedding of sampled images directly in this folder.
     /// `None` when no image backend was available at profile time or the folder
     /// holds no images. Compare only against `SigLIP` image embeddings.
@@ -115,6 +120,10 @@ pub struct FolderProfile {
     /// Number of images that contributed to [`image_centroid`](Self::image_centroid).
     #[serde(default)]
     pub image_centroid_sample_count: u32,
+    /// Folder path/label embedded by the audio backend's text tower. Compare
+    /// only against embeddings from the matching audio backend.
+    #[serde(default)]
+    pub audio_name_embedding: Option<Vec<f32>>,
     /// Mean `CLAP` audio embedding of sampled audio directly in this folder.
     /// `None` when no audio backend was available at profile time or the folder
     /// holds no audio. Compare only against `CLAP` audio embeddings.
@@ -189,11 +198,13 @@ pub struct ClassificationResult {
     pub source_file: PathBuf,
     /// Ordered list of candidate destinations, best first.
     pub candidates: Vec<Candidate>,
-    /// Which tier produced the final classification.
+    /// Which semantic resolver produced the final classification. The `Tier`
+    /// type name is retained as persisted compatibility vocabulary.
     pub resolved_at: Tier,
     /// Whether this classification needs user review.
     pub needs_review: bool,
-    /// Optional new filename (only if Tier 3 was invoked for renaming).
+    /// Optional grounded filename proposed from metadata, extracted text/OCR,
+    /// or contrastive concepts. The optional LLM reranker never supplies it.
     pub suggested_rename: Option<String>,
 }
 
@@ -213,15 +224,10 @@ pub struct ScoreBreakdown {
     pub name_similarity: f32,
     /// Similarity to folder content centroid.
     pub centroid_similarity: Option<f32>,
-    /// Metadata compatibility score.
-    pub metadata_score: f32,
-    /// Hierarchical coherence adjustment.
-    pub hierarchy_adjustment: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Tier {
-    Heuristic,
     Embedding,
     Llm,
 }
@@ -232,13 +238,11 @@ pub enum Tier {
 
 #[derive(Debug, Clone)]
 pub struct ClassifierConfig {
-    /// Tier 1 auto-classify threshold.
-    pub heuristic_threshold: f32,
-    /// Tier 2 auto-classify threshold.
+    /// Semantic embedding auto-classify threshold.
     pub embedding_threshold: f32,
-    /// Tier 2 ambiguity gap threshold.
+    /// Semantic ambiguity gap threshold.
     pub ambiguity_gap: f32,
-    /// Whether to invoke Tier 3 (LLM) for ambiguous files. Defaults to `false`
+    /// Whether to invoke an optional LLM reranker for ambiguous files. Defaults to `false`
     /// (privacy-preserving): activation is materialised from the layered config
     /// only under the three-gate model (cargo feature + config bool +
     /// per-invocation flag), never from this default alone.
@@ -256,31 +260,39 @@ pub struct ClassifierConfig {
 pub struct ScoreWeights {
     pub name: f32,
     pub centroid: f32,
-    pub metadata: f32,
-    pub hierarchy: f32,
 }
 
 /// Thresholds gating rename proposals. Both signals must clear their threshold before a
 /// rename is surfaced to review. Renames never auto-apply, even under `--yes`.
 ///
-/// - `min_classification_confidence`: lower bound on Tier-2 classification confidence.
+/// - `min_classification_confidence`: lower bound on deterministic semantic-routing evidence.
 /// - `min_mismatch_score`: lower bound on `1.0 - cosine(embed(filename), content_embedding)`.
+/// - `min_grounded_mismatch`: lower bound on unmatched retrieved concept-token fraction.
 #[derive(Debug, Clone)]
 pub struct RenameConfig {
     pub min_classification_confidence: f32,
     pub min_mismatch_score: f32,
+    /// Minimum fraction of selected non-textual concept labels not already
+    /// present as literal filename tokens. This intentionally has a separate
+    /// scale from the continuous text-embedding mismatch score.
+    pub min_grounded_mismatch: f32,
+    /// Minimum raw contrastive-model score for a concept to ground a
+    /// non-textual semantic rename.
+    pub min_grounding_confidence: f32,
+    /// Minimum score separation between the last selected grounded concept and
+    /// the next unselected concept.
+    pub min_grounding_gap: f32,
 }
 
 impl Default for ClassifierConfig {
     fn default() -> Self {
         Self {
-            heuristic_threshold: 0.60,
             embedding_threshold: 0.35,
             ambiguity_gap: 0.05,
-            // Privacy default: Tier 3 stays off unless the layered config +
+            // Privacy default: the optional reranker stays off unless the layered config +
             // three-gate activation explicitly turns it on. A dead
             // `enable_llm_renaming` field used to default true here — it was
-            // never read and contradicted the extractive-only rename invariant.
+            // never read and contradicted the grounded, non-generative rename invariant.
             enable_llm_fallback: false,
             weights: ScoreWeights::default(),
             rename: RenameConfig::default(),
@@ -292,10 +304,10 @@ impl Default for ClassifierConfig {
 impl Default for ScoreWeights {
     fn default() -> Self {
         Self {
-            name: 0.25,
-            centroid: 0.55,
-            metadata: 0.10,
-            hierarchy: 0.10,
+            // Preserve the former 25:55 ratio while normalizing the two live
+            // semantic signals onto the full confidence scale.
+            name: 0.3125,
+            centroid: 0.6875,
         }
     }
 }
@@ -305,6 +317,9 @@ impl Default for RenameConfig {
         Self {
             min_classification_confidence: 0.85,
             min_mismatch_score: 0.60,
+            min_grounded_mismatch: 0.60,
+            min_grounding_confidence: 0.30,
+            min_grounding_gap: 0.02,
         }
     }
 }
@@ -369,7 +384,7 @@ mod tests {
 
     #[test]
     fn tier_serde_roundtrip() {
-        for t in [Tier::Heuristic, Tier::Embedding, Tier::Llm] {
+        for t in [Tier::Embedding, Tier::Llm] {
             let json = serde_json::to_string(&t).unwrap();
             let back: Tier = serde_json::from_str(&json).unwrap();
             assert_eq!(t, back);
@@ -379,10 +394,9 @@ mod tests {
     #[test]
     fn default_classifier_config() {
         let config = ClassifierConfig::default();
-        assert!((config.heuristic_threshold - 0.60).abs() < f32::EPSILON);
         assert!((config.embedding_threshold - 0.35).abs() < f32::EPSILON);
         let w = &config.weights;
-        let total = w.name + w.centroid + w.metadata + w.hierarchy;
+        let total = w.name + w.centroid;
         assert!((total - 1.0).abs() < 0.01);
     }
 
@@ -391,6 +405,7 @@ mod tests {
         let r = RenameConfig::default();
         assert!((r.min_classification_confidence - 0.85).abs() < f32::EPSILON);
         assert!((r.min_mismatch_score - 0.60).abs() < f32::EPSILON);
+        assert!((r.min_grounded_mismatch - 0.60).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -398,5 +413,6 @@ mod tests {
         let r = RenameConfig::default();
         assert!((0.0..=1.0).contains(&r.min_classification_confidence));
         assert!((0.0..=1.0).contains(&r.min_mismatch_score));
+        assert!((0.0..=1.0).contains(&r.min_grounded_mismatch));
     }
 }

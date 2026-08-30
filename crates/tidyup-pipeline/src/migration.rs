@@ -3,31 +3,30 @@
 //!
 //! Contrast with [`crate::scan`]: scan-mode routes into a fixed taxonomy;
 //! migration-mode routes into whatever structure the user has already built.
-//! Tier 1 still fires (extension / MIME / marker filenames), but Tier 2
-//! composite scoring is the primary signal, combining similarity to each
-//! folder's `name_embedding` and `content_centroid`, plus a metadata score
-//! and a hierarchy adjustment.
+//! Composite semantic scoring combines similarity to each folder's
+//! `name_embedding` and `content_centroid`. File
+//! type may select a compatible inference backend, but never a destination.
 //!
 //! # Composite score
 //!
-//! Per [`ScoreWeights`] (defaults `0.25 name + 0.55 centroid + 0.10 metadata +
-//! 0.10 hierarchy`). The profiler populates `content_centroid` from each target
+//! Per [`ScoreWeights`]. The profiler populates `content_centroid` from each target
 //! folder's documents when extractors are supplied; when a folder has no text
 //! documents (or extractors weren't supplied) its `content_centroid` is `None`
 //! and the centroid weight is redistributed to `name` so the composite stays in
 //! `[0, 1]`.
 //!
-//! # Tier 3
+//! # Optional LLM reranking
 //!
-//! When a caller supplies `Some(text_backend)` and Tier 2's top profile lands
+//! When a caller supplies `Some(text_backend)` and the embedding top profile lands
 //! in the review zone, the LLM classifies the content and the resulting
 //! `summary + category + tags` is re-embedded and re-ranked against the same
 //! profile cache under the same scoring rules. The LLM-reranked top is
-//! adopted only if it scores higher than Tier 2's. The verdict's
-//! `resolved_at` is set to [`Tier::Llm`] when this fires. The activation gate
+//! adopted only if it scores higher than the original. The verdict's
+//! `resolved_at` is set to the legacy [`Tier::Llm`] provenance when this fires. The activation gate
 //! is the caller passing `Some(text_backend)` — this module is
 //! feature-flag-free by design.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -42,21 +41,19 @@ use tidyup_domain::change::{ChangeProposal, ChangeStatus, ChangeType};
 use tidyup_domain::migration::{
     Candidate, ClassificationResult, ScoreBreakdown, ScoreWeights, Tier,
 };
-use tidyup_domain::{
-    BundleKind, BundleProposal, ClassifierConfig, FolderProfile, Phase, ProfileCache,
-};
+use tidyup_domain::{BundleProposal, ClassifierConfig, FolderProfile, Phase, ProfileCache};
 use uuid::Uuid;
 
-use crate::heuristics::{self, HeuristicMatch};
-use crate::naming::{propose_rename, RenameProposal};
+use crate::naming::{propose_rename, uniquify_bundle_member_names, RenameProposal};
 use crate::scanner::{self, DetectedBundle};
+use crate::semantic::{gate_grounded_rename, GroundedConcept, SemanticRunCache};
 use crate::text_util::char_prefix;
 use crate::yake;
 
 /// Optional cross-modal backends for routing image/audio source files.
 ///
 /// Both `None` on the default install — image and audio files then fall through
-/// to the text Tier 2 path (today's behaviour). When present, image source
+/// to the general text path. When present, image source
 /// files route against folder image centroids and audio against audio centroids.
 ///
 /// Latent-space isolation: the image backend is only ever used to embed image
@@ -69,6 +66,10 @@ use crate::yake;
 pub struct MigrationMultimodal<'a> {
     pub image: Option<&'a dyn ImageEmbeddingBackend>,
     pub audio: Option<&'a dyn AudioEmbeddingBackend>,
+    /// General concepts embedded in the image backend's text space. Used only
+    /// for grounded naming and collection labels, never destination routing.
+    pub image_concepts: &'a [GroundedConcept],
+    pub artifact_store: Option<&'a dyn tidyup_core::storage::FileIndex>,
 }
 
 /// Output of one migration pass.
@@ -82,29 +83,33 @@ pub struct MigrationOutcome {
     pub classifications: Vec<ClassificationResult>,
     /// Files the cascade couldn't place (no extractable content, empty
     /// profile cache, or below-threshold with too small an ambiguity gap and
-    /// no heuristic fallback).
+    /// no reliable semantic evidence).
     pub unclassified: Vec<PathBuf>,
+    /// Images excluded from visual-collection discovery by the per-directory
+    /// work cap. See [`crate::clustering::ClusterOutcome`].
+    pub visual_candidates_over_cap: usize,
 }
 
 /// Drive the migration cascade end-to-end.
 ///
-/// `text_backend` is the optional Tier 3 LLM. Pass `None` and the cascade
-/// stops at Tier 2; pass `Some` and low-confidence Tier 2 verdicts get a
+/// `text_backend` is the optional LLM reranker. Pass `None` for deterministic
+/// embedding-only routing; pass `Some` and low-confidence embedding verdicts get a
 /// chance to be re-ranked through an LLM-cleaned query against the same
 /// folder profiles.
 ///
 /// `multimodal` carries optional image/audio backends. When present, image and
 /// audio source files are routed against the folders' cross-modal centroids
 /// (`SigLIP` / `CLAP`) instead of the text path; when absent (the default
-/// install) those files fall through to the text Tier 2 cascade unchanged.
+/// install) those files fall through to the general text path unchanged.
 ///
 /// # Errors
 /// Propagates source-read and embedding-backend failures. Per-file
 /// extraction / classification failures are logged via `progress.message`
 /// and surface through [`MigrationOutcome::unclassified`].
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn run_migration(
     source_root: &Path,
+    identities: &crate::indexing::SourceIdentities,
     profiles: &ProfileCache,
     embeddings: &dyn EmbeddingBackend,
     text_backend: Option<&dyn TextBackend>,
@@ -113,23 +118,51 @@ pub async fn run_migration(
     config: &ClassifierConfig,
     progress: &dyn ProgressReporter,
 ) -> Result<MigrationOutcome> {
-    progress.phase_started(Phase::Indexing, None).await;
+    let semantic_cache = SemanticRunCache::new(multimodal.artifact_store);
+    progress.phase_started(Phase::Clustering, None).await;
     let tree = scanner::scan(source_root);
-    progress.phase_finished(Phase::Indexing).await;
+    let clustered = crate::clustering::cluster_loose_semantic(
+        &tree.loose_files,
+        extractors,
+        &crate::clustering::ClusterConfig::default(),
+        crate::clustering::SemanticClusterContext {
+            image: multimodal.image,
+            image_concepts: multimodal.image_concepts,
+            cache: &semantic_cache,
+        },
+    )
+    .await;
+    progress.phase_finished(Phase::Clustering).await;
 
+    let content_bundles = clustered.bundles;
+    let loose_files = clustered.loose;
     let mut outcome = MigrationOutcome {
         proposals: Vec::new(),
         bundles: Vec::new(),
+        visual_candidates_over_cap: clustered.visual_candidates_over_cap,
         classifications: Vec::new(),
         unclassified: Vec::new(),
     };
 
-    // Bundles first — they bypass Tier 2 per-file classification but we still
-    // place them under the best-matching leaf folder (by leaf name).
+    // Bundles and loose files share one Classifying phase with one running
+    // counter. Both bundle loops classify member files, and they used to run
+    // between `phase_finished` and `phase_started(Classifying)` with no
+    // progress events at all — the longest unreported stretch of the run.
+    let bundle_count = tree.bundles.len().saturating_add(content_bundles.len());
+    let classify_total =
+        u64::try_from(bundle_count.saturating_add(loose_files.len())).unwrap_or(u64::MAX);
+    progress
+        .phase_started(Phase::Classifying, Some(classify_total))
+        .await;
+    let mut classified_count: u64 = 0;
+
+    // Bundles first: they bypass per-file routing, while the aggregate still
+    // targets the best-matching leaf folder.
     for bundle in &tree.bundles {
-        match build_bundle_proposal(bundle, profiles, embeddings).await {
+        match build_bundle_proposal(bundle, identities, profiles, embeddings).await {
             Ok(bp) => outcome.bundles.push(bp),
             Err(e) => {
+                outcome.unclassified.extend(bundle.members.iter().cloned());
                 progress
                     .message(
                         Level::Warn,
@@ -138,14 +171,64 @@ pub async fn run_migration(
                     .await;
             }
         }
+        classified_count = classified_count.saturating_add(1);
+        progress
+            .item_completed(
+                Phase::Classifying,
+                ProgressItem {
+                    label: bundle.root.display().to_string(),
+                    current: classified_count,
+                    total: Some(classify_total),
+                },
+            )
+            .await;
     }
 
-    let total = u64::try_from(tree.loose_files.len()).unwrap_or(u64::MAX);
-    progress
-        .phase_started(Phase::Classifying, Some(total))
-        .await;
+    // Semantic collections and other loose-file clusters need per-member
+    // extraction/classification before their aggregate destination and optional
+    // evidence-backed renames can be proposed.
+    for bundle in &content_bundles {
+        match build_content_bundle_proposal(
+            bundle,
+            identities,
+            profiles,
+            embeddings,
+            text_backend,
+            multimodal,
+            extractors,
+            config,
+            &semantic_cache,
+        )
+        .await
+        {
+            Ok(bp) => outcome.bundles.push(bp),
+            Err(e) => {
+                outcome.unclassified.extend(bundle.members.iter().cloned());
+                progress
+                    .message(
+                        Level::Warn,
+                        &format!(
+                            "semantic collection proposal failed for {}: {e}",
+                            bundle.root.display()
+                        ),
+                    )
+                    .await;
+            }
+        }
+        classified_count = classified_count.saturating_add(1);
+        progress
+            .item_completed(
+                Phase::Classifying,
+                ProgressItem {
+                    label: bundle.root.display().to_string(),
+                    current: classified_count,
+                    total: Some(classify_total),
+                },
+            )
+            .await;
+    }
 
-    for (idx, path) in tree.loose_files.iter().enumerate() {
+    for path in &loose_files {
         match classify_file(
             path,
             profiles,
@@ -154,11 +237,12 @@ pub async fn run_migration(
             multimodal,
             extractors,
             config,
+            &semantic_cache,
         )
         .await
         {
             Ok(Some(verdict)) => {
-                let mut proposal = build_proposal(path, &verdict);
+                let mut proposal = build_proposal(path, &verdict, identities);
                 // Calibrated confidence (no-op under the default Identity).
                 proposal.confidence = config.calibration.calibrate(proposal.confidence);
                 outcome.proposals.push(proposal);
@@ -177,13 +261,14 @@ pub async fn run_migration(
                 outcome.unclassified.push(path.clone());
             }
         }
+        classified_count = classified_count.saturating_add(1);
         progress
             .item_completed(
                 Phase::Classifying,
                 ProgressItem {
                     label: path.display().to_string(),
-                    current: u64::try_from(idx).unwrap_or(u64::MAX).saturating_add(1),
-                    total: Some(total),
+                    current: classified_count,
+                    total: Some(classify_total),
                 },
             )
             .await;
@@ -214,6 +299,7 @@ async fn classify_file(
     multimodal: MigrationMultimodal<'_>,
     extractors: &[Arc<dyn ContentExtractor>],
     config: &ClassifierConfig,
+    semantic_cache: &SemanticRunCache<'_>,
 ) -> Result<Option<Verdict>> {
     let filename = path
         .file_name()
@@ -222,59 +308,21 @@ async fn classify_file(
         .to_string();
 
     let mime = tidyup_extract::mime::detect(path).await;
-    let extracted = match tidyup_extract::router::pick(extractors, path, mime.as_deref()) {
-        Some(ex) => ex.extract(path).await.ok(),
-        None => None,
-    };
+    let extracted = semantic_cache
+        .extract(path, mime.as_deref(), extractors)
+        .await;
     let effective_mime = extracted
         .as_ref()
         .map(|e| e.mime.clone())
         .or_else(|| mime.clone());
 
-    // Tier 1.
-    //
-    // Heuristics give us a class label (e.g. `"Code/"`), but in migration
-    // mode we need an actual folder path. Use the heuristic's taxonomy
-    // string as a soft routing signal: pick the profile leaf whose path
-    // *contains* that label case-insensitively (`route_heuristic`). If none
-    // matches, fall through to Tier 2.
-    let tier1_route = heuristics::classify(path, effective_mime.as_deref())
-        .filter(|hit| hit.confidence >= config.heuristic_threshold)
-        .and_then(|hit| route_heuristic(&hit, profiles).map(|folder| (hit, folder)));
-
-    // Ordering: for image/audio whose cross-modal backend is loaded, prefer the
-    // image/audio-centroid classifier and use Tier 1 as the fallback — otherwise
-    // a `.jpg`/`.mp3` short-circuits at Tier 1 (whenever a folder name happens to
-    // match the heuristic label) and never reaches Tier 2. With no backend (the
-    // default install) Tier 1 wins first, unchanged.
-    let modality = file_modality(path, effective_mime.as_deref());
-    let media_backend_present = match modality {
-        FileModality::Image => multimodal.image.is_some(),
-        FileModality::Audio => multimodal.audio.is_some(),
-        _ => false,
-    };
-
-    if !media_backend_present {
-        if let Some((hit, folder)) = &tier1_route {
-            return Ok(Some(
-                tier1_verdict(
-                    path,
-                    hit,
-                    folder.clone(),
-                    extracted.as_ref(),
-                    embeddings,
-                    &filename,
-                    config,
-                )
-                .await?,
-            ));
-        }
-    }
-
-    // Tier 2 (cross-modal) — image/audio files route against the folders'
+    // File type selects only a compatible semantic backend. It never maps to a
+    // destination folder.
+    let modality = file_modality(effective_mime.as_deref());
+    // Cross-modal image/audio files route against the folders'
     // image/audio centroids when the matching backend is loaded. A miss
     // (backend absent, no folder has a centroid, unreadable/oversized file)
-    // falls through to the deferred Tier-1 route, then the text Tier 2 path.
+    // falls through to the text semantic path.
     if let Some(verdict) = classify_modality_file(
         path,
         modality,
@@ -282,41 +330,23 @@ async fn classify_file(
         multimodal,
         profiles,
         config,
+        semantic_cache,
     )
     .await
     {
         return Ok(Some(verdict));
     }
 
-    if media_backend_present {
-        if let Some((hit, folder)) = &tier1_route {
-            return Ok(Some(
-                tier1_verdict(
-                    path,
-                    hit,
-                    folder.clone(),
-                    extracted.as_ref(),
-                    embeddings,
-                    &filename,
-                    config,
-                )
-                .await?,
-            ));
-        }
-    }
-
-    // Tier 2 — composite scoring against all leaf profiles.
-    let Some(text) = extracted.as_ref().and_then(|e| e.text.as_deref()) else {
-        // No content → fall back to the heuristic if any, flagged for review.
-        if let Some(hit) = heuristics::classify(path, effective_mime.as_deref()) {
-            if let Some(folder) = route_heuristic(&hit, profiles) {
-                return Ok(Some(weak_heuristic(&hit, folder, path)));
-            }
-        }
-        return Ok(None);
-    };
-
-    let content_embedding = embeddings.embed_text(text).await?;
+    // General semantic scoring against all leaf profiles. Files with no
+    // extractable body still carry filename, local path context, and detected
+    // media type as model inputs; none of those inputs directly chooses a
+    // destination.
+    let text = extracted
+        .as_ref()
+        .and_then(|content| content.text.as_deref())
+        .unwrap_or_default();
+    let semantic_query = semantic_evidence_query(path, text, effective_mime.as_deref());
+    let content_embedding = embeddings.embed_text(&semantic_query).await?;
 
     let ranked = rank_profiles(&content_embedding, profiles, path, &config.weights);
     if ranked.is_empty() {
@@ -332,7 +362,8 @@ async fn classify_file(
     let tier2_needs_review =
         tier2_score < config.embedding_threshold || tier2_gap < config.ambiguity_gap;
 
-    // Tier 3 — only fires when Tier 2 was uncertain and a backend is wired.
+    // Optional LLM reranking only fires when deterministic semantic routing is
+    // uncertain and a text backend is wired.
     let mut chosen_folder = tier2_folder.clone();
     let mut chosen_score = tier2_score;
     let mut chosen_gap = tier2_gap;
@@ -348,7 +379,11 @@ async fn classify_file(
                 embeddings,
                 profiles,
                 path,
-                text,
+                if text.trim().is_empty() {
+                    &semantic_query
+                } else {
+                    text
+                },
                 &filename,
                 &config.weights,
             )
@@ -382,11 +417,14 @@ async fn classify_file(
     let metadata_json = extracted
         .as_ref()
         .map_or(serde_json::Value::Null, |e| e.metadata.clone());
-    let keywords = yake::extract_keywords(text, 8);
-    let year = find_year(char_prefix(text, 1000));
-    // Rename gate is driven by Tier 2's confidence (`tier2_score`), NOT the
-    // post-Tier-3 rerank (`chosen_score`) — see the scan-mode gate and the
-    // "Tier 3 reroutes never produce renames" invariant in CLAUDE.md.
+    let content_text = (!text.trim().is_empty()).then_some(text);
+    let keywords = content_text
+        .map(|body| yake::extract_keywords(body, 8))
+        .unwrap_or_default();
+    let year = content_text.and_then(|body| find_year(char_prefix(body, 1000)));
+    // Rename gating uses the deterministic semantic score (`tier2_score`), not
+    // the post-rerank routing score (`chosen_score`). The optional LLM must not
+    // create a rename path.
     let rename = gate_rename(
         path,
         &metadata_json,
@@ -394,7 +432,7 @@ async fn classify_file(
         year,
         tier2_score,
         embeddings,
-        Some(text),
+        content_text,
         &filename,
         config,
     )
@@ -424,14 +462,11 @@ async fn classify_file(
         )
     } else {
         format!(
-            "tier2 composite: top={chosen_score:.3} gap={chosen_gap:.3} name={:.3} centroid={} \
-             metadata={:.3} hierarchy={:.3}",
+            "tier2 composite: top={chosen_score:.3} gap={chosen_gap:.3} name={:.3} centroid={}",
             chosen_breakdown.name_similarity,
             chosen_breakdown
                 .centroid_similarity
                 .map_or_else(|| "n/a".to_string(), |v| format!("{v:.3}")),
-            chosen_breakdown.metadata_score,
-            chosen_breakdown.hierarchy_adjustment,
         )
     };
 
@@ -450,20 +485,47 @@ async fn classify_file(
         destination_folder: chosen_folder,
         confidence: chosen_score,
         reasoning,
-        // The Tier-2 sub-score that gated the rename (not the Tier-3 rerank).
+        // The deterministic semantic score that gated the rename, before any
+        // optional LLM reranking.
         classification_confidence: Some(tier2_score),
         rename_mismatch_score: rename.mismatch_score,
     }))
 }
 
-/// Tier 3 for migration mode: ask the LLM to classify the content, then
+fn semantic_evidence_query(path: &Path, body: &str, mime: Option<&str>) -> String {
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let parent = path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    format!(
+        "filename {} parent context {} media type {} content {}",
+        normalize_semantic_text(filename),
+        normalize_semantic_text(parent),
+        mime.unwrap_or("unknown"),
+        body
+    )
+}
+
+fn normalize_semantic_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| if ch.is_alphanumeric() { ch } else { ' ' })
+        .collect()
+}
+
+/// Optional migration rerank: ask the LLM to classify the content, then
 /// re-rank profiles using an embedding of `summary + category + tags` instead
 /// of the raw content.
 ///
 /// Returns the new ranked list (same shape as [`rank_profiles`]) plus the
 /// backend's model id, or `None` when the LLM produced no usable output. We
-/// deliberately ignore the LLM's `suggested_name` — rename proposals are
-/// extractive only (per project rename policy).
+/// deliberately ignore the LLM's `suggested_name`: rename proposals use exact
+/// evidence or scored local concept retrieval, never LLM-authored text.
 #[allow(clippy::too_many_arguments)]
 async fn tier3_rerank(
     text_backend: &dyn TextBackend,
@@ -474,7 +536,11 @@ async fn tier3_rerank(
     filename: &str,
     weights: &ScoreWeights,
 ) -> Result<Option<(Vec<(PathBuf, f32, ScoreBreakdown)>, String)>> {
-    let classification = text_backend.classify_text(text, filename).await?;
+    // Small local fallback models have finite context windows; bound long PDF
+    // and document evidence without ever splitting a UTF-8 code point.
+    let classification = text_backend
+        .classify_text(char_prefix(text, 12_000), filename)
+        .await?;
     let model_id = text_backend.model_id().to_string();
     let query = build_llm_query(&classification);
     if query.is_empty() {
@@ -505,94 +571,7 @@ fn build_llm_query(c: &tidyup_core::inference::ContentClassification) -> String 
     parts.join(" ")
 }
 
-/// Build the Tier-1 (`needs_review = false`) verdict for a confident heuristic
-/// hit routed to `folder`. Shared by the two call sites in `classify_file`: the
-/// normal Tier-1 short-circuit, and the fallback when a media file's cross-modal
-/// Tier 2 was tried first and missed.
-async fn tier1_verdict(
-    path: &Path,
-    hit: &HeuristicMatch,
-    folder: PathBuf,
-    extracted: Option<&tidyup_core::extractor::ExtractedContent>,
-    embeddings: &dyn EmbeddingBackend,
-    filename: &str,
-    config: &ClassifierConfig,
-) -> Result<Verdict> {
-    let text = extracted.and_then(|e| e.text.as_deref());
-    let metadata_json = extracted.map_or(serde_json::Value::Null, |e| e.metadata.clone());
-    let keywords = text
-        .map(|t| yake::extract_keywords(t, 8))
-        .unwrap_or_default();
-    let year = text.and_then(|t| find_year(char_prefix(t, 1000)));
-    let rename = gate_rename(
-        path,
-        &metadata_json,
-        &keywords,
-        year,
-        hit.confidence,
-        embeddings,
-        text,
-        filename,
-        config,
-    )
-    .await?;
-    Ok(Verdict {
-        result: ClassificationResult {
-            source_file: path.to_path_buf(),
-            candidates: vec![Candidate {
-                folder: folder.clone(),
-                score: hit.confidence,
-                score_breakdown: ScoreBreakdown {
-                    name_similarity: 0.0,
-                    centroid_similarity: None,
-                    metadata_score: 0.0,
-                    hierarchy_adjustment: 0.0,
-                },
-            }],
-            resolved_at: Tier::Heuristic,
-            needs_review: false,
-            suggested_rename: match &rename.proposal {
-                RenameProposal::Rename { name, .. } => Some(name.clone()),
-                RenameProposal::Keep => None,
-            },
-        },
-        rename: rename.proposal,
-        destination_folder: folder,
-        confidence: hit.confidence,
-        reasoning: format!("tier1 heuristic: {}", hit.reason),
-        classification_confidence: Some(hit.confidence),
-        rename_mismatch_score: rename.mismatch_score,
-    })
-}
-
-fn weak_heuristic(hit: &HeuristicMatch, folder: PathBuf, path: &Path) -> Verdict {
-    Verdict {
-        result: ClassificationResult {
-            source_file: path.to_path_buf(),
-            candidates: vec![Candidate {
-                folder: folder.clone(),
-                score: hit.confidence,
-                score_breakdown: ScoreBreakdown {
-                    name_similarity: 0.0,
-                    centroid_similarity: None,
-                    metadata_score: 0.0,
-                    hierarchy_adjustment: 0.0,
-                },
-            }],
-            resolved_at: Tier::Heuristic,
-            needs_review: true,
-            suggested_rename: None,
-        },
-        rename: RenameProposal::Keep,
-        destination_folder: folder,
-        confidence: hit.confidence,
-        reasoning: format!("tier1 heuristic (below threshold): {}", hit.reason),
-        classification_confidence: Some(hit.confidence),
-        rename_mismatch_score: None,
-    }
-}
-
-/// Cross-modal Tier 2 for one file: if it's an image/audio file and the
+/// Cross-modal routing for one file: if it is an image/audio file and the
 /// matching backend is loaded, embed it and rank against the folders' centroids
 /// in that modality's latent space. Returns `None` (fall through to text) when
 /// the modality has no backend, the file can't be read or embedded, or no
@@ -604,36 +583,63 @@ async fn classify_modality_file(
     multimodal: MigrationMultimodal<'_>,
     profiles: &ProfileCache,
     config: &ClassifierConfig,
+    semantic_cache: &SemanticRunCache<'_>,
 ) -> Option<Verdict> {
     let mime_str = mime.unwrap_or("application/octet-stream");
-    // Bound the read: an oversized media file is left to the Tier-1 fallback
-    // rather than slurped whole into memory for embedding.
-    if tokio::fs::metadata(path).await.map_or(0, |m| m.len()) > tidyup_extract::MAX_DOCUMENT_BYTES {
-        return None;
-    }
-    let bytes = tokio::fs::read(path).await.ok()?;
     match modality {
         FileModality::Image => {
             let backend = multimodal.image?;
-            let embedding = backend.embed_image(&bytes, mime_str).await.ok()?;
-            rank_centroids(
+            let embedding = semantic_cache
+                .image_embedding(path, mime_str, backend)
+                .await
+                .ok()??;
+            let mut verdict = rank_modality_profiles(
                 path,
-                &embedding,
+                embedding.as_slice(),
                 profiles,
                 config,
+                |profile| profile.image_name_embedding.as_deref(),
                 |p| p.image_centroid.as_deref(),
                 "image",
                 backend.model_id(),
-            )
+            )?;
+            let grounded = gate_grounded_rename(
+                path,
+                embedding.as_slice(),
+                multimodal.image_concepts,
+                verdict.confidence,
+                config,
+            );
+            if !matches!(grounded.proposal, RenameProposal::Keep) {
+                verdict.result.needs_review = true;
+                verdict.result.suggested_rename = match &grounded.proposal {
+                    RenameProposal::Rename { name, .. } => Some(name.clone()),
+                    RenameProposal::Keep => None,
+                };
+            }
+            let concept_reasoning = grounded
+                .concepts
+                .iter()
+                .map(|concept| format!("{}:{:.3}", concept.label, concept.score))
+                .collect::<Vec<_>>()
+                .join(",");
+            let _ = write!(verdict.reasoning, " concepts=[{concept_reasoning}]");
+            verdict.rename = grounded.proposal;
+            verdict.rename_mismatch_score = grounded.mismatch_score;
+            Some(verdict)
         }
         FileModality::Audio => {
             let backend = multimodal.audio?;
-            let embedding = backend.embed_audio(&bytes, mime_str).await.ok()?;
-            rank_centroids(
+            let embedding = semantic_cache
+                .audio_embedding(path, mime_str, backend)
+                .await
+                .ok()??;
+            rank_modality_profiles(
                 path,
-                &embedding,
+                embedding.as_slice(),
                 profiles,
                 config,
+                |profile| profile.audio_name_embedding.as_deref(),
                 |p| p.audio_centroid.as_deref(),
                 "audio",
                 backend.model_id(),
@@ -643,34 +649,53 @@ async fn classify_modality_file(
     }
 }
 
-/// Rank leaf folders that carry a centroid in `select`'s latent space by cosine
-/// against `embedding`, returning a [`Verdict`] for the best match.
+/// Rank leaf folders using their dynamic text prototype and optional content
+/// centroid in one modality-specific latent space.
 ///
 /// `select` extracts the modality-appropriate centroid from a profile
 /// (`image_centroid` or `audio_centroid`) — `embedding` must come from the same
 /// backend, so the cosine is meaningful and never crosses latent spaces.
 /// Returns `None` when no leaf folder has a centroid in this space, so the
-/// caller falls through to the text Tier 2 path.
+/// caller falls through to the general text path.
 ///
 /// Bundle members and renames are irrelevant here: this is a loose-file
 /// placement, and image/audio renames stay on the (text) EXIF/metadata path
 /// exactly as in scan mode, so the verdict is always `RenameProposal::Keep`.
-fn rank_centroids(
+#[allow(clippy::too_many_arguments)]
+fn rank_modality_profiles(
     path: &Path,
     embedding: &[f32],
     profiles: &ProfileCache,
     config: &ClassifierConfig,
-    select: impl Fn(&FolderProfile) -> Option<&[f32]>,
+    select_name: impl Fn(&FolderProfile) -> Option<&[f32]>,
+    select_centroid: impl Fn(&FolderProfile) -> Option<&[f32]>,
     modality_label: &str,
     model_id: &str,
 ) -> Option<Verdict> {
-    let mut ranked: Vec<(PathBuf, f32)> = Vec::new();
+    let mut ranked: Vec<(PathBuf, f32, ScoreBreakdown)> = Vec::new();
     for folder in &profiles.last_scan.leaf_folders {
         if let Some(profile) = profiles.profiles.get(folder) {
-            if let Some(centroid) = select(profile) {
-                let score = cosine(embedding, centroid).max(0.0);
-                ranked.push((folder.clone(), score));
+            let name_similarity =
+                select_name(profile).map(|prototype| cosine(embedding, prototype).max(0.0));
+            let centroid_similarity =
+                select_centroid(profile).map(|centroid| cosine(embedding, centroid).max(0.0));
+            if name_similarity.is_none() && centroid_similarity.is_none() {
+                continue;
             }
+            let breakdown = ScoreBreakdown {
+                name_similarity: name_similarity.unwrap_or(0.0),
+                centroid_similarity,
+            };
+            let score = match (name_similarity, centroid_similarity) {
+                (Some(name), Some(centroid)) => config
+                    .weights
+                    .name
+                    .mul_add(name, config.weights.centroid * centroid),
+                (Some(name), None) => name,
+                (None, Some(centroid)) => centroid,
+                (None, None) => 0.0,
+            };
+            ranked.push((folder.clone(), score, breakdown));
         }
     }
     if ranked.is_empty() {
@@ -678,22 +703,17 @@ fn rank_centroids(
     }
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    let (folder, score) = ranked.first().cloned()?;
-    let gap = ranked.get(1).map_or(score, |(_, next)| score - next);
+    let (folder, score, _) = ranked.first().cloned()?;
+    let gap = ranked.get(1).map_or(score, |(_, next, _)| score - next);
     let needs_review = score < config.embedding_threshold || gap < config.ambiguity_gap;
 
     let candidates: Vec<Candidate> = ranked
         .iter()
         .take(5)
-        .map(|(f, s)| Candidate {
+        .map(|(f, s, breakdown)| Candidate {
             folder: f.clone(),
             score: *s,
-            score_breakdown: ScoreBreakdown {
-                name_similarity: 0.0,
-                centroid_similarity: Some(*s),
-                metadata_score: 0.0,
-                hierarchy_adjustment: 0.0,
-            },
+            score_breakdown: breakdown.clone(),
         })
         .collect();
 
@@ -709,16 +729,17 @@ fn rank_centroids(
         destination_folder: folder,
         confidence: score,
         reasoning: format!(
-            "tier2 {modality_label}-centroid: cos={score:.3} gap={gap:.3} model={model_id}"
+            "tier2 {modality_label}-profile: score={score:.3} gap={gap:.3} model={model_id}"
         ),
         classification_confidence: Some(score),
         rename_mismatch_score: None,
     })
 }
 
-/// Decide a file's modality from MIME + extension. Mirrors the scan pipeline's
-/// helper; kept local so migration mode doesn't depend on scan internals.
-fn file_modality(path: &Path, mime: Option<&str>) -> FileModality {
+/// Select a compatible semantic capability from the centralized MIME result.
+/// Unknown/application types use the general text/context path; no local
+/// extension table controls inference behavior.
+fn file_modality(mime: Option<&str>) -> FileModality {
     if let Some(m) = mime {
         if m.starts_with("image/") {
             return FileModality::Image;
@@ -733,24 +754,7 @@ fn file_modality(path: &Path, mime: Option<&str>) -> FileModality {
             return FileModality::Text;
         }
     }
-    let Some(ext) = path
-        .extension()
-        .and_then(|s| s.to_str())
-        .map(str::to_ascii_lowercase)
-    else {
-        return FileModality::Skip;
-    };
-    match ext.as_str() {
-        "jpg" | "jpeg" | "png" | "gif" | "bmp" | "tiff" | "tif" | "webp" | "ico" | "avif"
-        | "jxl" | "heic" | "heif" | "raw" | "cr2" | "cr3" | "nef" | "arw" | "orf" | "dng"
-        | "rw2" | "raf" => FileModality::Image,
-        "mp3" | "flac" | "m4a" | "wav" | "ogg" | "opus" | "aiff" | "aif" | "ape" | "wma"
-        | "alac" | "aac" | "mka" => FileModality::Audio,
-        "mp4" | "mov" | "mkv" | "avi" | "wmv" | "flv" | "webm" | "m4v" | "mpg" | "mpeg" => {
-            FileModality::Video
-        }
-        _ => FileModality::Text,
-    }
+    FileModality::Text
 }
 
 /// Rank every leaf profile by composite score against a content embedding.
@@ -777,19 +781,16 @@ fn rank_profiles(
 fn score_profile(
     content_embedding: &[f32],
     profile: &FolderProfile,
-    source_path: &Path,
+    _source_path: &Path,
 ) -> ScoreBreakdown {
     let name_similarity = cosine(content_embedding, &profile.name_embedding).max(0.0);
     let centroid_similarity = profile
         .content_centroid
         .as_deref()
         .map(|c| cosine(content_embedding, c).max(0.0));
-    let metadata_score = metadata_compatibility(source_path, profile);
     ScoreBreakdown {
         name_similarity,
         centroid_similarity,
-        metadata_score,
-        hierarchy_adjustment: 0.0,
     }
 }
 
@@ -801,47 +802,7 @@ fn composite(b: &ScoreBreakdown, w: &ScoreWeights) -> f32 {
     let (name_w, centroid_term) = b
         .centroid_similarity
         .map_or((w.name + w.centroid, 0.0), |c| (w.name, w.centroid * c));
-    let metadata_term = w.metadata.mul_add(b.metadata_score, centroid_term);
-    let hierarchy_term = w.hierarchy.mul_add(b.hierarchy_adjustment, metadata_term);
-    name_w.mul_add(b.name_similarity, hierarchy_term)
-}
-
-fn metadata_compatibility(source_path: &Path, profile: &FolderProfile) -> f32 {
-    let Some(ext) = source_path.extension().and_then(|s| s.to_str()) else {
-        return 0.0;
-    };
-    let dotted = format!(".{}", ext.to_ascii_lowercase());
-    if profile.metadata.dominant_extensions.contains(&dotted) {
-        1.0
-    } else if profile.metadata.extension_counts.contains_key(&dotted) {
-        0.5
-    } else {
-        0.0
-    }
-}
-
-fn route_heuristic(hit: &HeuristicMatch, profiles: &ProfileCache) -> Option<PathBuf> {
-    let label = hit
-        .taxonomy_path
-        .trim_end_matches('/')
-        .rsplit('/')
-        .next()
-        .unwrap_or(hit.taxonomy_path)
-        .to_ascii_lowercase();
-    if label.is_empty() {
-        return None;
-    }
-    profiles
-        .last_scan
-        .leaf_folders
-        .iter()
-        .find(|p| {
-            p.components()
-                .next_back()
-                .and_then(|c| c.as_os_str().to_str())
-                .is_some_and(|name| name.to_ascii_lowercase().contains(&label))
-        })
-        .cloned()
+    name_w.mul_add(b.name_similarity, centroid_term)
 }
 
 struct GatedRename {
@@ -914,7 +875,11 @@ fn find_year(s: &str) -> Option<i32> {
     crate::text_util::find_year(s)
 }
 
-fn build_proposal(source: &Path, v: &Verdict) -> ChangeProposal {
+fn build_proposal(
+    source: &Path,
+    v: &Verdict,
+    identities: &crate::indexing::SourceIdentities,
+) -> ChangeProposal {
     let final_name = match &v.rename {
         RenameProposal::Rename { name, .. } => name.clone(),
         RenameProposal::Keep => source
@@ -930,7 +895,7 @@ fn build_proposal(source: &Path, v: &Verdict) -> ChangeProposal {
     };
     ChangeProposal {
         id: Uuid::new_v4(),
-        file_id: None,
+        file_id: identities.file_id(source),
         change_type,
         original_path: source.to_path_buf(),
         proposed_path,
@@ -944,15 +909,290 @@ fn build_proposal(source: &Path, v: &Verdict) -> ChangeProposal {
         bundle_id: None,
         classification_confidence: v.classification_confidence,
         rename_mismatch_score: v.rename_mismatch_score,
-        content_hash: crate::hashing::content_hash_of(source),
+        content_hash: identities.content_hash(source),
     }
 }
 
-/// Bundle placement: embed the bundle's leaf name and pick the top-scoring
-/// profile by `name_embedding` cosine. Fall back to a taxonomy default when
-/// the profile cache is empty.
+#[allow(clippy::too_many_arguments)]
+async fn build_content_bundle_proposal(
+    bundle: &DetectedBundle,
+    identities: &crate::indexing::SourceIdentities,
+    profiles: &ProfileCache,
+    embeddings: &dyn EmbeddingBackend,
+    text_backend: Option<&dyn TextBackend>,
+    multimodal: MigrationMultimodal<'_>,
+    extractors: &[Arc<dyn ContentExtractor>],
+    config: &ClassifierConfig,
+    semantic_cache: &SemanticRunCache<'_>,
+) -> Result<BundleProposal> {
+    if profiles.last_scan.leaf_folders.is_empty() {
+        return cold_start_content_bundle(bundle, &profiles.target_root, identities);
+    }
+
+    let mut classified = Vec::with_capacity(bundle.members.len());
+    for member in &bundle.members {
+        let verdict = classify_file(
+            member,
+            profiles,
+            embeddings,
+            text_backend,
+            multimodal,
+            extractors,
+            config,
+            semantic_cache,
+        )
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no classification for {}", member.display()))?;
+        classified.push((member.clone(), verdict));
+    }
+
+    let label = bundle.target_subdir.clone().unwrap_or_else(|| {
+        bundle
+            .root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("collection")
+            .to_string()
+    });
+    let target_parent = choose_collection_target(
+        bundle,
+        &label,
+        &classified,
+        profiles,
+        embeddings,
+        text_backend,
+        config,
+    )
+    .await
+    .ok_or_else(|| anyhow::anyhow!("no semantic destination for collection {label}"))?;
+    let collection_root = target_parent.parent.join(&label);
+    let allow_renames = bundle.kind.allows_member_renames();
+
+    let mut confidence_sum = 0.0_f32;
+    let mut proposals = Vec::with_capacity(classified.len());
+    for (source, verdict) in classified {
+        confidence_sum += verdict.confidence;
+        let mut proposal = build_proposal(&source, &verdict, identities);
+        if !allow_renames {
+            proposal.change_type = ChangeType::Move;
+            proposal.proposed_name = source
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_string();
+            proposal.rename_mismatch_score = None;
+        }
+        proposal.proposed_path = collection_root.join(&proposal.proposed_name);
+        proposal.reasoning = format!("{}; {}", bundle.reasoning, proposal.reasoning);
+        if target_parent.abstained {
+            proposal.needs_review = true;
+        }
+        proposals.push(proposal);
+    }
+    uniquify_bundle_member_names(&mut proposals)?;
+
+    let count = u16::try_from(proposals.len()).unwrap_or(u16::MAX);
+    // An abstention reports zero confidence in the *placement*, matching the
+    // cold-start path. Per-member scores stay on their own proposals; averaging
+    // them into the bundle would dress up a destination the ranking rejected.
+    let confidence = if target_parent.abstained || count == 0 {
+        0.0
+    } else {
+        confidence_sum / f32::from(count)
+    };
+    let reasoning = if target_parent.abstained {
+        format!(
+            "{}; no folder cleared the placement threshold and runner-up gap, so the collection is held at the target root for review",
+            bundle.reasoning
+        )
+    } else {
+        bundle.reasoning.clone()
+    };
+    Ok(BundleProposal::new(
+        bundle.root.clone(),
+        bundle.kind.clone(),
+        target_parent.parent,
+        proposals,
+        confidence,
+        reasoning,
+    )?)
+}
+
+fn cold_start_content_bundle(
+    bundle: &DetectedBundle,
+    target_root: &Path,
+    identities: &crate::indexing::SourceIdentities,
+) -> Result<BundleProposal> {
+    let label = bundle.target_subdir.clone().unwrap_or_else(|| {
+        bundle
+            .root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("collection")
+            .to_string()
+    });
+    let collection_root = target_root.join(&label);
+    let members = bundle
+        .members
+        .iter()
+        .map(|source| {
+            let proposed_name = source
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_string();
+            ChangeProposal {
+                id: Uuid::new_v4(),
+                file_id: identities.file_id(source),
+                change_type: ChangeType::Move,
+                original_path: source.clone(),
+                proposed_path: collection_root.join(&proposed_name),
+                proposed_name,
+                confidence: 0.0,
+                reasoning: format!(
+                    "{}; cold-start fallback preserves the collection at the target root",
+                    bundle.reasoning
+                ),
+                needs_review: true,
+                status: ChangeStatus::Pending,
+                created_at: Utc::now(),
+                applied_at: None,
+                bundle_id: None,
+                classification_confidence: None,
+                rename_mismatch_score: None,
+                content_hash: identities.content_hash(source),
+            }
+        })
+        .collect();
+    Ok(BundleProposal::new(
+        bundle.root.clone(),
+        bundle.kind.clone(),
+        target_root.to_path_buf(),
+        members,
+        0.0,
+        format!(
+            "{}; no learned destination exists, so preserve this collection at the target root for review",
+            bundle.reasoning
+        ),
+    )?)
+}
+
+/// Where a semantic collection should land, and whether the hierarchy actually
+/// supported that choice.
+struct CollectionTarget {
+    parent: PathBuf,
+    /// No folder cleared both the score threshold and the runner-up gap, so
+    /// `parent` is the target root rather than a ranked destination.
+    abstained: bool,
+}
+
+async fn choose_collection_target(
+    bundle: &DetectedBundle,
+    label: &str,
+    classified: &[(PathBuf, Verdict)],
+    profiles: &ProfileCache,
+    embeddings: &dyn EmbeddingBackend,
+    text_backend: Option<&dyn TextBackend>,
+    config: &ClassifierConfig,
+) -> Option<CollectionTarget> {
+    let first = classified.first()?.1.destination_folder.clone();
+    if classified
+        .iter()
+        .all(|(_, verdict)| verdict.destination_folder == first)
+    {
+        // Unanimity is only evidence if at least one member actually cleared
+        // its own placement gate. A collection where every member was pushed
+        // to the same folder by a below-threshold score has agreement without
+        // confidence, and taking the shortcut here would route it around the
+        // abstention check below.
+        let any_member_confident = classified
+            .iter()
+            .any(|(_, verdict)| !verdict.result.needs_review);
+        if any_member_confident {
+            return Some(CollectionTarget {
+                parent: first,
+                abstained: false,
+            });
+        }
+        return Some(CollectionTarget {
+            parent: profiles.target_root.clone(),
+            abstained: true,
+        });
+    }
+
+    let filenames = classified
+        .iter()
+        .filter_map(|(path, verdict)| match &verdict.rename {
+            RenameProposal::Rename { name, .. } => Path::new(name)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(str::to_owned),
+            RenameProposal::Keep => path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(str::to_owned),
+        })
+        .map(|name| normalize_semantic_text(&name))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let query = format!(
+        "cohesive collection named {}; member artifacts: {filenames}",
+        normalize_semantic_text(label)
+    );
+    let embedding = embeddings.embed_text(&query).await.ok()?;
+    let ranked = rank_profiles(&embedding, profiles, &bundle.root, &config.weights);
+    let (mut folder, mut score, _) = ranked.first()?.clone();
+    let mut gap = ranked.get(1).map_or(score, |(_, second, _)| score - second);
+    if (score < config.embedding_threshold || gap < config.ambiguity_gap)
+        && config.enable_llm_fallback
+    {
+        if let Some(backend) = text_backend {
+            if let Ok(Some((reranked, _))) = tier3_rerank(
+                backend,
+                embeddings,
+                profiles,
+                &bundle.root,
+                &query,
+                label,
+                &config.weights,
+            )
+            .await
+            {
+                if let Some((llm_folder, llm_score, _)) = reranked.first() {
+                    if *llm_score > score {
+                        folder.clone_from(llm_folder);
+                        score = *llm_score;
+                        gap = reranked
+                            .get(1)
+                            .map_or(score, |(_, second, _)| score - *second);
+                    }
+                }
+            }
+        }
+    }
+
+    // Abstain rather than file the collection under the least-wrong folder.
+    // Migration has to move everything under the source, so abstention means
+    // the target root with mandatory review — the honest "I could not place
+    // this" — not a confident-looking destination nobody chose. The default
+    // build has no LLM, so this is the ordinary path, not an edge case.
+    if score < config.embedding_threshold || gap < config.ambiguity_gap {
+        return Some(CollectionTarget {
+            parent: profiles.target_root.clone(),
+            abstained: true,
+        });
+    }
+    Some(CollectionTarget {
+        parent: folder,
+        abstained: false,
+    })
+}
+
+/// Bundle placement: embed structural and naming evidence and pick the
+/// top-scoring learned profile. Bundle detection controls atomicity only.
 async fn build_bundle_proposal(
     bundle: &DetectedBundle,
+    identities: &crate::indexing::SourceIdentities,
     profiles: &ProfileCache,
     embeddings: &dyn EmbeddingBackend,
 ) -> Result<BundleProposal> {
@@ -963,13 +1203,14 @@ async fn build_bundle_proposal(
         .unwrap_or("bundle")
         .to_string();
 
-    let target_parent = pick_bundle_target(bundle, profiles, embeddings, &leaf_name)
-        .await
-        .unwrap_or_else(|| {
-            profiles
-                .target_root
-                .join(default_bundle_taxonomy(&bundle.kind))
-        });
+    let (target_parent, confidence, fallback) = if profiles.last_scan.leaf_folders.is_empty() {
+        (profiles.target_root.clone(), 0.0, true)
+    } else {
+        let (target, score) = pick_bundle_target(bundle, profiles, embeddings, &leaf_name)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("no semantic destination for bundle {leaf_name}"))?;
+        (target, score, false)
+    };
 
     let bundle_target_root = target_parent.join(&leaf_name);
 
@@ -984,12 +1225,12 @@ async fn build_bundle_proposal(
             .to_string();
         members.push(ChangeProposal {
             id: Uuid::new_v4(),
-            file_id: None,
+            file_id: identities.file_id(m),
             change_type: ChangeType::Move,
             original_path: m.clone(),
             proposed_path,
             proposed_name: name,
-            confidence: 0.90,
+            confidence,
             reasoning: bundle.reasoning.clone(),
             needs_review: false,
             status: ChangeStatus::Pending,
@@ -998,7 +1239,7 @@ async fn build_bundle_proposal(
             bundle_id: None,
             classification_confidence: None,
             rename_mismatch_score: None,
-            content_hash: crate::hashing::content_hash_of(m),
+            content_hash: identities.content_hash(m),
         });
     }
 
@@ -1007,8 +1248,15 @@ async fn build_bundle_proposal(
         bundle.kind.clone(),
         target_parent,
         members,
-        0.90,
-        bundle.reasoning.clone(),
+        confidence,
+        if fallback {
+            format!(
+                "{}; no learned destination exists, so preserve this bundle at the target root for review",
+                bundle.reasoning
+            )
+        } else {
+            format!("{}; semantic bundle routing", bundle.reasoning)
+        },
     )?)
 }
 
@@ -1017,12 +1265,23 @@ async fn pick_bundle_target(
     profiles: &ProfileCache,
     embeddings: &dyn EmbeddingBackend,
     leaf_name: &str,
-) -> Option<PathBuf> {
-    if profiles.last_scan.leaf_folders.is_empty() {
-        return None;
-    }
-    // Build a single description string from the bundle kind + root name.
-    let query = format!("{} {}", default_bundle_taxonomy(&bundle.kind), leaf_name);
+) -> Option<(PathBuf, f32)> {
+    // Bundle kind controls atomicity, not placement. Placement is ranked from
+    // the kind label, collection name, and member names against the learned
+    // target-folder profiles.
+    let members = bundle
+        .members
+        .iter()
+        .take(24)
+        .filter_map(|member| member.file_name().and_then(|name| name.to_str()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let query = format!(
+        "atomic collection kind {} name {} members {}",
+        bundle.kind.as_str(),
+        leaf_name,
+        members
+    );
     let query_embedding = embeddings.embed_text(&query).await.ok()?;
     let mut best: Option<(PathBuf, f32)> = None;
     for path in &profiles.last_scan.leaf_folders {
@@ -1033,23 +1292,7 @@ async fn pick_bundle_target(
             }
         }
     }
-    best.map(|(p, _)| p)
-}
-
-const fn default_bundle_taxonomy(kind: &BundleKind) -> &'static str {
-    match kind {
-        BundleKind::GitRepository
-        | BundleKind::NodeProject
-        | BundleKind::RustCrate
-        | BundleKind::PythonProject
-        | BundleKind::XcodeProject
-        | BundleKind::AndroidStudioProject => "Code/Projects",
-        BundleKind::JupyterNotebookSet => "Code/Notebooks",
-        BundleKind::PhotoBurst => "Photos/Bursts",
-        BundleKind::MusicAlbum => "Music/Albums",
-        BundleKind::DocumentSeries { .. } => "Documents/Series",
-        BundleKind::Generic => "Archives",
-    }
+    best
 }
 
 #[cfg(test)]
@@ -1064,6 +1307,7 @@ mod tests {
     use tempfile::TempDir;
     use tidyup_core::extractor::ExtractedContent;
     use tidyup_domain::migration::{FolderMetadata, FolderNode, OrganizationType, TargetScan};
+    use tidyup_domain::BundleKind;
 
     struct NullProgress;
     #[async_trait]
@@ -1158,8 +1402,10 @@ mod tests {
             name_embedding: emb,
             content_centroid: None,
             centroid_sample_count: 0,
+            image_name_embedding: None,
             image_centroid: None,
             image_centroid_sample_count: 0,
+            audio_name_embedding: None,
             audio_centroid: None,
             audio_centroid_sample_count: 0,
             metadata: make_node(path, "x", dominant).metadata,
@@ -1235,6 +1481,63 @@ mod tests {
         }
     }
 
+    fn empty_cache(target_root: &Path) -> ProfileCache {
+        ProfileCache {
+            target_root: target_root.to_path_buf(),
+            model_id: "bucket".to_string(),
+            embedding_dim: 7,
+            profiles: HashMap::new(),
+            last_scan: TargetScan {
+                root: target_root.to_path_buf(),
+                nodes: HashMap::new(),
+                leaf_folders: vec![],
+                scan_timestamp: SystemTime::now(),
+            },
+            created_at: SystemTime::now(),
+            last_updated: SystemTime::now(),
+        }
+    }
+
+    struct FailingEmbeddings;
+    #[async_trait]
+    impl EmbeddingBackend for FailingEmbeddings {
+        async fn embed_text(&self, _text: &str) -> Result<Vec<f32>> {
+            anyhow::bail!("synthetic embedding failure")
+        }
+
+        async fn embed_texts(&self, _texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            anyhow::bail!("synthetic embedding failure")
+        }
+
+        fn dimensions(&self) -> usize {
+            7
+        }
+
+        fn model_id(&self) -> &'static str {
+            "failing"
+        }
+    }
+
+    struct ConstantEmbeddings;
+    #[async_trait]
+    impl EmbeddingBackend for ConstantEmbeddings {
+        async fn embed_text(&self, _text: &str) -> Result<Vec<f32>> {
+            Ok(vec![1.0])
+        }
+
+        async fn embed_texts(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            Ok(vec![vec![1.0]; texts.len()])
+        }
+
+        fn dimensions(&self) -> usize {
+            1
+        }
+
+        fn model_id(&self) -> &'static str {
+            "constant"
+        }
+    }
+
     #[tokio::test]
     async fn loose_file_classified_into_leaf_folder() {
         let src = TempDir::new().unwrap();
@@ -1252,6 +1555,7 @@ mod tests {
 
         let out = run_migration(
             src.path(),
+            &crate::indexing::SourceIdentities::default(),
             &profiles,
             &eb,
             None,
@@ -1280,7 +1584,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn heuristic_routes_rust_source_to_code_folder() {
+    async fn semantic_ranking_routes_source_into_a_profile_leaf() {
         let src = TempDir::new().unwrap();
         let tgt = TempDir::new().unwrap();
         fs::write(src.path().join("main.rs"), b"fn main() {}").unwrap();
@@ -1291,6 +1595,7 @@ mod tests {
 
         let out = run_migration(
             src.path(),
+            &crate::indexing::SourceIdentities::default(),
             &profiles,
             &eb,
             None,
@@ -1304,8 +1609,12 @@ mod tests {
 
         assert_eq!(out.proposals.len(), 1);
         let p = &out.proposals[0];
-        assert!(p.proposed_path.starts_with(tgt.path().join("Code")));
-        assert!(p.reasoning.contains("tier1"));
+        assert!(profiles
+            .last_scan
+            .leaf_folders
+            .iter()
+            .any(|leaf| p.proposed_path.starts_with(leaf)));
+        assert!(p.reasoning.contains("tier2 composite"));
     }
 
     #[tokio::test]
@@ -1326,6 +1635,7 @@ mod tests {
 
         let out = run_migration(
             src.path(),
+            &crate::indexing::SourceIdentities::default(),
             &profiles,
             &eb,
             None,
@@ -1346,6 +1656,183 @@ mod tests {
             .iter()
             .any(|l| l == &b.target_parent));
         assert_eq!(b.members.len(), 2);
+        assert!(
+            (b.confidence - 0.90).abs() > 1e-3,
+            "migration bundle confidence must be its raw semantic cosine, not the old fixed value"
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_start_preserves_structural_bundle_at_target_root() {
+        let src = TempDir::new().unwrap();
+        let tgt = TempDir::new().unwrap();
+        fs::create_dir_all(src.path().join("myproj/src")).unwrap();
+        fs::write(
+            src.path().join("myproj/Cargo.toml"),
+            b"[package]\nname='x'\n",
+        )
+        .unwrap();
+        fs::write(src.path().join("myproj/src/main.rs"), b"fn main() {}").unwrap();
+
+        let out = run_migration(
+            src.path(),
+            &crate::indexing::SourceIdentities::default(),
+            &empty_cache(tgt.path()),
+            &BucketEmbeddings,
+            None,
+            MigrationMultimodal::default(),
+            &[],
+            &ClassifierConfig::default(),
+            &NullProgress,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.bundles.len(), 1);
+        assert!(out.unclassified.is_empty());
+        let bundle = &out.bundles[0];
+        assert_eq!(bundle.target_parent, tgt.path());
+        assert_eq!(bundle.confidence, 0.0);
+        assert!(bundle.reasoning.contains("target root for review"));
+    }
+
+    #[tokio::test]
+    async fn cold_start_preserves_semantic_collection_at_target_root() {
+        let src = TempDir::new().unwrap();
+        let tgt = TempDir::new().unwrap();
+        fs::write(
+            src.path().join("atomsnotelectrons_submission.txt"),
+            b"submission",
+        )
+        .unwrap();
+        fs::write(
+            src.path().join("atomsnotelectrons_testbench.png"),
+            b"testbench",
+        )
+        .unwrap();
+        let extractors: Vec<Arc<dyn ContentExtractor>> = vec![Arc::new(PlainExtractor)];
+
+        let out = run_migration(
+            src.path(),
+            &crate::indexing::SourceIdentities::default(),
+            &empty_cache(tgt.path()),
+            &BucketEmbeddings,
+            None,
+            MigrationMultimodal::default(),
+            &extractors,
+            &ClassifierConfig::default(),
+            &NullProgress,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.bundles.len(), 1);
+        assert!(out.unclassified.is_empty());
+        let bundle = &out.bundles[0];
+        assert!(matches!(bundle.kind, BundleKind::SemanticCollection { .. }));
+        assert_eq!(bundle.target_parent, tgt.path());
+        assert_eq!(bundle.members.len(), 2);
+        assert!(bundle
+            .members
+            .iter()
+            .all(|member| member.change_type == ChangeType::Move));
+    }
+
+    /// A populated hierarchy that nothing clears must abstain, not file the
+    /// collection under the least-wrong folder. Migration has to move every
+    /// source file, so abstention means the target root plus mandatory review.
+    /// The default build has no LLM, so this is the ordinary path.
+    #[tokio::test]
+    async fn undecidable_collection_abstains_to_the_target_root() {
+        let src = TempDir::new().unwrap();
+        let tgt = TempDir::new().unwrap();
+        fs::write(
+            src.path().join("atomsnotelectrons_submission.txt"),
+            b"submission",
+        )
+        .unwrap();
+        fs::write(
+            src.path().join("atomsnotelectrons_testbench.png"),
+            b"testbench",
+        )
+        .unwrap();
+        let extractors: Vec<Arc<dyn ContentExtractor>> = vec![Arc::new(PlainExtractor)];
+
+        // A threshold no score can reach: the hierarchy is populated and
+        // rankable, but nothing in it is a defensible destination.
+        let config = ClassifierConfig {
+            embedding_threshold: 1.1,
+            ..ClassifierConfig::default()
+        };
+        let out = run_migration(
+            src.path(),
+            &crate::indexing::SourceIdentities::default(),
+            &sample_cache(tgt.path(), &BucketEmbeddings).await,
+            &BucketEmbeddings,
+            None,
+            MigrationMultimodal::default(),
+            &extractors,
+            &config,
+            &NullProgress,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.bundles.len(), 1);
+        let bundle = &out.bundles[0];
+        assert_eq!(
+            bundle.target_parent,
+            tgt.path(),
+            "an undecidable collection belongs at the target root, not a ranked folder"
+        );
+        assert!((bundle.confidence - 0.0).abs() < f32::EPSILON);
+        assert!(bundle.reasoning.contains("held at the target root"));
+        assert!(
+            bundle.members.iter().all(|member| member.needs_review),
+            "every member of an abstained collection must be reviewed"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_bundle_proposals_return_every_member_as_unclassified() {
+        let src = TempDir::new().unwrap();
+        let tgt = TempDir::new().unwrap();
+        fs::create_dir_all(src.path().join("myproj/src")).unwrap();
+        fs::write(
+            src.path().join("myproj/Cargo.toml"),
+            b"[package]\nname='x'\n",
+        )
+        .unwrap();
+        fs::write(src.path().join("myproj/src/main.rs"), b"fn main() {}").unwrap();
+        fs::write(
+            src.path().join("atomsnotelectrons_submission.txt"),
+            b"submission",
+        )
+        .unwrap();
+        fs::write(
+            src.path().join("atomsnotelectrons_testbench.png"),
+            b"testbench",
+        )
+        .unwrap();
+        let profiles = sample_cache(tgt.path(), &BucketEmbeddings).await;
+        let extractors: Vec<Arc<dyn ContentExtractor>> = vec![Arc::new(PlainExtractor)];
+
+        let out = run_migration(
+            src.path(),
+            &crate::indexing::SourceIdentities::default(),
+            &profiles,
+            &FailingEmbeddings,
+            None,
+            MigrationMultimodal::default(),
+            &extractors,
+            &ClassifierConfig::default(),
+            &NullProgress,
+        )
+        .await
+        .unwrap();
+
+        assert!(out.bundles.is_empty());
+        assert_eq!(out.unclassified.len(), 4);
     }
 
     #[tokio::test]
@@ -1356,24 +1843,12 @@ mod tests {
 
         let eb = BucketEmbeddings;
         // Empty cache (no leaves).
-        let profiles = ProfileCache {
-            target_root: tgt.path().to_path_buf(),
-            model_id: "bucket".to_string(),
-            embedding_dim: 7,
-            profiles: HashMap::new(),
-            last_scan: TargetScan {
-                root: tgt.path().to_path_buf(),
-                nodes: HashMap::new(),
-                leaf_folders: vec![],
-                scan_timestamp: SystemTime::now(),
-            },
-            created_at: SystemTime::now(),
-            last_updated: SystemTime::now(),
-        };
+        let profiles = empty_cache(tgt.path());
         let ex: Vec<Arc<dyn ContentExtractor>> = vec![Arc::new(PlainExtractor)];
 
         let out = run_migration(
             src.path(),
+            &crate::indexing::SourceIdentities::default(),
             &profiles,
             &eb,
             None,
@@ -1386,6 +1861,29 @@ mod tests {
         .unwrap();
         assert_eq!(out.proposals.len(), 0);
         assert_eq!(out.unclassified.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ocr_rename_must_clear_filename_mismatch_gate() {
+        let metadata = serde_json::json!({
+            "ocr_text": "README.MD\nTESTBENCH\nLEADERBOARD"
+        });
+        let gated = gate_rename(
+            Path::new("/source/Screenshot.png"),
+            &metadata,
+            &[],
+            None,
+            1.0,
+            &ConstantEmbeddings,
+            Some("README.MD TESTBENCH LEADERBOARD"),
+            "Screenshot.png",
+            &ClassifierConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(gated.proposal, RenameProposal::Keep);
+        assert_eq!(gated.mismatch_score, None);
     }
 
     /// Stub `TextBackend` for Tier 3 tests. Returns a fixed
@@ -1472,6 +1970,7 @@ mod tests {
 
         let out = run_migration(
             src.path(),
+            &crate::indexing::SourceIdentities::default(),
             &profiles,
             &eb,
             Some(&llm),
@@ -1527,6 +2026,7 @@ mod tests {
 
         let out = run_migration(
             src.path(),
+            &crate::indexing::SourceIdentities::default(),
             &profiles,
             &eb,
             Some(&llm),
@@ -1564,70 +2064,32 @@ mod tests {
         let with_centroid = ScoreBreakdown {
             name_similarity: 0.5,
             centroid_similarity: Some(0.5),
-            metadata_score: 0.0,
-            hierarchy_adjustment: 0.0,
         };
         let without_centroid = ScoreBreakdown {
             name_similarity: 0.5,
             centroid_similarity: None,
-            metadata_score: 0.0,
-            hierarchy_adjustment: 0.0,
         };
         let a = composite(&with_centroid, &w);
         let b = composite(&without_centroid, &w);
-        // With centroid: 0.25*0.5 + 0.55*0.5 = 0.4
-        // Without centroid: (0.25+0.55)*0.5 = 0.4
+        // Both live weights sum to one, and the absent centroid weight moves
+        // onto the name signal.
         assert!((a - b).abs() < 1e-6, "{a} vs {b}");
     }
 
     #[test]
-    fn metadata_compatibility_boosts_dominant_extensions() {
-        let eb_emb = vec![0.0_f32; 7];
-        let profile = FolderProfile {
-            path: PathBuf::from("/tgt/Code"),
-            name_embedding: eb_emb,
-            content_centroid: None,
-            centroid_sample_count: 0,
-            image_centroid: None,
-            image_centroid_sample_count: 0,
-            audio_centroid: None,
-            audio_centroid_sample_count: 0,
-            metadata: make_node(Path::new("/tgt/Code"), "Code", &[".rs"]).metadata,
-            organization_type: OrganizationType::Semantic,
-            profile_confidence: 1.0,
-            last_updated: SystemTime::now(),
-        };
-        assert_eq!(metadata_compatibility(Path::new("main.rs"), &profile), 1.0,);
-        // Non-dominant but present.
-        assert_eq!(metadata_compatibility(Path::new("main.txt"), &profile), 0.0,);
-    }
-
-    #[test]
-    fn route_heuristic_matches_by_label() {
-        let eb = BucketEmbeddings;
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let tgt = TempDir::new().unwrap();
-        let profiles = rt.block_on(sample_cache(tgt.path(), &eb));
-        let hit = HeuristicMatch {
-            taxonomy_path: "Code/",
-            confidence: 0.9,
-            reason: "rust source",
-        };
-        let routed = route_heuristic(&hit, &profiles).unwrap();
-        assert_eq!(routed, tgt.path().join("Code"));
-    }
-
-    #[test]
-    fn default_bundle_taxonomy_mapping() {
-        assert_eq!(
-            default_bundle_taxonomy(&BundleKind::RustCrate),
-            "Code/Projects"
+    fn composite_ceiling_can_clear_default_rename_gate() {
+        let ceiling = composite(
+            &ScoreBreakdown {
+                name_similarity: 1.0,
+                centroid_similarity: Some(1.0),
+            },
+            &ScoreWeights::default(),
         );
-        assert_eq!(
-            default_bundle_taxonomy(&BundleKind::PhotoBurst),
-            "Photos/Bursts"
+        assert!(
+            ceiling >= tidyup_domain::RenameConfig::default().min_classification_confidence,
+            "composite ceiling {ceiling} must reach the rename confidence gate",
         );
-        assert_eq!(default_bundle_taxonomy(&BundleKind::Generic), "Archives");
+        assert!((ceiling - 1.0).abs() < f32::EPSILON);
     }
 
     // -----------------------------------------------------------------------
@@ -1658,6 +2120,39 @@ mod tests {
         }
     }
 
+    struct LabelImageBackend;
+
+    #[async_trait]
+    impl ImageEmbeddingBackend for LabelImageBackend {
+        async fn embed_image(&self, _bytes: &[u8], _mime: &str) -> Result<Vec<f32>> {
+            Ok(vec![1.0, 0.0])
+        }
+
+        async fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
+            if text.to_ascii_lowercase().contains("cats") {
+                Ok(vec![1.0, 0.0])
+            } else {
+                Ok(vec![0.0, 1.0])
+            }
+        }
+
+        async fn embed_texts(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            let mut vectors = Vec::with_capacity(texts.len());
+            for text in texts {
+                vectors.push(self.embed_text(text).await?);
+            }
+            Ok(vectors)
+        }
+
+        fn dimensions(&self) -> usize {
+            2
+        }
+
+        fn model_id(&self) -> &'static str {
+            "label-image"
+        }
+    }
+
     fn bucket4(bytes: &[u8]) -> Vec<f32> {
         let mut v = vec![0.0_f32; 4];
         for (i, b) in bytes.iter().enumerate() {
@@ -1670,8 +2165,48 @@ mod tests {
         v
     }
 
+    #[tokio::test]
+    async fn empty_named_folder_routes_through_dynamic_image_prototype() {
+        use crate::profiler::{build_profile_cache_multimodal, scan_target, MultimodalProfilers};
+
+        let target = TempDir::new().unwrap();
+        let cats = target.path().join("Photos/Cats");
+        let invoices = target.path().join("Finance/Invoices");
+        fs::create_dir_all(&cats).unwrap();
+        fs::create_dir_all(&invoices).unwrap();
+        let scan = scan_target(target.path()).unwrap();
+        let backend = LabelImageBackend;
+        let profiles = build_profile_cache_multimodal(
+            &scan,
+            &BucketEmbeddings,
+            MultimodalProfilers {
+                image: Some(&backend),
+                audio: None,
+                extractors: &[],
+                artifact_store: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let verdict = rank_modality_profiles(
+            Path::new("/source/image_2348985fg.png"),
+            &[1.0, 0.0],
+            &profiles,
+            &ClassifierConfig::default(),
+            |profile| profile.image_name_embedding.as_deref(),
+            |profile| profile.image_centroid.as_deref(),
+            "image",
+            backend.model_id(),
+        )
+        .unwrap();
+
+        assert_eq!(verdict.destination_folder, cats);
+        assert!(verdict.reasoning.contains("image-profile"));
+    }
+
     /// Two folders, one with an image centroid: an image source file matching
-    /// that folder's images routes there via the image-centroid path, and the
+    /// that folder's images routes there via matching-space semantic evidence, and the
     /// reasoning records it came from the cross-modal tier — not text.
     #[tokio::test]
     async fn image_source_routes_against_image_centroid() {
@@ -1698,6 +2233,7 @@ mod tests {
                 image: Some(&img),
                 audio: None,
                 extractors: &[],
+                artifact_store: None,
             },
         )
         .await
@@ -1724,19 +2260,21 @@ mod tests {
 
         let ex: Vec<Arc<dyn ContentExtractor>> = vec![];
         let cfg = ClassifierConfig {
-            heuristic_threshold: 0.99, // force Tier 1 to miss
             embedding_threshold: 0.0,
             ambiguity_gap: 0.0,
             ..ClassifierConfig::default()
         };
         let out = run_migration(
             src.path(),
+            &crate::indexing::SourceIdentities::default(),
             &profiles,
             &eb,
             None,
             MigrationMultimodal {
                 image: Some(&img),
                 audio: None,
+                image_concepts: &[],
+                artifact_store: None,
             },
             &ex,
             &cfg,
@@ -1748,8 +2286,8 @@ mod tests {
         assert_eq!(out.proposals.len(), 1);
         let p = &out.proposals[0];
         assert!(
-            p.reasoning.contains("tier2 image-centroid"),
-            "expected image-centroid routing, got: {}",
+            p.reasoning.contains("tier2 image-profile"),
+            "expected image-profile routing, got: {}",
             p.reasoning,
         );
         assert!(
@@ -1760,12 +2298,8 @@ mod tests {
         assert_eq!(out.classifications[0].resolved_at, Tier::Embedding);
     }
 
-    /// WP-7 regression signal (migration mode): even when the target has a
-    /// `Photos/` folder — whose name the Tier-1 `route_heuristic` matches on the
-    /// "photos" label — an image source under the SHIPPED default threshold
-    /// (0.60) must still route via the image centroid because the `SigLIP`
-    /// backend is loaded. Before the fix, the name match short-circuited to
-    /// Tier 1.
+    /// Regression signal (migration mode): a recognized image routes through
+    /// the image centroid whenever that semantic backend is available.
     #[tokio::test]
     async fn image_reaches_centroid_at_default_threshold_when_backend_present() {
         use crate::profiler::{build_profile_cache_multimodal, scan_target, MultimodalProfilers};
@@ -1787,6 +2321,7 @@ mod tests {
                 image: Some(&img),
                 audio: None,
                 extractors: &[],
+                artifact_store: None,
             },
         )
         .await
@@ -1796,19 +2331,21 @@ mod tests {
         fs::write(src.path().join("vacation.png"), &png).unwrap();
         let ex: Vec<Arc<dyn ContentExtractor>> = vec![];
         let cfg = ClassifierConfig {
-            heuristic_threshold: 0.6, // shipped default — Tier-1 route_heuristic("photos") WOULD match Photos/
             embedding_threshold: 0.0,
             ambiguity_gap: 0.0,
             ..ClassifierConfig::default()
         };
         let out = run_migration(
             src.path(),
+            &crate::indexing::SourceIdentities::default(),
             &profiles,
             &eb,
             None,
             MigrationMultimodal {
                 image: Some(&img),
                 audio: None,
+                image_concepts: &[],
+                artifact_store: None,
             },
             &ex,
             &cfg,
@@ -1819,8 +2356,8 @@ mod tests {
 
         assert_eq!(out.proposals.len(), 1);
         assert!(
-            out.proposals[0].reasoning.contains("tier2 image-centroid"),
-            "at the default threshold the image must reach the centroid path, not Tier 1; got: {}",
+            out.proposals[0].reasoning.contains("tier2 image-profile"),
+            "the image must reach the profile path; got: {}",
             out.proposals[0].reasoning,
         );
         assert_eq!(out.classifications[0].resolved_at, Tier::Embedding);
@@ -1843,24 +2380,25 @@ mod tests {
         fs::write(src.path().join("photo.png"), make_png_bytes()).unwrap();
 
         let img = BucketImageBackend;
-        // No extractor → real PNG MIME drives modality routing, and there's no
-        // text to fall back on. Force Tier 1 to miss so the test exercises the
-        // modality fall-through, not heuristic image-extension routing.
+        // No extractor means real PNG MIME drives modality routing and there is
+        // no text evidence when the image backend has no matching centroid.
         let ex: Vec<Arc<dyn ContentExtractor>> = vec![];
         let cfg = ClassifierConfig {
-            heuristic_threshold: 1.01, // unreachable → Tier 1 never resolves
             embedding_threshold: 0.0,
             ambiguity_gap: 0.0,
             ..ClassifierConfig::default()
         };
         let out = run_migration(
             src.path(),
+            &crate::indexing::SourceIdentities::default(),
             &profiles,
             &eb,
             None,
             MigrationMultimodal {
                 image: Some(&img),
                 audio: None,
+                image_concepts: &[],
+                artifact_store: None,
             },
             &ex,
             &cfg,
@@ -1870,10 +2408,9 @@ mod tests {
         .unwrap();
 
         // No image centroid to match → the image-centroid branch returns None
-        // and the file falls through to the text path. Crucially it is NOT
-        // placed via the image tier: the only signal left is the filename
-        // heuristic (a text-space, name-based fallback), never a cross-space
-        // cosine of the image embedding against a text `name_embedding`.
+        // and the file falls through to generalized text-space semantic
+        // evidence. It must never compare an image embedding with a text-space
+        // folder vector.
         assert_eq!(out.proposals.len(), 1);
         let p = &out.proposals[0];
         assert!(
@@ -1881,11 +2418,7 @@ mod tests {
             "must not route via the image tier when no image centroid exists, got: {}",
             p.reasoning,
         );
-        assert!(
-            p.reasoning.contains("tier1 heuristic"),
-            "fall-through should be the text-space heuristic, got: {}",
-            p.reasoning,
-        );
+        assert!(p.reasoning.contains("tier2 composite"));
     }
 
     /// A minimal valid PNG so `tidyup_extract::mime::detect` identifies the

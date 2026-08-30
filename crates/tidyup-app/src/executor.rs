@@ -26,11 +26,22 @@ use anyhow::{anyhow, Context};
 use tidyup_core::frontend::{Level, ProgressItem, ProgressReporter, ReviewHandler};
 use tidyup_core::storage::{BackupStore, ChangeLog};
 use tidyup_core::Result;
-use tidyup_domain::{BundleProposal, ChangeProposal, FileId, IndexedFile, Phase, ReviewDecision};
+use tidyup_domain::{
+    BundleKind, BundleProposal, ChangeProposal, ChangeType, FileId, IndexedFile, Phase,
+    ReviewDecision,
+};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
-/// Summary of what the executor did during an apply pass.
+/// Minimum raw semantic cosine for non-interactive approval of opaque
+/// structural bundles. Soft/file-set collections remain review-only until
+/// their action-specific confidence is calibrated.
+pub const DEFAULT_BUNDLE_MIN_CONFIDENCE: f32 = 0.50;
+
+/// Summary of one apply pass.
+///
+/// During a dry-run, successful previews count as applied dispositions even
+/// though this executor leaves the filesystem and persistence layers untouched.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ApplyReport {
     pub applied: usize,
@@ -153,7 +164,7 @@ pub async fn apply_loose_decisions(
 /// stays pending).
 pub async fn apply_bundles(
     bundles: &[BundleProposal],
-    auto_apply: &[Uuid],
+    approved: &[BundleProposal],
     deps: &ExecutorDeps<'_>,
     dry_run: bool,
 ) -> Result<ApplyReport> {
@@ -161,22 +172,42 @@ pub async fn apply_bundles(
     if bundles.is_empty() {
         return Ok(report);
     }
-    for bundle in bundles {
-        if !auto_apply.contains(&bundle.id) {
+    let approved_by_id: HashMap<Uuid, &BundleProposal> =
+        approved.iter().map(|bundle| (bundle.id, bundle)).collect();
+    for original in bundles {
+        let Some(reviewed) = approved_by_id.get(&original.id).copied() else {
             report.bundles_skipped = report.bundles_skipped.saturating_add(1);
             continue;
-        }
+        };
+        let bundle = match reconcile_reviewed_bundle(original, reviewed) {
+            Ok(bundle) => bundle,
+            Err(e) => {
+                report.bundles_failed = report.bundles_failed.saturating_add(1);
+                deps.progress
+                    .message(
+                        Level::Warn,
+                        &format!(
+                            "bundle review rejected for {}: {e}",
+                            original.root.display()
+                        ),
+                    )
+                    .await;
+                continue;
+            }
+        };
         // Two atomic strategies: directory bundles (code projects, etc.) move by
         // a single root rename; file-set bundles (photo bursts, music albums,
         // document series) are clustered loose siblings with no shared root, so
         // each member moves individually with all-or-nothing rollback.
         let result = if bundle.kind.moves_as_file_set() {
-            apply_file_set_bundle(bundle, deps, dry_run).await
+            apply_file_set_bundle(&bundle, deps, dry_run).await
         } else {
-            apply_bundle_atomic(bundle, deps, dry_run).await
+            apply_bundle_atomic(&bundle, deps, dry_run).await
         };
         match result {
-            Ok(()) => report.bundles_applied = report.bundles_applied.saturating_add(1),
+            Ok(()) => {
+                report.bundles_applied = report.bundles_applied.saturating_add(1);
+            }
             Err(e) => {
                 report.bundles_failed = report.bundles_failed.saturating_add(1);
                 deps.progress
@@ -189,6 +220,207 @@ pub async fn apply_bundles(
         }
     }
     Ok(report)
+}
+
+/// Reconcile a frontend-returned bundle with the persisted proposal.
+///
+/// A semantic-collection label and its member basenames are editable. Every
+/// identity, source, hash, score, status, and destination-parent field remains
+/// authoritative from `original`; structural bundles have no editable fields.
+/// The returned aggregate is rebuilt in original member order so a frontend
+/// cannot add, drop, substitute, or reorder execution inputs.
+fn reconcile_reviewed_bundle(
+    original: &BundleProposal,
+    reviewed: &BundleProposal,
+) -> Result<BundleProposal> {
+    validate_immutable_bundle_fields(original, reviewed)?;
+
+    let reviewed_label = match (&original.kind, &reviewed.kind) {
+        (BundleKind::SemanticCollection { .. }, BundleKind::SemanticCollection { label }) => {
+            validate_path_component(label, "collection label")?;
+            Some(label.as_str())
+        }
+        (original_kind, reviewed_kind) if original_kind == reviewed_kind => None,
+        _ => {
+            return Err(anyhow!(
+                "frontend changed immutable bundle kind for {}",
+                original.id
+            ));
+        }
+    };
+
+    if reviewed.members.len() != original.members.len() {
+        return Err(anyhow!(
+            "frontend changed bundle member count for {} (expected {}, received {})",
+            original.id,
+            original.members.len(),
+            reviewed.members.len()
+        ));
+    }
+    let reviewed_by_id: HashMap<Uuid, &ChangeProposal> = reviewed
+        .members
+        .iter()
+        .map(|member| (member.id, member))
+        .collect();
+    if reviewed_by_id.len() != reviewed.members.len() {
+        return Err(anyhow!(
+            "frontend returned duplicate member ids for bundle {}",
+            original.id
+        ));
+    }
+
+    let mut reconciled = original.clone();
+    reconciled.kind = reviewed.kind.clone();
+    let mut members = Vec::with_capacity(original.members.len());
+    for original_member in &original.members {
+        let reviewed_member = reviewed_by_id
+            .get(&original_member.id)
+            .copied()
+            .ok_or_else(|| {
+                anyhow!(
+                    "frontend replaced or removed member {} from bundle {}",
+                    original_member.id,
+                    original.id
+                )
+            })?;
+        members.push(reconcile_reviewed_member(
+            original_member,
+            reviewed_member,
+            original,
+            reviewed_label,
+        )?);
+    }
+    reconciled.members = members;
+    Ok(reconciled)
+}
+
+fn validate_immutable_bundle_fields(
+    original: &BundleProposal,
+    reviewed: &BundleProposal,
+) -> Result<()> {
+    if reviewed.id != original.id
+        || reviewed.root != original.root
+        || reviewed.target_parent != original.target_parent
+        || reviewed.confidence.to_bits() != original.confidence.to_bits()
+        || reviewed.reasoning != original.reasoning
+        || reviewed.status != original.status
+        || reviewed.created_at != original.created_at
+        || reviewed.applied_at != original.applied_at
+    {
+        return Err(anyhow!(
+            "frontend changed immutable bundle fields for {}",
+            original.id
+        ));
+    }
+    Ok(())
+}
+
+fn reconcile_reviewed_member(
+    original_member: &ChangeProposal,
+    reviewed_member: &ChangeProposal,
+    original_bundle: &BundleProposal,
+    reviewed_label: Option<&str>,
+) -> Result<ChangeProposal> {
+    validate_immutable_member_fields(original_member, reviewed_member, original_bundle.id)?;
+    let Some(label) = reviewed_label else {
+        if reviewed_member.change_type != original_member.change_type
+            || reviewed_member.proposed_name != original_member.proposed_name
+            || reviewed_member.proposed_path != original_member.proposed_path
+        {
+            return Err(anyhow!(
+                "frontend edited a structural bundle member in bundle {}",
+                original_bundle.id
+            ));
+        }
+        return Ok(original_member.clone());
+    };
+
+    validate_path_component(&reviewed_member.proposed_name, "member filename")?;
+    let expected_path = original_bundle
+        .target_parent
+        .join(label)
+        .join(&reviewed_member.proposed_name);
+    if !reviewed_member
+        .proposed_path
+        .starts_with(&original_bundle.target_parent)
+    {
+        return Err(anyhow!(
+            "reviewed member target escapes bundle parent: {}",
+            reviewed_member.proposed_path.display()
+        ));
+    }
+    if reviewed_member.proposed_path != expected_path {
+        return Err(anyhow!(
+            "reviewed member target must be collection label plus filename: expected {}, received {}",
+            expected_path.display(),
+            reviewed_member.proposed_path.display()
+        ));
+    }
+    let original_name = original_member
+        .original_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let expected_change = if original_name == reviewed_member.proposed_name {
+        ChangeType::Move
+    } else {
+        ChangeType::RenameAndMove
+    };
+    if reviewed_member.change_type != expected_change {
+        return Err(anyhow!(
+            "reviewed member change type does not match its edited filename"
+        ));
+    }
+
+    let mut member = original_member.clone();
+    member.change_type = expected_change;
+    member
+        .proposed_name
+        .clone_from(&reviewed_member.proposed_name);
+    member
+        .proposed_path
+        .clone_from(&reviewed_member.proposed_path);
+    Ok(member)
+}
+
+fn validate_immutable_member_fields(
+    original: &ChangeProposal,
+    reviewed: &ChangeProposal,
+    bundle_id: Uuid,
+) -> Result<()> {
+    if reviewed.id != original.id
+        || reviewed.file_id != original.file_id
+        || reviewed.original_path != original.original_path
+        || reviewed.confidence.to_bits() != original.confidence.to_bits()
+        || reviewed.reasoning != original.reasoning
+        || reviewed.needs_review != original.needs_review
+        || reviewed.status != original.status
+        || reviewed.created_at != original.created_at
+        || reviewed.applied_at != original.applied_at
+        || reviewed.bundle_id != original.bundle_id
+        || reviewed.classification_confidence.map(f32::to_bits)
+            != original.classification_confidence.map(f32::to_bits)
+        || reviewed.rename_mismatch_score.map(f32::to_bits)
+            != original.rename_mismatch_score.map(f32::to_bits)
+        || reviewed.content_hash != original.content_hash
+    {
+        return Err(anyhow!(
+            "frontend changed immutable fields for member {} in bundle {bundle_id}",
+            original.id
+        ));
+    }
+    Ok(())
+}
+
+fn validate_path_component(value: &str, field: &str) -> Result<()> {
+    let path = Path::new(value);
+    if value.trim().is_empty()
+        || path.file_name().and_then(|name| name.to_str()) != Some(value)
+        || path.components().count() != 1
+    {
+        return Err(anyhow!("{field} must be one non-empty path component"));
+    }
+    Ok(())
 }
 
 async fn apply_single(
@@ -639,44 +871,179 @@ fn indexed_stub(source: &Path, file_id: Option<FileId>) -> anyhow::Result<Indexe
 
 /// Threshold-only bundle selection used on the `--yes` path.
 ///
-/// - `auto_approve_all = true` (i.e. `--yes`): approve bundles with confidence ≥
-///   `min_confidence`; skip the rest. This mirrors how `--yes` auto-approves
-///   loose moves above a confidence threshold.
+/// - `auto_approve_all = true` (i.e. `--yes`): approve recognized opaque
+///   structural bundles with confidence ≥ `min_confidence`; skip soft/file-set
+///   collections and the rest. This precision-first policy remains until
+///   action-specific calibration establishes a safe collection threshold.
 /// - `auto_approve_all = false`: approve nothing. Callers that want interactive
 ///   per-bundle review go through [`select_bundle_decisions`] instead.
 ///
 /// Bundles are atomic aggregates, so the decision is binary per bundle — there
 /// is no per-member selection and no `Override` (members carry their own paths
-/// and never receive rename proposals).
+/// and are never selected independently). Bundles containing member renames
+/// require interactive review and are excluded from this path. Soft/file-set
+/// collections are held because their raw semantic confidence is not calibrated
+/// for unattended application. The legacy `Generic` kind is also held if read
+/// from persisted data; current scans do not create generic directory envelopes.
 #[must_use]
 pub fn select_auto_applied_bundles(
     bundles: &[BundleProposal],
     auto_approve_all: bool,
     min_confidence: f32,
-) -> Vec<Uuid> {
+) -> Vec<BundleProposal> {
     if !auto_approve_all {
         return Vec::new();
     }
     bundles
         .iter()
-        .filter(|b| b.confidence >= min_confidence)
-        .map(|b| b.id)
+        .filter(|b| {
+            !b.kind.moves_as_file_set()
+                && !matches!(&b.kind, BundleKind::Generic)
+                && b.confidence >= min_confidence
+                && !b.members.iter().any(|member| {
+                    matches!(
+                        member.change_type,
+                        ChangeType::Rename | ChangeType::RenameAndMove
+                    )
+                })
+        })
+        .cloned()
+        .collect()
+}
+
+/// Validate selected destinations before any filesystem mutation.
+///
+/// Paths are folded conservatively for case-insensitive filesystems; this may
+/// hold a proposal that would be distinct on a case-sensitive volume, but it
+/// can never permit an overwrite on the user's default macOS volume.
+///
+/// Existing parent directories are allowed, while an existing final target is
+/// rejected. Bundle directory destinations reserve their root once; file-set
+/// collections reserve each member target.
+pub fn validate_destination_ledger(
+    proposals: &[ChangeProposal],
+    decisions: &[ReviewDecision],
+    approved_bundles: &[BundleProposal],
+) -> Result<()> {
+    let by_id: HashMap<Uuid, &ChangeProposal> = proposals.iter().map(|p| (p.id, p)).collect();
+    let mut reserved: Vec<(Vec<String>, String)> = Vec::new();
+
+    for decision in decisions {
+        let (id, target, source) = match decision {
+            ReviewDecision::Approve(id) => {
+                let Some(proposal) = by_id.get(id) else {
+                    continue;
+                };
+                (
+                    *id,
+                    proposal.proposed_path.as_path(),
+                    proposal.original_path.as_path(),
+                )
+            }
+            ReviewDecision::Override {
+                proposal_id,
+                new_target,
+            } => {
+                let Some(proposal) = by_id.get(proposal_id) else {
+                    continue;
+                };
+                (
+                    *proposal_id,
+                    new_target.as_path(),
+                    proposal.original_path.as_path(),
+                )
+            }
+            ReviewDecision::Reject(_) => continue,
+        };
+        reserve_destination(&mut reserved, id, target, source)?;
+    }
+
+    for bundle in approved_bundles {
+        if bundle.kind.moves_as_file_set() {
+            for member in &bundle.members {
+                reserve_destination(
+                    &mut reserved,
+                    member.id,
+                    &member.proposed_path,
+                    &member.original_path,
+                )?;
+            }
+        } else {
+            let leaf = bundle
+                .root
+                .file_name()
+                .ok_or_else(|| anyhow!("bundle root has no filename: {}", bundle.root.display()))?;
+            reserve_destination(
+                &mut reserved,
+                bundle.id,
+                &bundle.target_parent.join(leaf),
+                &bundle.root,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn reserve_destination(
+    reserved: &mut Vec<(Vec<String>, String)>,
+    id: Uuid,
+    target: &Path,
+    source: &Path,
+) -> Result<()> {
+    let key = normalized_destination(target);
+    for (other_key, other) in reserved.iter() {
+        let overlap =
+            key == *other_key || key.starts_with(other_key) || other_key.starts_with(&key);
+        if overlap {
+            return Err(anyhow!(
+                "approved operations have overlapping destinations at {} ({} and {}); refusing to apply",
+                target.display(),
+                other,
+                id,
+            ));
+        }
+    }
+    // A target that exists *because it is the source* is a no-op, not a
+    // collision. Scan reorganizes in place, so an override back to the file's
+    // current location must not abort the whole plan; the destination is still
+    // reserved so nothing else can claim it.
+    if key != normalized_destination(source) && target.exists() {
+        return Err(anyhow!(
+            "approved operation targets an existing path {}; refusing to overwrite",
+            target.display()
+        ));
+    }
+    reserved.push((key, id.to_string()));
+    Ok(())
+}
+
+fn normalized_destination(path: &Path) -> Vec<String> {
+    // Component-wise comparison catches ancestor/descendant conflicts without
+    // confusing names such as `foo` and `foobar`. Lower-casing is conservative
+    // for case-insensitive macOS/Windows volumes. Unicode normalization is not
+    // performed here, so canonically equivalent decomposed/composed spellings
+    // remain a known limitation and are still subject to the exact filesystem
+    // guard at apply time.
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy().to_lowercase())
         .collect()
 }
 
 /// Decide which bundles to apply, honouring both the `--yes` threshold path and
 /// interactive per-bundle review.
 ///
-/// - `auto_approve_all = true` (`--yes`): non-interactive — approve bundles
-///   clearing `min_confidence` via [`select_auto_applied_bundles`]. The bundle
-///   review handler is not consulted, consistent with `--yes` skipping prompts.
+/// - `auto_approve_all = true` (`--yes`): non-interactive — approve recognized
+///   opaque structural bundles clearing `min_confidence` via
+///   [`select_auto_applied_bundles`]. Soft/file-set collections remain pending
+///   until calibrated and explicitly reviewed.
 /// - `auto_approve_all = false`: delegate to [`ReviewHandler::review_bundles`].
-///   The CLI's interactive handler prompts per bundle; the default trait impl
-///   (UI today, test stubs) approves nothing, so every bundle stays pending —
-///   exactly the pre-bundle-review behaviour.
+///   The CLI prompts per bundle and the desktop exposes bundle decisions in its
+///   complete-plan surface. A frontend that relies on the default trait method
+///   approves nothing, so its bundles stay pending.
 ///
-/// Returns the ids the user (or threshold) approved. Renames are never involved:
-/// bundle members move as-is, so there is nothing to surface for rename review.
+/// Returns the proposals the user (or threshold) approved. The threshold path
+/// applies only recognized opaque structural bundles; any generic, soft, or
+/// rename-bearing bundle remains pending until a frontend reviews it explicitly.
 ///
 /// # Errors
 /// Propagates errors from the review handler.
@@ -685,7 +1052,7 @@ pub async fn select_bundle_decisions(
     auto_approve_all: bool,
     min_confidence: f32,
     review: &dyn ReviewHandler,
-) -> Result<Vec<Uuid>> {
+) -> Result<Vec<BundleProposal>> {
     if bundles.is_empty() {
         return Ok(Vec::new());
     }
@@ -705,7 +1072,7 @@ mod tests {
     use tempfile::TempDir;
     use tidyup_core::frontend::Level;
     use tidyup_core::Result as CoreResult;
-    use tidyup_domain::{ChangeStatus, ChangeType};
+    use tidyup_domain::ChangeStatus;
 
     #[test]
     fn copy_verify_delete_relocates_file_and_removes_original() {
@@ -996,7 +1363,7 @@ mod tests {
         let report = apply_loose_decisions(&[proposal], &decisions, &deps, true)
             .await
             .unwrap();
-        assert_eq!(report.applied, 1);
+        assert_eq!(report.applied, 1, "dry-run reports what would apply");
         assert!(src.exists(), "dry-run must not touch source");
         assert!(!dst.exists(), "dry-run must not touch destination");
     }
@@ -1146,35 +1513,72 @@ mod tests {
 
     #[tokio::test]
     async fn select_auto_applied_bundles_requires_yes_and_threshold() {
-        let low = BundleProposal {
-            id: Uuid::new_v4(),
-            root: PathBuf::from("/a"),
-            kind: tidyup_domain::BundleKind::Generic,
-            target_parent: PathBuf::from("/target"),
-            members: vec![],
-            confidence: 0.3,
-            reasoning: "t".into(),
-            status: ChangeStatus::Pending,
-            created_at: chrono::Utc::now(),
-            applied_at: None,
-        };
-        let high = BundleProposal {
-            confidence: 0.9,
+        let low = sample_bundle(0.3);
+        let typical_raw_cosine = BundleProposal {
+            confidence: 0.55,
             id: Uuid::new_v4(),
             ..low.clone()
         };
-        let bundles = vec![low, high.clone()];
+        let bundles = vec![low, typical_raw_cosine.clone()];
 
-        assert_eq!(select_auto_applied_bundles(&bundles, false, 0.5).len(), 0);
-        let ids = select_auto_applied_bundles(&bundles, true, 0.5);
-        assert_eq!(ids, vec![high.id]);
+        assert_eq!(
+            select_auto_applied_bundles(&bundles, false, DEFAULT_BUNDLE_MIN_CONFIDENCE).len(),
+            0
+        );
+        let ids = select_auto_applied_bundles(&bundles, true, DEFAULT_BUNDLE_MIN_CONFIDENCE);
+        assert_eq!(
+            ids.iter().map(|bundle| bundle.id).collect::<Vec<_>>(),
+            vec![typical_raw_cosine.id],
+            "a structural bundle clears the configured raw-cosine threshold",
+        );
+    }
+
+    #[test]
+    fn soft_and_generic_bundles_require_explicit_review() {
+        let mut semantic = sample_bundle(0.99);
+        semantic.kind = BundleKind::SemanticCollection {
+            label: "example".to_string(),
+        };
+        let mut photo_burst = sample_bundle(0.99);
+        photo_burst.kind = BundleKind::PhotoBurst;
+        let mut generic = sample_bundle(0.99);
+        generic.kind = BundleKind::Generic;
+
+        assert!(
+            select_auto_applied_bundles(&[semantic, photo_burst, generic], true, 0.0).is_empty()
+        );
+
+        let structural = sample_bundle(0.99);
+        assert_eq!(
+            select_auto_applied_bundles(std::slice::from_ref(&structural), true, 0.50)
+                .iter()
+                .map(|bundle| bundle.id)
+                .collect::<Vec<_>>(),
+            vec![structural.id],
+            "recognized opaque structural bundles remain eligible after clearing the threshold",
+        );
+    }
+
+    #[test]
+    fn select_auto_applied_bundles_holds_member_renames() {
+        let mut renamed = sample_bundle(0.95);
+        let mut member = sample_proposal(
+            PathBuf::from("/a/screenshot.png"),
+            Path::new("/target/project_homepage.png"),
+        );
+        member.change_type = ChangeType::RenameAndMove;
+        member.proposed_name = "project_homepage.png".to_string();
+        member.bundle_id = Some(renamed.id);
+        renamed.members.push(member);
+
+        assert!(select_auto_applied_bundles(&[renamed], true, 0.50).is_empty());
     }
 
     fn sample_bundle(confidence: f32) -> BundleProposal {
         BundleProposal {
             id: Uuid::new_v4(),
             root: PathBuf::from("/a"),
-            kind: tidyup_domain::BundleKind::Generic,
+            kind: BundleKind::RustCrate,
             target_parent: PathBuf::from("/target"),
             members: vec![],
             confidence,
@@ -1196,12 +1600,18 @@ mod tests {
         async fn review(&self, _p: Vec<ChangeProposal>) -> CoreResult<Vec<ReviewDecision>> {
             Ok(Vec::new())
         }
-        async fn review_bundles(&self, bundles: Vec<BundleProposal>) -> CoreResult<Vec<Uuid>> {
+        async fn review_bundles(
+            &self,
+            bundles: Vec<BundleProposal>,
+        ) -> CoreResult<Vec<BundleProposal>> {
             self.seen
                 .lock()
                 .unwrap()
                 .extend(bundles.iter().map(|b| b.id));
-            Ok(self.approve.clone())
+            Ok(bundles
+                .into_iter()
+                .filter(|bundle| self.approve.contains(&bundle.id))
+                .collect())
         }
     }
 
@@ -1221,7 +1631,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            ids,
+            ids.iter().map(|bundle| bundle.id).collect::<Vec<_>>(),
             vec![high.id],
             "only the high-confidence bundle clears the threshold"
         );
@@ -1229,6 +1639,15 @@ mod tests {
             reviewer.seen.lock().unwrap().is_empty(),
             "review_bundles must not be called on the --yes path",
         );
+    }
+
+    #[test]
+    fn generic_envelopes_require_explicit_review() {
+        let generic = BundleProposal {
+            kind: BundleKind::Generic,
+            ..sample_bundle(0.99)
+        };
+        assert!(select_auto_applied_bundles(&[generic], true, 0.0).is_empty());
     }
 
     #[tokio::test]
@@ -1247,7 +1666,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(ids, vec![a.id]);
+        assert_eq!(
+            ids.iter().map(|bundle| bundle.id).collect::<Vec<_>>(),
+            vec![a.id]
+        );
         assert_eq!(
             reviewer.seen.lock().unwrap().len(),
             2,
@@ -1292,7 +1714,7 @@ mod tests {
     fn file_set_bundle(members: Vec<ChangeProposal>, target_parent: PathBuf) -> BundleProposal {
         BundleProposal::new(
             PathBuf::from("/src/cluster"),
-            tidyup_domain::BundleKind::PhotoBurst,
+            BundleKind::PhotoBurst,
             target_parent,
             members,
             0.9,
@@ -1325,9 +1747,14 @@ mod tests {
             progress: &NullProgress,
         };
 
-        let report = apply_bundles(std::slice::from_ref(&bundle), &[bundle.id], &deps, false)
-            .await
-            .unwrap();
+        let report = apply_bundles(
+            std::slice::from_ref(&bundle),
+            std::slice::from_ref(&bundle),
+            &deps,
+            false,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(report.bundles_applied, 1);
         assert!(!src1.exists() && !src2.exists(), "originals must be moved");
@@ -1341,6 +1768,86 @@ mod tests {
         assert!(shelved.contains(&bundle.members[0].id));
         assert!(shelved.contains(&bundle.members[1].id));
         assert!(log.applied_bundles.lock().unwrap().contains(&bundle.id));
+    }
+
+    #[tokio::test]
+    async fn apply_bundles_refuses_frontend_that_drops_a_member() {
+        let dir = TempDir::new().unwrap();
+        let src1 = dir.path().join("a.jpg");
+        let src2 = dir.path().join("b.jpg");
+        std::fs::write(&src1, b"a").unwrap();
+        std::fs::write(&src2, b"b").unwrap();
+        let dst1 = dir.path().join("out/a.jpg");
+        let dst2 = dir.path().join("out/b.jpg");
+        let original = file_set_bundle(
+            vec![
+                sample_proposal(src1.clone(), &dst1),
+                sample_proposal(src2.clone(), &dst2),
+            ],
+            dir.path().join("out"),
+        );
+        let mut reviewed = original.clone();
+        reviewed.members.pop();
+        let shelf = NoopBackup::new();
+        let deps = ExecutorDeps {
+            change_log: &RecordingLog::new(),
+            backup_store: &shelf,
+            progress: &NullProgress,
+        };
+
+        let report = apply_bundles(&[original], &[reviewed], &deps, false)
+            .await
+            .unwrap();
+
+        assert_eq!(report.bundles_failed, 1);
+        assert_eq!(report.bundles_applied, 0);
+        assert!(src1.exists() && src2.exists(), "no member may move");
+        assert!(!dst1.exists() && !dst2.exists());
+        assert!(
+            shelf.shelved.lock().unwrap().is_empty(),
+            "reconciliation must fail before shelving"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_bundles_accepts_semantic_label_and_filename_edits() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("Screenshot.png");
+        std::fs::write(&src, b"screen").unwrap();
+        let target_parent = dir.path().join("out");
+        let original_target = target_parent.join("screenshots/Screenshot.png");
+        let original = BundleProposal::new(
+            dir.path().to_path_buf(),
+            BundleKind::SemanticCollection {
+                label: "screenshots".to_string(),
+            },
+            target_parent.clone(),
+            vec![sample_proposal(src.clone(), &original_target)],
+            0.8,
+            "shared OCR evidence".to_string(),
+        )
+        .unwrap();
+        let mut reviewed = original.clone();
+        reviewed.kind = BundleKind::SemanticCollection {
+            label: "project".to_string(),
+        };
+        reviewed.members[0].change_type = ChangeType::RenameAndMove;
+        reviewed.members[0].proposed_name = "project_homepage.png".to_string();
+        let edited_target = target_parent.join("project/project_homepage.png");
+        reviewed.members[0].proposed_path.clone_from(&edited_target);
+        let deps = ExecutorDeps {
+            change_log: &RecordingLog::new(),
+            backup_store: &NoopBackup::new(),
+            progress: &NullProgress,
+        };
+
+        let report = apply_bundles(&[original], &[reviewed], &deps, false)
+            .await
+            .unwrap();
+
+        assert_eq!(report.bundles_applied, 1);
+        assert!(!src.exists());
+        assert_eq!(std::fs::read(edited_target).unwrap(), b"screen");
     }
 
     #[tokio::test]
@@ -1367,9 +1874,14 @@ mod tests {
             backup_store: &NoopBackup::new(),
             progress: &NullProgress,
         };
-        let report = apply_bundles(std::slice::from_ref(&bundle), &[bundle.id], &deps, false)
-            .await
-            .unwrap();
+        let report = apply_bundles(
+            std::slice::from_ref(&bundle),
+            std::slice::from_ref(&bundle),
+            &deps,
+            false,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(report.bundles_failed, 1);
         // All-or-nothing: neither member moved, no partial state.
@@ -1407,9 +1919,14 @@ mod tests {
             progress: &NullProgress,
         };
 
-        let report = apply_bundles(std::slice::from_ref(&bundle), &[bundle.id], &deps, false)
-            .await
-            .unwrap();
+        let report = apply_bundles(
+            std::slice::from_ref(&bundle),
+            std::slice::from_ref(&bundle),
+            &deps,
+            false,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(report.bundles_failed, 1, "the bundle apply fails");
         assert_eq!(report.bundles_applied, 0);
@@ -1444,9 +1961,14 @@ mod tests {
             backup_store: &NoopBackup::new(),
             progress: &NullProgress,
         };
-        let report = apply_bundles(std::slice::from_ref(&bundle), &[bundle.id], &deps, false)
-            .await
-            .unwrap();
+        let report = apply_bundles(
+            std::slice::from_ref(&bundle),
+            std::slice::from_ref(&bundle),
+            &deps,
+            false,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(report.bundles_failed, 1);
         assert_eq!(report.bundles_applied, 0);
@@ -1479,9 +2001,14 @@ mod tests {
             backup_store: &NoopBackup::new(),
             progress: &NullProgress,
         };
-        let report = apply_bundles(std::slice::from_ref(&bundle), &[bundle.id], &deps, false)
-            .await
-            .unwrap();
+        let report = apply_bundles(
+            std::slice::from_ref(&bundle),
+            std::slice::from_ref(&bundle),
+            &deps,
+            false,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(report.bundles_failed, 1, "changed member fails the bundle");
         assert_eq!(report.bundles_applied, 0);
@@ -1491,7 +2018,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_file_set_bundle_dry_run_touches_nothing() {
+    async fn apply_file_set_bundle_dry_run_reports_same_disposition_as_real_apply() {
         let dir = TempDir::new().unwrap();
         let src = dir.path().join("c.jpg");
         std::fs::write(&src, b"c").unwrap();
@@ -1505,11 +2032,119 @@ mod tests {
             backup_store: &NoopBackup::new(),
             progress: &NullProgress,
         };
-        let report = apply_bundles(std::slice::from_ref(&bundle), &[bundle.id], &deps, true)
-            .await
-            .unwrap();
-        assert_eq!(report.bundles_applied, 1);
+        let report = apply_bundles(
+            std::slice::from_ref(&bundle),
+            std::slice::from_ref(&bundle),
+            &deps,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            report.bundles_applied, 1,
+            "dry-run reports what would apply"
+        );
         assert!(src.exists(), "dry-run must not move the source");
         assert!(!dst.exists(), "dry-run must not create the target");
+
+        let applied = apply_bundles(
+            std::slice::from_ref(&bundle),
+            std::slice::from_ref(&bundle),
+            &deps,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.bundles_applied, applied.bundles_applied);
+        assert!(!src.exists());
+        assert!(dst.exists());
+    }
+
+    #[test]
+    fn destination_ledger_catches_cross_case_collisions() {
+        let dir = TempDir::new().unwrap();
+        let source_a = dir.path().join("a.txt");
+        let source_b = dir.path().join("b.txt");
+        let target = dir.path().join("Organized/item.txt");
+        let first = sample_proposal(source_a, &target);
+        let second_target = dir.path().join("Organized/ITEM.txt");
+        let second = sample_proposal(source_b, &second_target);
+        let decisions = vec![
+            ReviewDecision::Approve(first.id),
+            ReviewDecision::Approve(second.id),
+        ];
+        let error = validate_destination_ledger(&[first, second], &decisions, &[])
+            .expect_err("case-folded targets must be held before apply");
+        assert!(error.to_string().contains("overlapping destinations"));
+    }
+
+    #[test]
+    fn destination_ledger_catches_loose_target_inside_bundle_target() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("incoming/readme.txt");
+        let bundle_root = dir.path().join("incoming/project");
+        let target_parent = dir.path().join("organized");
+        let bundle_member_target = target_parent.join("project/readme.txt");
+        let loose = sample_proposal(source, &bundle_member_target);
+        let structural_member =
+            sample_proposal(bundle_root.join("readme.txt"), &bundle_member_target);
+        let structural = BundleProposal::new(
+            bundle_root,
+            BundleKind::RustCrate,
+            target_parent,
+            vec![structural_member],
+            0.9,
+            "project".to_string(),
+        )
+        .unwrap();
+        let decisions = vec![ReviewDecision::Approve(loose.id)];
+        let error =
+            validate_destination_ledger(&[loose], &decisions, std::slice::from_ref(&structural))
+                .expect_err("a member cannot target inside a structural bundle root");
+        assert!(error.to_string().contains("overlapping destinations"));
+    }
+
+    #[test]
+    fn destination_ledger_rejects_existing_final_target() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("source.txt");
+        let target = dir.path().join("organized/existing.txt");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, b"already here").unwrap();
+        let proposal = sample_proposal(source, &target);
+        let decisions = vec![ReviewDecision::Approve(proposal.id)];
+        let error = validate_destination_ledger(&[proposal], &decisions, &[])
+            .expect_err("existing final target must be held");
+        assert!(error.to_string().contains("existing path"));
+    }
+
+    /// A target that exists because it *is* the source is a no-op, not a
+    /// collision. Scan reorganizes in place, so without this the ledger would
+    /// abort an entire run over one file that needed nothing done to it.
+    #[test]
+    fn destination_ledger_allows_target_equal_to_source() {
+        let dir = TempDir::new().unwrap();
+        let settled = dir.path().join("organized/settled.txt");
+        std::fs::create_dir_all(settled.parent().unwrap()).unwrap();
+        std::fs::write(&settled, b"already filed").unwrap();
+        let proposal = sample_proposal(settled.clone(), &settled);
+        let decisions = vec![ReviewDecision::Approve(proposal.id)];
+        validate_destination_ledger(&[proposal], &decisions, &[])
+            .expect("a file already at its destination must not fail the plan");
+    }
+
+    /// The self-target exemption is narrow: two different sources resolving to
+    /// one path is still a collision, and an unrelated occupant still blocks.
+    #[test]
+    fn destination_ledger_still_rejects_other_sources_targeting_a_live_path() {
+        let dir = TempDir::new().unwrap();
+        let settled = dir.path().join("organized/settled.txt");
+        std::fs::create_dir_all(settled.parent().unwrap()).unwrap();
+        std::fs::write(&settled, b"already filed").unwrap();
+        let intruder = sample_proposal(dir.path().join("elsewhere.txt"), &settled);
+        let decisions = vec![ReviewDecision::Approve(intruder.id)];
+        let error = validate_destination_ledger(&[intruder], &decisions, &[])
+            .expect_err("a different source must not overwrite an occupied path");
+        assert!(error.to_string().contains("existing path"));
     }
 }

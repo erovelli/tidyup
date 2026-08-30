@@ -496,6 +496,19 @@ impl RollbackService {
     pub async fn prune_backups(&self, days: u32) -> Result<usize> {
         self.ctx.backup_store.prune_older_than_days(days).await
     }
+
+    /// Delete cached semantic artifacts older than `days` and return the row
+    /// count removed. This cache is reconstructible and independent of the
+    /// backup shelf's rollback guarantees.
+    ///
+    /// # Errors
+    /// Propagates storage failures.
+    pub async fn prune_semantic_artifacts(&self, days: u32) -> Result<usize> {
+        self.ctx
+            .file_index
+            .prune_semantic_artifacts_older_than_days(days)
+            .await
+    }
 }
 
 /// What a retrying rollback should do with a change's backup record.

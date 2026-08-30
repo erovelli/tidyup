@@ -7,12 +7,13 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Row};
 use tidyup_core::storage::RunLog;
-use tidyup_domain::{RunMode, RunRecord, RunState};
+use tidyup_domain::{CapabilityManifest, RunMode, RunRecord, RunState};
 use uuid::Uuid;
 
 use crate::SqliteStore;
 
-const RUN_COLS: &str = "id, mode, source_root, target_root, started_at, completed_at, state";
+const RUN_COLS: &str =
+    "id, mode, source_root, target_root, started_at, completed_at, state, capabilities_json";
 
 fn parse_uuid(s: &str) -> rusqlite::Result<Uuid> {
     Uuid::parse_str(s).map_err(|e| {
@@ -35,6 +36,12 @@ fn row_to_run(row: &Row<'_>) -> rusqlite::Result<RunRecord> {
     let target_root = row
         .get::<_, Option<String>>("target_root")?
         .map(PathBuf::from);
+    let capabilities_json = row.get::<_, String>("capabilities_json")?;
+    // Capability manifests are diagnostics, never recovery-critical state. A
+    // row written by a newer or damaged build must not make status/rollback
+    // unable to enumerate otherwise intact runs.
+    let capabilities =
+        serde_json::from_str::<CapabilityManifest>(&capabilities_json).unwrap_or_default();
     Ok(RunRecord {
         id,
         mode,
@@ -43,6 +50,7 @@ fn row_to_run(row: &Row<'_>) -> rusqlite::Result<RunRecord> {
         started_at: row.get::<_, DateTime<Utc>>("started_at")?,
         completed_at: row.get::<_, Option<DateTime<Utc>>>("completed_at")?,
         state,
+        capabilities,
     })
 }
 
@@ -69,12 +77,14 @@ impl RunLog for SqliteStore {
                 .ok_or_else(|| anyhow!("source_root not valid UTF-8"))?
                 .to_owned();
             let tgt = path_opt(run.target_root.as_ref())?;
+            let capabilities_json = serde_json::to_string(&run.capabilities)
+                .context("serializing run capability manifest")?;
             {
                 let guard = conn.lock().map_err(|e| anyhow!("lock poisoned: {e}"))?;
                 guard
                     .execute(
                         &format!(
-                            "INSERT INTO runs ({RUN_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+                            "INSERT INTO runs ({RUN_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
                         ),
                         params![
                             run.id.to_string(),
@@ -84,6 +94,7 @@ impl RunLog for SqliteStore {
                             run.started_at,
                             run.completed_at,
                             run.state.as_str(),
+                            capabilities_json,
                         ],
                     )
                     .context("inserting run")?;
@@ -149,6 +160,7 @@ impl RunLog for SqliteStore {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use tidyup_domain::{CapabilityEntry, CapabilityKind, CapabilityStatus};
 
     #[tokio::test]
     async fn record_and_get_run_roundtrips() {
@@ -157,12 +169,25 @@ mod tests {
             RunMode::Migrate,
             PathBuf::from("/src"),
             Some(PathBuf::from("/target")),
-        );
+        )
+        .with_capabilities(CapabilityManifest {
+            schema_version: 1,
+            entries: vec![CapabilityEntry {
+                kind: CapabilityKind::TextEmbedding,
+                status: CapabilityStatus::Available,
+                implementation: "test".to_string(),
+                model_id: Some("test-model".to_string()),
+                dimensions: Some(3),
+                requires_network: false,
+                detail: None,
+            }],
+        });
         store.record_run(&run).await.unwrap();
         let back = store.get_run(run.id).await.unwrap().unwrap();
         assert_eq!(back.id, run.id);
         assert_eq!(back.mode, RunMode::Migrate);
         assert_eq!(back.state, RunState::InProgress);
+        assert_eq!(back.capabilities, run.capabilities);
     }
 
     #[tokio::test]
@@ -195,5 +220,33 @@ mod tests {
     async fn get_run_returns_none_for_unknown_id() {
         let store = SqliteStore::open_in_memory().unwrap();
         assert!(store.get_run(Uuid::new_v4()).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn unknown_capability_kind_does_not_block_run_listing() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let run = RunRecord::begin(RunMode::Scan, PathBuf::from("/future"), None);
+        store.record_run(&run).await.unwrap();
+        {
+            let conn = store.conn();
+            let guard = conn.lock().unwrap();
+            guard
+                .execute(
+                    "UPDATE runs SET capabilities_json = ?1 WHERE id = ?2",
+                    params![
+                        r#"{"schema_version":2,"entries":[{"kind":"FutureEmbedding","status":"Available","implementation":"future","model_id":null,"dimensions":null,"requires_network":false,"detail":null}]}"#,
+                        run.id.to_string(),
+                    ],
+                )
+                .unwrap();
+        }
+
+        let listed = store.list_runs().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].capabilities.entries.len(), 1);
+        assert_eq!(
+            listed[0].capabilities.entries[0].kind,
+            CapabilityKind::Unknown
+        );
     }
 }

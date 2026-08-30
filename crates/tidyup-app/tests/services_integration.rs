@@ -23,9 +23,11 @@ use tidyup_app::{MigrationService, ScanService, ServiceContext};
 use tidyup_core::extractor::{ContentExtractor, ExtractedContent};
 use tidyup_core::frontend::{Level, ProgressItem, ProgressReporter};
 use tidyup_core::inference::{EmbeddingBackend, TextBackend};
-use tidyup_core::storage::{BackupStore, ChangeLog, RunLog};
+use tidyup_core::storage::{BackupStore, ChangeLog, FileIndex, RunLog};
 use tidyup_core::{Result as CoreResult, ReviewHandler};
-use tidyup_domain::{BundleProposal, ChangeProposal, Phase, ReviewDecision};
+use tidyup_domain::{
+    BundleProposal, ChangeProposal, FileProcessingRole, FileProcessingState, Phase, ReviewDecision,
+};
 use tidyup_storage_sqlite::SqliteStore;
 
 struct NullProgress;
@@ -87,13 +89,16 @@ impl ReviewHandler for ApproveEverything {
             .map(|p| ReviewDecision::Approve(p.id))
             .collect())
     }
-    async fn review_bundles(&self, bundles: Vec<BundleProposal>) -> CoreResult<Vec<uuid::Uuid>> {
+    async fn review_bundles(
+        &self,
+        bundles: Vec<BundleProposal>,
+    ) -> CoreResult<Vec<BundleProposal>> {
         let ids: Vec<_> = bundles.iter().map(|b| b.id).collect();
         self.bundles_seen
             .lock()
             .unwrap()
             .extend(ids.iter().copied());
-        Ok(ids)
+        Ok(bundles)
     }
 }
 
@@ -211,17 +216,32 @@ fn make_ctx_with_shelf(shelf: Option<std::path::PathBuf>) -> (Arc<ServiceContext
     } else {
         store
     };
+    let text = Arc::new(StubText) as Arc<dyn TextBackend>;
+    let embeddings = Arc::new(BucketEmbeddings) as Arc<dyn EmbeddingBackend>;
+    let extractors = vec![Arc::new(PlainExtractor) as Arc<dyn ContentExtractor>];
+    let capabilities = tidyup_app::capability_manifest_for(tidyup_app::CapabilityManifestInput {
+        embeddings: embeddings.as_ref(),
+        image_embeddings: None,
+        audio_embeddings: None,
+        text: Some(text.as_ref()),
+        vision: None,
+        extractors: &extractors,
+        ocr_enabled: false,
+        ocr_available: false,
+        text_requires_network: false,
+    });
     let ctx = Arc::new(ServiceContext {
         file_index: Arc::new(store.clone()),
         change_log: Arc::new(store.clone()),
         backup_store: Arc::new(store.clone()),
         run_log: Arc::new(store.clone()),
-        text: Some(Arc::new(StubText) as Arc<dyn TextBackend>),
-        embeddings: Arc::new(BucketEmbeddings),
+        text: Some(text),
+        embeddings,
         vision: None,
         image_embeddings: None,
         audio_embeddings: None,
-        extractors: vec![Arc::new(PlainExtractor)],
+        extractors,
+        capabilities,
         classifier: tidyup_app::classifier_config_for(
             &tidyup_app::config::TidyupConfig::default(),
             true,
@@ -282,9 +302,21 @@ async fn scan_service_persists_proposals_and_auto_approves() {
         .unwrap();
 
     assert_eq!(report.proposed, 1, "expected 1 loose proposal");
+    assert_eq!(report.indexed, 1);
+    assert_eq!(report.indexing_failed, 0);
     assert_eq!(report.bundles, 0);
     assert_eq!(report.approved, 1, "auto-approve should count 1");
-    assert_eq!(report.applied, 1, "dry-run apply counts approved proposals");
+    assert_eq!(report.applied, 1, "dry-run reports what would apply");
+
+    // Identity indexing happens before classification, even for a dry run.
+    assert_eq!(store.list_under(src.path()).await.unwrap().len(), 1);
+    let processing = store.processing_for_run(report.run_id).await.unwrap();
+    assert_eq!(processing.len(), 1);
+    assert_eq!(processing[0].role, FileProcessingRole::Source);
+    assert_eq!(processing[0].state, FileProcessingState::Classified);
+    let stored_run = store.get_run(report.run_id).await.unwrap().unwrap();
+    assert_eq!(stored_run.capabilities, report.capabilities);
+    assert!(!stored_run.capabilities.entries.is_empty());
 
     // Dry-run leaves proposals Pending in the change log.
     let pending = store.pending().await.unwrap();
@@ -458,9 +490,18 @@ async fn migration_service_builds_profiles_and_classifies() {
         .unwrap();
 
     assert_eq!(report.proposed, 1, "one loose proposal");
+    assert_eq!(report.source_indexed, 1);
+    assert_eq!(report.target_indexed, 0);
+    assert_eq!(report.indexing_failed, 0);
     assert_eq!(report.bundles, 0);
     assert_eq!(report.approved, 1);
-    assert_eq!(report.applied, 1, "dry-run apply counts approved");
+    assert_eq!(report.applied, 1, "dry-run reports what would apply");
+
+    // Migration indexes the source tree before building semantic proposals.
+    assert_eq!(store.list_under(src.path()).await.unwrap().len(), 1);
+    let processing = store.processing_for_run(report.run_id).await.unwrap();
+    assert_eq!(processing.len(), 1);
+    assert_eq!(processing[0].state, FileProcessingState::Classified);
 
     let pending = store.pending().await.unwrap();
     assert_eq!(pending.len(), 1);
@@ -758,10 +799,17 @@ async fn file_set_bundle_applies_atomically_and_rollback_restores_it() {
     for n in ["invoice-01.pdf", "invoice-02.pdf", "invoice-03.pdf"] {
         assert!(!src_root.join(n).exists(), "{n} original must be moved");
     }
-    let moved = src_root.join("Documents/Series/invoice/invoice-01.pdf");
+    let applied = store.applied_bundles_for_run(report.run_id).await.unwrap();
+    let moved = applied[0]
+        .members
+        .iter()
+        .find(|member| member.original_path.ends_with("invoice-01.pdf"))
+        .unwrap()
+        .proposed_path
+        .clone();
     assert!(
         moved.exists(),
-        "members land flat under the cluster subfolder"
+        "members land flat under the semantically selected cluster subfolder"
     );
 
     // Atomic restore — every member comes back to its original path.

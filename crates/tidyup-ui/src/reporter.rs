@@ -46,9 +46,13 @@ impl ProgressReporter for DioxusReporter {
         current.set(0);
         total_sig.set(total);
         label.set(String::new());
+        if phase == Phase::Indexing {
+            let mut indexed = self.signals.indexed_count;
+            indexed.set(0);
+        }
     }
 
-    async fn item_completed(&self, _phase: Phase, item: ProgressItem) {
+    async fn item_completed(&self, phase: Phase, item: ProgressItem) {
         let mut current = self.signals.progress_current;
         let mut total_sig = self.signals.progress_total;
         let mut label = self.signals.progress_label;
@@ -57,13 +61,27 @@ impl ProgressReporter for DioxusReporter {
             total_sig.set(item.total);
         }
         label.set(item.label);
+        if phase == Phase::Indexing {
+            let mut indexed = self.signals.indexed_count;
+            indexed.set(item.current);
+        }
     }
 
     async fn phase_finished(&self, _phase: Phase) {
-        // Leave the phase signal set to the last value; the UI resets it when
-        // the service call returns. We just clear the transient label.
+        // Clear the counter and item label but keep the phase name, so the
+        // banner reads as "still working, between steps" rather than showing a
+        // stale count that no longer advances.
+        //
+        // This used to leave the totals in place too. Combined with the
+        // unreported bundle-classification stretch, the banner sat on a frozen
+        // count under a phase label that had already finished — which is what
+        // made an ordinary run look like an infinite loop.
         let mut label = self.signals.progress_label;
+        let mut current = self.signals.progress_current;
+        let mut total = self.signals.progress_total;
         label.set(String::new());
+        current.set(0);
+        total.set(None);
     }
 
     async fn message(&self, level: Level, msg: &str) {

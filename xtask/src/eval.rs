@@ -1,16 +1,11 @@
 //! `cargo xtask eval` — classification-accuracy harness over a labeled corpus.
 //!
-//! Runs the deterministic cascade against the golden corpus under
+//! Runs semantic classification against the golden corpus under
 //! `xtask/corpus/` and reports overall accuracy, per-label precision / recall /
-//! F1, tier coverage, and the top confusions.
+//! F1, semantic coverage, and the top confusions.
 //!
-//! # Why two tiers behave differently
-//!
-//! Tier-1 heuristics need no model, so they always run — this harness is
-//! meaningful even on a machine (or CI host) without the embedding bundle. The
-//! Tier-2 embedding path is gated on `bge-small-en-v1.5` being installed
-//! (`verify_default_model`); when it is absent, content-dependent entries are
-//! reported as *deferred* rather than failed, and `--json`/text output says so.
+//! Classification is semantic and therefore gated on the local embedding model
+//! being installed. Without it, entries are reported as deferred.
 //!
 //! This is a developer + calibration tool (it feeds the Stage-5 confidence
 //! calibration work). It is intentionally **not** wired into `cargo xtask ci`,
@@ -34,13 +29,11 @@ use serde::{Deserialize, Serialize};
 use tidyup_domain::Calibration;
 use tidyup_embeddings_ort::{verify_default_model, EmbeddingClassifier, OrtEmbeddings};
 use tidyup_pipeline::calibration::{expected_calibration_error, fit_platt};
-use tidyup_pipeline::heuristics;
 
-/// The cascade tier that produced a prediction.
+/// The resolver that produced a prediction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum Tier {
-    Heuristic,
     Embedding,
     Unresolved,
 }
@@ -50,11 +43,8 @@ enum Tier {
 struct CorpusEntry {
     /// Path to the fixture, relative to the corpus directory.
     file: String,
-    /// Taxonomy leaf the cascade is expected to route the file to.
+    /// Taxonomy leaf the semantic resolver is expected to route the file to.
     expected: String,
-    /// Whether Tier-1 heuristics alone should resolve this entry.
-    #[serde(default)]
-    tier1: bool,
 }
 
 /// Top-level shape of `corpus.toml` (`[[entry]]` tables).
@@ -68,14 +58,10 @@ struct Manifest {
 #[derive(Debug, Clone)]
 struct Outcome {
     expected: String,
-    /// `None` when no evaluated tier produced a prediction (unresolved).
+    /// `None` when no evaluated resolver produced a prediction (unresolved).
     predicted: Option<String>,
     tier: Tier,
-    /// Whether the corpus declared this entry Tier-1-resolvable. Used to flag
-    /// heuristic regressions (a `tier1 = true` entry that did not land at
-    /// Tier 1).
-    expected_tier1: bool,
-    /// Raw confidence the producing tier assigned (`None` when unresolved).
+    /// Raw confidence the resolver assigned (`None` when unresolved).
     /// Feeds `--calibrate`.
     confidence: Option<f32>,
 }
@@ -132,12 +118,8 @@ struct Report {
     accuracy: f64,
     /// `correct / resolved` — accuracy among entries that got a prediction.
     resolved_accuracy: f64,
-    heuristic_count: usize,
     embedding_count: usize,
     unresolved_count: usize,
-    /// `tier1 = true` corpus entries that did NOT resolve at Tier 1 — a
-    /// heuristic regression. Should be zero on a healthy build.
-    tier1_regressions: usize,
     macro_precision: f64,
     macro_recall: f64,
     macro_f1: f64,
@@ -152,7 +134,7 @@ struct Report {
 /// Entry point for `cargo xtask eval`.
 ///
 /// `json` switches to machine-readable output. `no_model` forces the
-/// embedding tier off even when the bundle is present (useful for fast,
+/// embedding resolver off even when the bundle is present (useful for fast,
 /// deterministic, model-free runs).
 ///
 /// # Errors
@@ -208,34 +190,19 @@ fn load_manifest(dir: &Path) -> Result<Vec<CorpusEntry>> {
     Ok(manifest.entries)
 }
 
-/// Run the cascade over every corpus entry. Tier 1 (heuristics) runs for all
-/// entries; entries it does not resolve fall to the Tier-2 embedding pass when
-/// `use_model` is true.
+/// Run semantic classification over every corpus entry when the local model is
+/// available.
 fn classify_corpus(dir: &Path, entries: &[CorpusEntry], use_model: bool) -> Result<Vec<Outcome>> {
-    let mut outcomes: Vec<Outcome> = Vec::with_capacity(entries.len());
-    let mut pending: Vec<usize> = Vec::new();
-
-    for (idx, entry) in entries.iter().enumerate() {
-        let path = dir.join(&entry.file);
-        if let Some(hit) = heuristics::classify(&path, None) {
-            outcomes.push(Outcome {
-                expected: entry.expected.clone(),
-                predicted: Some(hit.taxonomy_path.to_string()),
-                tier: Tier::Heuristic,
-                expected_tier1: entry.tier1,
-                confidence: Some(hit.confidence),
-            });
-        } else {
-            outcomes.push(Outcome {
-                expected: entry.expected.clone(),
-                predicted: None,
-                tier: Tier::Unresolved,
-                expected_tier1: entry.tier1,
-                confidence: None,
-            });
-            pending.push(idx);
-        }
-    }
+    let mut outcomes: Vec<Outcome> = entries
+        .iter()
+        .map(|entry| Outcome {
+            expected: entry.expected.clone(),
+            predicted: None,
+            tier: Tier::Unresolved,
+            confidence: None,
+        })
+        .collect();
+    let pending: Vec<usize> = (0..entries.len()).collect();
 
     if use_model && !pending.is_empty() {
         run_embedding_pass(dir, entries, &pending, &mut outcomes)?;
@@ -243,8 +210,7 @@ fn classify_corpus(dir: &Path, entries: &[CorpusEntry], use_model: bool) -> Resu
     Ok(outcomes)
 }
 
-/// Classify the heuristic-unresolved entries with the Tier-2 embedding
-/// classifier. Only ever called when the model bundle verified present.
+/// Classify entries with the embedding classifier.
 fn run_embedding_pass(
     dir: &Path,
     entries: &[CorpusEntry],
@@ -260,8 +226,8 @@ fn run_embedding_pass(
 
         for &idx in pending {
             let path = dir.join(&entries[idx].file);
-            // Binary fixtures (placeholder media) are never pending — they
-            // resolve at Tier 1 — so an unreadable file just stays unresolved.
+            // Placeholder binary fixtures remain unresolved when this text-only
+            // evaluator cannot extract semantic content.
             let Ok(content) = std::fs::read_to_string(&path) else {
                 continue;
             };
@@ -277,7 +243,6 @@ fn run_embedding_pass(
                 expected: entries[idx].expected.clone(),
                 predicted: Some(result.folder),
                 tier: Tier::Embedding,
-                expected_tier1: entries[idx].tier1,
                 confidence: Some(result.confidence),
             };
         }
@@ -316,19 +281,11 @@ fn summarize(outcomes: &[Outcome]) -> Report {
     let total = outcomes.len();
     let resolved = outcomes.iter().filter(|o| o.predicted.is_some()).count();
     let correct = outcomes.iter().filter(|o| o.is_correct()).count();
-    let heuristic_count = outcomes
-        .iter()
-        .filter(|o| o.tier == Tier::Heuristic)
-        .count();
     let embedding_count = outcomes
         .iter()
         .filter(|o| o.tier == Tier::Embedding)
         .count();
-    let unresolved_count = total - heuristic_count - embedding_count;
-    let tier1_regressions = outcomes
-        .iter()
-        .filter(|o| o.expected_tier1 && o.tier != Tier::Heuristic)
-        .count();
+    let unresolved_count = total - embedding_count;
 
     let mut labels: BTreeMap<String, LabelCounts> = BTreeMap::new();
     let mut confusions: BTreeMap<String, usize> = BTreeMap::new();
@@ -386,10 +343,8 @@ fn summarize(outcomes: &[Outcome]) -> Report {
         correct,
         accuracy: ratio(correct, total),
         resolved_accuracy: ratio(correct, resolved),
-        heuristic_count,
         embedding_count,
         unresolved_count,
-        tier1_regressions,
         macro_precision: sum_p / denom,
         macro_recall: sum_r / denom,
         macro_f1: sum_f / denom,
@@ -459,19 +414,18 @@ fn ratio(num: usize, den: usize) -> f64 {
 fn print_report(report: &Report, use_model: bool) {
     println!("tidyup eval — classification accuracy over the golden corpus\n");
     if use_model {
-        println!("mode: Tier 1 (heuristics) + Tier 2 (embeddings)");
+        println!("mode: semantic embeddings");
     } else {
         println!(
-            "mode: Tier 1 (heuristics) only — embedding bundle absent; \
-             content-dependent entries are deferred.\n      \
+            "mode: embedding bundle absent; entries are deferred.\n      \
              Install it with `cargo xtask download-models` for the full run."
         );
     }
     println!();
     println!("  entries:       {}", report.total);
     println!(
-        "  resolved:      {} ({} heuristic, {} embedding, {} unresolved)",
-        report.resolved, report.heuristic_count, report.embedding_count, report.unresolved_count,
+        "  resolved:      {} ({} semantic embedding, {} unresolved)",
+        report.resolved, report.embedding_count, report.unresolved_count,
     );
     println!(
         "  correct:       {} / {}  (accuracy {:.1}%)",
@@ -488,18 +442,6 @@ fn print_report(report: &Report, use_model: bool) {
         "  macro P/R/F1:  {:.3} / {:.3} / {:.3}",
         report.macro_precision, report.macro_recall, report.macro_f1,
     );
-    if report.tier1_regressions > 0 {
-        println!(
-            "  WARNING: {} tier1 entr{} did not resolve at Tier 1 (heuristic regression)",
-            report.tier1_regressions,
-            if report.tier1_regressions == 1 {
-                "y"
-            } else {
-                "ies"
-            },
-        );
-    }
-
     if !report.confusions.is_empty() {
         println!("\n  confusions (expected -> predicted):");
         for (pair, count) in &report.confusions {
@@ -521,9 +463,7 @@ fn print_report(report: &Report, use_model: bool) {
             cal.ece_raw, cal.ece_calibrated,
         );
         if !use_model {
-            println!(
-                "    note: model absent — fit over Tier-1 samples only; install the bundle for a real fit"
-            );
+            println!("    note: model absent — no semantic samples are available for calibration");
         }
     }
 }
@@ -538,7 +478,6 @@ mod tests {
             expected: expected.to_string(),
             predicted: predicted.map(ToString::to_string),
             tier,
-            expected_tier1: false,
             confidence: None,
         }
     }
@@ -548,7 +487,6 @@ mod tests {
             expected: expected.to_string(),
             predicted: predicted.map(ToString::to_string),
             tier: Tier::Embedding,
-            expected_tier1: false,
             confidence: Some(confidence),
         }
     }
@@ -572,8 +510,8 @@ mod tests {
     #[test]
     fn summarize_counts_accuracy_and_coverage() {
         let outcomes = vec![
-            outcome("Code/", Some("Code/"), Tier::Heuristic),
-            outcome("Music/", Some("Music/"), Tier::Heuristic),
+            outcome("Code/", Some("Code/"), Tier::Embedding),
+            outcome("Music/", Some("Music/"), Tier::Embedding),
             outcome(
                 "Finance/Taxes/",
                 Some("Finance/Taxes/2023/"),
@@ -586,8 +524,7 @@ mod tests {
         assert_eq!(report.total, 5);
         assert_eq!(report.resolved, 4);
         assert_eq!(report.correct, 3);
-        assert_eq!(report.heuristic_count, 2);
-        assert_eq!(report.embedding_count, 2);
+        assert_eq!(report.embedding_count, 4);
         assert_eq!(report.unresolved_count, 1);
         assert!((report.accuracy - 0.6).abs() < 1e-9);
         assert!((report.resolved_accuracy - 0.75).abs() < 1e-9);
@@ -611,8 +548,8 @@ mod tests {
     #[test]
     fn perfect_label_has_unit_metrics() {
         let outcomes = vec![
-            outcome("Code/", Some("Code/"), Tier::Heuristic),
-            outcome("Code/", Some("Code/"), Tier::Heuristic),
+            outcome("Code/", Some("Code/"), Tier::Embedding),
+            outcome("Code/", Some("Code/"), Tier::Embedding),
         ];
         let report = summarize(&outcomes);
         let code = report.per_label.get("Code/").unwrap();
@@ -620,28 +557,6 @@ mod tests {
         assert!((code.precision - 1.0).abs() < 1e-9);
         assert!((code.recall - 1.0).abs() < 1e-9);
         assert!((code.f1 - 1.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn summarize_flags_tier1_regressions() {
-        // A tier1-expected entry that fell through to the embedding tier is a
-        // heuristic regression; one that landed at Tier 1 is fine.
-        let regressed = Outcome {
-            expected: "Code/".to_string(),
-            predicted: Some("Code/".to_string()),
-            tier: Tier::Embedding,
-            expected_tier1: true,
-            confidence: Some(0.4),
-        };
-        let healthy = Outcome {
-            expected: "Music/".to_string(),
-            predicted: Some("Music/".to_string()),
-            tier: Tier::Heuristic,
-            expected_tier1: true,
-            confidence: Some(0.95),
-        };
-        let report = summarize(&[regressed, healthy]);
-        assert_eq!(report.tier1_regressions, 1);
     }
 
     #[test]
@@ -674,26 +589,6 @@ mod tests {
             );
             let path = dir.join(&entry.file);
             assert!(path.exists(), "missing corpus fixture: {}", path.display());
-        }
-    }
-
-    #[test]
-    fn tier1_entries_match_heuristics() {
-        // The deterministic Tier-1 path must route every `tier1 = true` entry to
-        // its declared `expected` label. This pins the corpus to the real
-        // heuristics so drift in either is caught with no model required.
-        let dir = corpus_dir();
-        let entries = load_manifest(&dir).unwrap();
-        for entry in entries.iter().filter(|e| e.tier1) {
-            let path = dir.join(&entry.file);
-            let hit = heuristics::classify(&path, None).unwrap_or_else(|| {
-                panic!("tier1 entry produced no heuristic match: {}", entry.file)
-            });
-            assert_eq!(
-                hit.taxonomy_path, entry.expected,
-                "heuristic mismatch for {}",
-                entry.file,
-            );
         }
     }
 }

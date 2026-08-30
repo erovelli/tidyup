@@ -209,6 +209,35 @@ async fn legacy_change_proposals_table_gains_content_hash_column() {
 }
 
 #[tokio::test]
+async fn legacy_runs_gain_an_empty_capability_manifest() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("legacy-runs.db");
+    let run_id = Uuid::new_v4();
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE runs (
+                id TEXT PRIMARY KEY, mode TEXT NOT NULL, source_root TEXT NOT NULL,
+                target_root TEXT, started_at TEXT NOT NULL, completed_at TEXT,
+                state TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO runs (id, mode, source_root, started_at, state)
+             VALUES (?1, 'Scan', '/legacy', ?2, 'Completed')",
+            rusqlite::params![run_id.to_string(), Utc::now()],
+        )
+        .unwrap();
+    }
+
+    let store = SqliteStore::open(&db).unwrap();
+    let run = store.get_run(run_id).await.unwrap().unwrap();
+    assert_eq!(run.capabilities.schema_version, 1);
+    assert!(run.capabilities.entries.is_empty());
+}
+
+#[tokio::test]
 async fn record_bundle_persists_members_and_filters_from_pending() {
     let dir = TempDir::new().unwrap();
     let store = new_store(&dir);

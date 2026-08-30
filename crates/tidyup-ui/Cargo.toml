@@ -19,7 +19,7 @@ path = "src/main.rs"
 
 [features]
 # Default build is LLM-silent by construction: `tidyup-inference-mistralrs` is
-# not in the dependency graph. Tier 3 LLM fallback is a power-user opt-in with
+# not in the dependency graph. The LLM reranker is a power-user opt-in with
 # the same triple-gated shape as the CLI — see `CLAUDE.md` privacy model. (The
 # UI intentionally does not surface the `remote` backend; that stays CLI-only.)
 default = []

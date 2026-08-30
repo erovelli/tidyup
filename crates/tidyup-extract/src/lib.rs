@@ -18,6 +18,9 @@
 //! any extractor implementations and must register their own.
 
 pub mod mime;
+
+#[cfg(all(target_os = "macos", feature = "image", macos_vision_ocr))]
+mod macos_ocr;
 pub mod router;
 
 /// Upper bound on the size of a document handed to an in-memory parser.
@@ -45,3 +48,13 @@ pub mod image;
 pub mod audio;
 
 pub use router::pick;
+
+/// Whether this build contains the local macOS Vision OCR helper.
+#[must_use]
+pub const fn macos_vision_ocr_available() -> bool {
+    cfg!(all(
+        target_os = "macos",
+        feature = "image",
+        macos_vision_ocr
+    ))
+}

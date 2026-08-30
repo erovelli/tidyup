@@ -1,8 +1,9 @@
 //! CLI [`ReviewHandler`](tidyup_core::frontend::ReviewHandler) impls:
-//! - [`AutoApproveHandler`] — used under `--yes`; approve if confidence clears
-//!   the threshold, otherwise reject. Bundle review (`review_bundles`) is never
-//!   invoked under `--yes`: the service applies the threshold directly, so this
-//!   handler relies on the trait's default (approve nothing) for bundles.
+//! - [`AutoApproveHandler`] — used under `--yes`; approve loose proposals if
+//!   confidence clears the threshold, otherwise reject. Bundle review
+//!   (`review_bundles`) is never invoked under `--yes`: the service applies the
+//!   threshold only to eligible opaque structural bundles, so this handler
+//!   relies on the trait's default (approve nothing) for bundles.
 //! - [`InteractiveHandler`] — prompt-per-proposal via `console`. For each
 //!   proposal, print a diff-like summary and read a single keystroke:
 //!   `a` approve, `A` approve all remaining, `r` reject, `q` reject all
@@ -13,7 +14,7 @@
 //!   → "Don't auto-apply rename proposals"). Bulk approve (`A`) approves the
 //!   item on screen (which may be a rename you're looking at — that's an
 //!   explicit keystroke on a surfaced proposal) and then auto-approves the
-//!   remaining **moves**; every subsequent rename still gets its own explicit
+//!   remaining **move proposals**; every subsequent rename still gets its own explicit
 //!   prompt, so a rename is never approved without being seen. If there is no
 //!   TTY (piped/redirected/CI), the handler errors up front pointing at
 //!   `--yes`, rather than spinning on a stream that never yields a keystroke.
@@ -26,6 +27,7 @@ use async_trait::async_trait;
 use console::{style, Key, Term};
 use tidyup_core::{frontend::ReviewHandler, Result};
 use tidyup_domain::{BundleProposal, ChangeProposal, ChangeType, ReviewDecision};
+#[cfg(test)]
 use uuid::Uuid;
 
 pub(crate) struct AutoApproveHandler {
@@ -67,7 +69,7 @@ impl ReviewHandler for InteractiveHandler {
             .map_err(|e| anyhow::anyhow!("interactive review task: {e}"))?
     }
 
-    async fn review_bundles(&self, bundles: Vec<BundleProposal>) -> Result<Vec<Uuid>> {
+    async fn review_bundles(&self, bundles: Vec<BundleProposal>) -> Result<Vec<BundleProposal>> {
         if bundles.is_empty() {
             return Ok(Vec::new());
         }
@@ -95,7 +97,8 @@ fn ensure_attended(stdin_tty: bool, stdout_tty: bool) -> Result<()> {
     Err(anyhow::anyhow!(
         "interactive review needs a terminal, but stdin/stdout is not a TTY \
          (piped, redirected, or non-interactive). Re-run in a terminal, or pass \
-         --yes to auto-approve moves above the confidence threshold (renames are \
+         --yes to auto-approve eligible opaque structural bundles and loose moves \
+         above the confidence threshold (soft/file-set bundles and renames are \
          never auto-applied)."
     ))
 }
@@ -247,13 +250,14 @@ fn render_proposal(term: &Term, idx: usize, total: usize, p: &ChangeProposal) {
     }
 }
 
-/// Prompt per bundle, returning the ids of the bundles the user approved.
+/// Prompt per bundle, returning the bundles the user approved.
 ///
 /// Bundles are atomic: the only choices are approve (move the whole subtree) or
 /// reject (leave it pending). There is no per-member decision and no override —
-/// members carry their own paths and never receive rename proposals. `Enter`
-/// defaults to reject, the safe choice, mirroring the loose-proposal prompt.
-fn prompt_each_bundle(bundles: Vec<BundleProposal>) -> Result<Vec<Uuid>> {
+/// members carry their own paths. Semantic collections may include member
+/// renames, which are displayed and always require explicit per-bundle review.
+/// `Enter` defaults to reject, the safe choice, mirroring the loose-proposal prompt.
+fn prompt_each_bundle(bundles: Vec<BundleProposal>) -> Result<Vec<BundleProposal>> {
     let term = Term::stdout();
     ensure_interactive_terminal(&term)?;
     let total = bundles.len();
@@ -272,9 +276,10 @@ fn prompt_each_bundle(bundles: Vec<BundleProposal>) -> Result<Vec<Uuid>> {
         if reject_rest {
             continue;
         }
-        // Bundle members never carry renames, so bulk-approve is unconditional.
-        if approve_rest {
-            approved.push(b.id);
+        // Interactive bulk approval is still an explicit user action. Bundles
+        // with member renames remain individually surfaced for review.
+        if approve_rest && !bundle_has_renames(&b) {
+            approved.push(b);
             continue;
         }
         render_bundle(&term, i.saturating_add(1), total, &b);
@@ -286,15 +291,18 @@ fn prompt_each_bundle(bundles: Vec<BundleProposal>) -> Result<Vec<Uuid>> {
             };
             match key {
                 Key::Char('a') => {
-                    approved.push(b.id);
+                    approved.push(b.clone());
                     let _ = term.write_line(&style(" → approved").green().to_string());
                     break;
                 }
                 Key::Char('A') => {
-                    approved.push(b.id);
+                    approved.push(b.clone());
                     approve_rest = true;
-                    let _ =
-                        term.write_line(&style(" → approving all remaining").green().to_string());
+                    let _ = term.write_line(
+                        &style(" → approving all remaining eligible bundles")
+                            .green()
+                            .to_string(),
+                    );
                     break;
                 }
                 Key::Char('r' | 'R') => {
@@ -348,7 +356,32 @@ fn render_bundle(term: &Term, idx: usize, total: usize, b: &BundleProposal) {
     let _ = term.write_line(&style(header).bold().to_string());
     let _ = term.write_line(&format!("  root: {}", b.root.display()));
     let _ = term.write_line(&format!("  to:   {}/", b.target_parent.display()));
+    for member in &b.members {
+        if matches!(
+            member.change_type,
+            ChangeType::Rename | ChangeType::RenameAndMove
+        ) {
+            let original = member
+                .original_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            let _ = term.write_line(&format!(
+                "  rename: {original} -> {}",
+                style(&member.proposed_name).italic()
+            ));
+        }
+    }
     let _ = term.write_line(&format!("  why:  {}", b.reasoning));
+}
+
+fn bundle_has_renames(bundle: &BundleProposal) -> bool {
+    bundle.members.iter().any(|member| {
+        matches!(
+            member.change_type,
+            ChangeType::Rename | ChangeType::RenameAndMove
+        )
+    })
 }
 
 #[cfg(test)]

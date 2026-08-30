@@ -29,7 +29,7 @@ use std::sync::Arc;
 use dioxus::prelude::*;
 use dioxus_core::ScopeId;
 use tidyup_app::{MigrationReport, RollbackReport, ScanReport};
-use tidyup_core::frontend::Level;
+use tidyup_core::frontend::{Level, ReviewOutcome};
 use tidyup_domain::{BundleProposal, ChangeProposal, Phase, ReviewDecision, RunRecord};
 use tokio::sync::{oneshot, Mutex};
 use uuid::Uuid;
@@ -69,6 +69,8 @@ pub(crate) struct SignalBundle {
     pub(crate) progress_current: SyncSignal<u64>,
     pub(crate) progress_total: SyncSignal<Option<u64>>,
     pub(crate) progress_label: SyncSignal<String>,
+    /// Successful identity records from the current source indexing pass.
+    pub(crate) indexed_count: SyncSignal<u64>,
     pub(crate) messages: SyncSignal<Vec<LogMessage>>,
     pub(crate) proposals: SyncSignal<Vec<ChangeProposal>>,
     pub(crate) bundles: SyncSignal<Vec<BundleProposal>>,
@@ -83,9 +85,10 @@ pub(crate) struct SignalBundle {
     pub(crate) runs: SyncSignal<Vec<RunRecord>>,
     pub(crate) error: SyncSignal<Option<String>>,
     pub(crate) model_ready: SyncSignal<Option<bool>>,
-    /// Per-invocation Tier 3 (LLM fallback) activation — the third privacy gate,
-    /// toggled from Settings. `false` by default; only togglable when the
-    /// `llm-fallback` feature is compiled and `[inference] llm_fallback = true`.
+    /// Per-invocation optional LLM-reranker activation — the third privacy gate,
+    /// toggled from Settings or explicitly requested at process launch through
+    /// `TIDYUP_LLM_FALLBACK`. It can become true only when the feature is
+    /// compiled and `[inference] llm_fallback = true`.
     pub(crate) llm_fallback_active: SyncSignal<bool>,
 }
 
@@ -98,7 +101,10 @@ pub(crate) type ReviewSlot = Arc<Mutex<Option<oneshot::Sender<Vec<ReviewDecision
 /// Non-signal state: the pending bundle review's sender, carrying the ids of the
 /// bundles the user approved. Separate from [`ReviewSlot`] because the service
 /// reviews loose proposals and bundles in two distinct `ReviewHandler` calls.
-pub(crate) type BundleReviewSlot = Arc<Mutex<Option<oneshot::Sender<Vec<Uuid>>>>>;
+pub(crate) type BundleReviewSlot = Arc<Mutex<Option<oneshot::Sender<Vec<BundleProposal>>>>>;
+
+/// Sender used by the desktop's unified loose-change + bundle review surface.
+pub(crate) type CombinedReviewSlot = Arc<Mutex<Option<oneshot::Sender<ReviewOutcome>>>>;
 
 /// Top-level shared state provided at the app root and consumed by every page.
 ///
@@ -111,6 +117,7 @@ pub(crate) struct SharedState {
     pub(crate) signals: SignalBundle,
     pub(crate) review_slot: ReviewSlot,
     pub(crate) bundle_review_slot: BundleReviewSlot,
+    pub(crate) combined_review_slot: CombinedReviewSlot,
 }
 
 impl PartialEq for SharedState {
@@ -118,6 +125,7 @@ impl PartialEq for SharedState {
         self.signals == other.signals
             && Arc::ptr_eq(&self.review_slot, &other.review_slot)
             && Arc::ptr_eq(&self.bundle_review_slot, &other.bundle_review_slot)
+            && Arc::ptr_eq(&self.combined_review_slot, &other.combined_review_slot)
     }
 }
 
@@ -140,6 +148,7 @@ impl SharedState {
             progress_current: Signal::new_maybe_sync_in_scope(0_u64, ScopeId::ROOT),
             progress_total: Signal::new_maybe_sync_in_scope(None, ScopeId::ROOT),
             progress_label: Signal::new_maybe_sync_in_scope(String::new(), ScopeId::ROOT),
+            indexed_count: Signal::new_maybe_sync_in_scope(0_u64, ScopeId::ROOT),
             messages: Signal::new_maybe_sync_in_scope(Vec::new(), ScopeId::ROOT),
             proposals: Signal::new_maybe_sync_in_scope(Vec::new(), ScopeId::ROOT),
             bundles: Signal::new_maybe_sync_in_scope(Vec::new(), ScopeId::ROOT),
@@ -157,6 +166,29 @@ impl SharedState {
             signals,
             review_slot: Arc::new(Mutex::new(None)),
             bundle_review_slot: Arc::new(Mutex::new(None)),
+            combined_review_slot: Arc::new(Mutex::new(None)),
         }
     }
+}
+
+/// Resolve the desktop UI's optional third LLM gate without blocking Dioxus
+/// root construction on config-file I/O.
+pub(crate) async fn load_llm_fallback_prearm() -> bool {
+    if !cfg!(feature = "llm-fallback") || !boolish_env("TIDYUP_LLM_FALLBACK") {
+        return false;
+    }
+    tokio::task::spawn_blocking(tidyup_app::config::load)
+        .await
+        .ok()
+        .and_then(std::result::Result::ok)
+        .is_some_and(|config| config.inference.llm_fallback)
+}
+
+fn boolish_env(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }

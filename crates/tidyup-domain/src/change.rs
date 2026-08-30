@@ -79,8 +79,8 @@ impl ChangeStatus {
 ///
 /// Bundle membership: when `bundle_id` is `Some`, this proposal moves a single member of a
 /// `BundleProposal` and is never approved, applied, or rolled back independently of its bundle.
-/// Members always have `change_type == ChangeType::Move` — bundle members never receive rename
-/// suggestions.
+/// Structural bundle members always use `Move`. Semantic-collection members may carry an
+/// evidence-backed `RenameAndMove`, but are still reviewed and applied with their collection.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChangeProposal {
     pub id: Uuid,
@@ -98,8 +98,10 @@ pub struct ChangeProposal {
     /// FK to the owning `BundleProposal`. `None` for loose (non-bundle) proposals.
     #[serde(default)]
     pub bundle_id: Option<Uuid>,
-    /// Tier-2 classification sub-score used (with `rename_mismatch_score`) to gate rename
-    /// proposals. `None` when classification wasn't run (e.g. bundle members, heuristic-only).
+    /// Deterministic semantic-routing sub-score used with `rename_mismatch_score`
+    /// to gate rename proposals. This is intentionally not an optional
+    /// LLM-reranked score. `None` when classification was not run (for example,
+    /// opaque structural bundle members).
     #[serde(default)]
     pub classification_confidence: Option<f32>,
     /// `1.0 - cosine(embed(filename_as_text), content_embedding)`. Drives rename proposals
@@ -130,6 +132,12 @@ pub enum ParseError {
     UnknownRunMode(String),
     #[error("unknown RunState: {0}")]
     UnknownRunState(String),
+    #[error("unknown FileProcessingRole: {0}")]
+    UnknownFileProcessingRole(String),
+    #[error("unknown FileProcessingStage: {0}")]
+    UnknownFileProcessingStage(String),
+    #[error("unknown FileProcessingState: {0}")]
+    UnknownFileProcessingState(String),
 }
 
 #[cfg(test)]

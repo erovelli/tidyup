@@ -8,6 +8,14 @@ To break the "template" look common in utility software, this system utilizes **
 
 ---
 
+
+> **Loading the stylesheet.** `assets/theme.css` is compiled into the binary via
+> `include_str!` and rendered through `document::Style`. It is deliberately not
+> referenced with `asset!`, which resolves to a hashed URL that only exists once
+> the `dx` CLI has bundled assets — a plain `cargo run`/`cargo build` binary got
+> an unresolvable href and fell back to the webview's default stylesheet, so the
+> whole app rendered as unstyled serif HTML with a non-animating spinner.
+
 ## 2. Colors & Surface Philosophy
 The palette is a sophisticated "Spring" spectrum, balanced to provide high legibility without the harshness of pure white or high-contrast blacks.
 
@@ -71,13 +79,20 @@ In this system, elevation is a product of light and shadow, not lines.
 ### Cards & File Items
 *   **Rule:** Forbid the use of divider lines between list items. Use 8px of vertical spacing (`md`) to separate rows. 
 *   **Visuals:** File icons should use soft `secondary` (#0f6784) and `primary` (#48664c) tones rather than harsh multi-color sets.
+*   **Inline validation:** Invalid editable filenames keep the editor in place, use a 2px `error_container` interaction outline, and show a compact `error_container` message directly below the field. Validation must happen before submit; do not defer a duplicate-name error to an execute-time toast.
+
+### Complete Organization Plan
+*   **One decision surface:** Loose proposals and atomic bundles belong in the same review page. Do not force users through disconnected review screens when `ReviewHandler::review_all` can present the complete plan together.
+*   **Diff semantics:** Always keep both current storage and proposed destination visible. Distinguish move-only and rename-and-move changes, and show every member rename before an atomic collection can be approved.
+*   **Atomic collections:** Approve/reject controls operate on the collection, never individual members. A semantic collection may expose editable label and member basenames; structural bundles remain immutable and binary.
+*   **Honest counts:** “Files indexed” comes from indexing progress/report state. Proposal, collection, unclassified, and failure counts are separate concepts and must not be substituted for it.
 
 ### Confidence Indicators (Chips)
 *   Small, pill-shaped (`full` roundedness) containers. Use the Tier colors defined in Section 2.
 *   Typography: `label-sm` in Semi-Bold to ensure the status is readable against the soft background.
 
 ### Power-User Gates (Settings)
-*   **Purpose:** Surface opt-in capabilities (e.g. the Tier 3 LLM-fallback toggle) without ever *recommending* them. These live on the Settings page as their own card, never on the primary scan/migrate flow.
+*   **Purpose:** Surface opt-in capabilities (for example, the optional LLM-reranker toggle) without ever *recommending* them. These live on the Settings page as their own card, never on the primary scan/migrate flow.
 *   **Honest disabled states:** When a gate is unavailable (feature not compiled, or config bool unset), render the control **disabled** with a plain-language status line explaining exactly which gate is missing and how to satisfy it — never hide the control silently, and never let it appear actionable when it isn't. The control only becomes enabled when *all* upstream gates are satisfied.
 *   **State, not persistence:** A per-session toggle reflects runtime activation only; it does not write config. Use the Primary button style when active, Secondary when inactive, so the current state reads at a glance.
 

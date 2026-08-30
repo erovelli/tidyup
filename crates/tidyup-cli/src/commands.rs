@@ -18,8 +18,10 @@ use crate::reporter::CliReporter;
 use crate::review::{AutoApproveHandler, InteractiveHandler};
 use crate::{Cli, Command};
 
-/// Confidence threshold for auto-applying bundles under `--yes`.
-const YES_BUNDLE_MIN_CONFIDENCE: f32 = 0.85;
+/// Confidence threshold for auto-applying opaque structural bundles under
+/// `--yes`; soft/file-set and generic bundles remain review-only until their
+/// action-specific confidence is calibrated.
+const YES_BUNDLE_MIN_CONFIDENCE: f32 = tidyup_app::executor::DEFAULT_BUNDLE_MIN_CONFIDENCE;
 
 /// Interpret an environment variable as a boolean activation gate.
 ///
@@ -51,7 +53,7 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<()> {
     let remote = cli.remote || env_activates("TIDYUP_REMOTE");
     if llm_fallback && remote {
         anyhow::bail!(
-            "--llm-fallback and --remote are mutually exclusive; pick one Tier 3 backend"
+            "--llm-fallback and --remote are mutually exclusive; pick one optional rerank backend"
         );
     }
     let activation = InferenceActivation {
@@ -120,19 +122,28 @@ async fn run_migrate(
 
     emit_summary(
         json,
-        "migrate",
-        report.run_id,
-        report.proposed,
-        report.bundles,
-        report.unclassified,
-        report.approved,
-        report.applied,
-        report.skipped,
-        report.failed,
-        report.bundles_applied,
-        report.bundles_skipped,
-        report.bundles_failed,
-        dry_run,
+        &RunSummary {
+            mode: "migrate",
+            run_id: report.run_id,
+            indexed: report.source_indexed,
+            target_indexed: Some(report.target_indexed),
+            indexing_failed: report.indexing_failed,
+            capabilities: &report.capabilities,
+            proposed: report.proposed,
+            bundles: report.bundles,
+            unclassified: report.unclassified,
+            // Migration always moves out of the source tree.
+            already_in_place: 0,
+            visual_candidates_over_cap: report.visual_candidates_over_cap,
+            approved: report.approved,
+            applied: report.applied,
+            skipped: report.skipped,
+            failed: report.failed,
+            bundles_applied: report.bundles_applied,
+            bundles_skipped: report.bundles_skipped,
+            bundles_failed: report.bundles_failed,
+            dry_run,
+        },
     );
     Ok(())
 }
@@ -188,25 +199,33 @@ async fn run_scan(
 
     emit_summary(
         json,
-        "scan",
-        report.run_id,
-        report.proposed,
-        report.bundles,
-        report.unclassified,
-        report.approved,
-        report.applied,
-        report.skipped,
-        report.failed,
-        report.bundles_applied,
-        report.bundles_skipped,
-        report.bundles_failed,
-        dry_run,
+        &RunSummary {
+            mode: "scan",
+            run_id: report.run_id,
+            indexed: report.indexed,
+            target_indexed: None,
+            indexing_failed: report.indexing_failed,
+            capabilities: &report.capabilities,
+            proposed: report.proposed,
+            bundles: report.bundles,
+            unclassified: report.unclassified,
+            already_in_place: report.already_in_place,
+            visual_candidates_over_cap: report.visual_candidates_over_cap,
+            approved: report.approved,
+            applied: report.applied,
+            skipped: report.skipped,
+            failed: report.failed,
+            bundles_applied: report.bundles_applied,
+            bundles_skipped: report.bundles_skipped,
+            bundles_failed: report.bundles_failed,
+            dry_run,
+        },
     );
     Ok(())
 }
 
 async fn run_list_runs(json: bool, cfg: &config::TidyupConfig) -> Result<()> {
-    // Rollback never invokes the classifier, so Tier 3 activation is irrelevant.
+    // Rollback never invokes the classifier, so optional reranker activation is irrelevant.
     let ctx = build(cfg, false, InferenceActivation::default()).await?;
     let service = RollbackService::new(ctx);
     let runs = service.list_runs().await?;
@@ -258,15 +277,23 @@ async fn run_prune(json: bool, cfg: &config::TidyupConfig, days: Option<u32>) ->
     let ctx = build(cfg, false, InferenceActivation::default()).await?;
     let service = RollbackService::new(ctx);
     let days = days.unwrap_or(cfg.storage.backup_retention_days);
-    let pruned = service.prune_backups(days).await?;
+    let backups_pruned = service.prune_backups(days).await?;
+    let semantic_artifacts_pruned = service.prune_semantic_artifacts(days).await?;
 
     if json {
         println!(
             "{}",
-            serde_json::json!({"event": "prune", "pruned": pruned, "older_than_days": days}),
+            serde_json::json!({
+                "event": "prune",
+                "backups_pruned": backups_pruned,
+                "semantic_artifacts_pruned": semantic_artifacts_pruned,
+                "older_than_days": days,
+            }),
         );
     } else {
-        println!("Pruned {pruned} shelved backup(s) older than {days} day(s).");
+        println!(
+            "Pruned {backups_pruned} shelved backup(s) and {semantic_artifacts_pruned} semantic cache artifact(s) older than {days} day(s)."
+        );
     }
     Ok(())
 }
@@ -297,6 +324,7 @@ async fn run_status(json: bool, cfg: &config::TidyupConfig) -> Result<()> {
                     "mode": r.mode.as_str(),
                     "state": r.state.as_str(),
                     "started_at": r.started_at,
+                    "capabilities": r.capabilities,
                 })
             })
             .collect();
@@ -365,7 +393,7 @@ async fn run_status(json: bool, cfg: &config::TidyupConfig) -> Result<()> {
 }
 
 async fn run_rollback(json: bool, cfg: &config::TidyupConfig, run_id: uuid::Uuid) -> Result<()> {
-    // Rollback never invokes the classifier, so Tier 3 activation is irrelevant.
+    // Rollback never invokes the classifier, so optional reranker activation is irrelevant.
     let ctx = build(cfg, false, InferenceActivation::default()).await?;
     let reporter = CliReporter::new(json);
     let service = RollbackService::new(ctx);
@@ -417,9 +445,10 @@ fn run_config(cfg: &config::TidyupConfig) -> Result<()> {
     Ok(())
 }
 
-/// Build the review handler. Under `--yes`, the auto-approve confidence
-/// threshold comes from `[classifier] min_confidence` in config (default 0.75),
-/// so users can tune how aggressively moves auto-apply without a rebuild.
+/// Build the review handler. Under `--yes`, the loose-proposal threshold comes
+/// from `[classifier] min_confidence` in config (default 0.75). Bundle
+/// auto-selection uses the same threshold only for opaque structural bundles;
+/// soft/file-set and generic bundles remain review-only.
 fn reviewer_for(yes: bool, cfg: &config::TidyupConfig) -> Box<dyn tidyup_core::ReviewHandler> {
     if yes {
         Box::new(AutoApproveHandler {
@@ -430,14 +459,22 @@ fn reviewer_for(yes: bool, cfg: &config::TidyupConfig) -> Box<dyn tidyup_core::R
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn emit_summary(
-    json: bool,
-    mode: &str,
+/// Everything one run reports. A struct rather than a positional argument list:
+/// the summary already carried eighteen parameters, and the two new
+/// accounting fields would have made a mis-ordered `usize` a silent bug.
+struct RunSummary<'a> {
+    mode: &'a str,
     run_id: uuid::Uuid,
+    indexed: usize,
+    target_indexed: Option<usize>,
+    indexing_failed: usize,
+    capabilities: &'a tidyup_domain::CapabilityManifest,
     proposed: usize,
     bundles: usize,
     unclassified: usize,
+    /// Scan only: classified, but already where it belongs.
+    already_in_place: usize,
+    visual_candidates_over_cap: usize,
     approved: usize,
     applied: usize,
     skipped: usize,
@@ -446,15 +483,44 @@ fn emit_summary(
     bundles_skipped: usize,
     bundles_failed: usize,
     dry_run: bool,
-) {
+}
+
+fn emit_summary(json: bool, s: &RunSummary<'_>) {
+    let RunSummary {
+        mode,
+        run_id,
+        indexed,
+        target_indexed,
+        indexing_failed,
+        capabilities,
+        proposed,
+        bundles,
+        unclassified,
+        already_in_place,
+        visual_candidates_over_cap,
+        approved,
+        applied,
+        skipped,
+        failed,
+        bundles_applied,
+        bundles_skipped,
+        bundles_failed,
+        dry_run,
+    } = *s;
     if json {
         let v = serde_json::json!({
             "event": format!("{mode}_summary"),
             "run_id": run_id,
             "dry_run": dry_run,
+            "indexed": indexed,
+            "target_indexed": target_indexed,
+            "indexing_failed": indexing_failed,
+            "capabilities": capabilities,
             "proposed": proposed,
             "bundles": bundles,
             "unclassified": unclassified,
+            "already_in_place": already_in_place,
+            "visual_candidates_over_cap": visual_candidates_over_cap,
             "approved": approved,
             "applied": applied,
             "skipped": skipped,
@@ -469,16 +535,35 @@ fn emit_summary(
     let tag = if dry_run { " [dry-run]" } else { "" };
     println!();
     println!("{mode} complete{tag} (run {run_id}):");
+    if let Some(target_count) = target_indexed {
+        println!("  indexed:   {indexed} source, {target_count} target ({indexing_failed} failed)");
+    } else {
+        println!("  indexed:   {indexed} ({indexing_failed} failed)");
+    }
+    println!("  capabilities: {}", capabilities.summary());
     println!(
         "  proposals: {proposed} (approved {approved}, applied {applied}, skipped {skipped}, failed {failed})"
     );
     println!(
         "  bundles:   {bundles} (applied {bundles_applied}, skipped {bundles_skipped}, failed {bundles_failed})"
     );
+    if already_in_place > 0 {
+        println!("  already in place: {already_in_place} (classified, nothing to move)");
+    }
     if unclassified > 0 {
         println!("  unclassified: {unclassified}");
     }
-    if applied > 0 {
+    if visual_candidates_over_cap > 0 {
+        // Say this out loud. These files are classified and present in the
+        // plan, so nothing looks missing — but they were never offered to
+        // collection discovery, so a large folder groups some images and not
+        // others for reasons the user cannot see.
+        println!(
+            "  note: {visual_candidates_over_cap} image(s) exceeded the per-directory clustering cap \
+and were classified individually without collection grouping"
+        );
+    }
+    if !dry_run && (applied > 0 || bundles_applied > 0) {
         println!("Undo with: tidyup rollback {run_id}");
     }
 }

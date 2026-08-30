@@ -33,7 +33,10 @@ struct Bars {
 impl Bars {
     const fn slot_for(&mut self, phase: Phase) -> &mut Option<ProgressBar> {
         match phase {
-            Phase::Indexing => &mut self.indexing,
+            // Preparing precedes any service call, so the CLI never receives
+            // it; clustering shares the indexing bar because it is the same
+            // discovery pass from the user's point of view.
+            Phase::Preparing | Phase::Indexing | Phase::Clustering => &mut self.indexing,
             Phase::Extracting => &mut self.extracting,
             Phase::ProfilingTarget => &mut self.profiling,
             // AwaitingReview shares the classifying slot — it's the phase
@@ -56,7 +59,9 @@ impl CliReporter {
 
     const fn label(phase: Phase) -> &'static str {
         match phase {
+            Phase::Preparing => "preparing",
             Phase::Indexing => "indexing",
+            Phase::Clustering => "grouping related files",
             Phase::Extracting => "extracting",
             Phase::ProfilingTarget => "profiling target",
             Phase::Classifying => "classifying",

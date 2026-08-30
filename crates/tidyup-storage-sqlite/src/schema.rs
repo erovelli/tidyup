@@ -25,7 +25,37 @@ CREATE TABLE IF NOT EXISTS files (
 const CREATE_FILES_HASH_IDX: &str =
     "CREATE INDEX IF NOT EXISTS idx_files_content_hash ON files(content_hash);";
 
-const CREATE_RUNS: &str = r"
+const CREATE_FILE_PROCESSING: &str = r"
+CREATE TABLE IF NOT EXISTS file_processing (
+    run_id      TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    path        TEXT NOT NULL,
+    role        TEXT NOT NULL,
+    file_id     TEXT REFERENCES files(id),
+    stage       TEXT NOT NULL,
+    state       TEXT NOT NULL,
+    reason      TEXT,
+    updated_at  TEXT NOT NULL,
+    PRIMARY KEY (run_id, path, role)
+);
+";
+
+const CREATE_FILE_PROCESSING_RUN_IDX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_file_processing_run ON file_processing(run_id, state);";
+
+const CREATE_SEMANTIC_ARTIFACTS: &str = r"
+CREATE TABLE IF NOT EXISTS semantic_artifacts (
+    content_hash           TEXT NOT NULL,
+    model_id               TEXT NOT NULL,
+    preprocessing_version  TEXT NOT NULL,
+    latent_space           TEXT NOT NULL,
+    embedding_json         TEXT NOT NULL,
+    embedding_blob         BLOB,
+    updated_at             TEXT NOT NULL,
+    PRIMARY KEY (content_hash, model_id, preprocessing_version, latent_space)
+);
+";
+
+const CREATE_RUNS: &str = r#"
 CREATE TABLE IF NOT EXISTS runs (
     id            TEXT PRIMARY KEY,
     mode          TEXT NOT NULL,
@@ -33,9 +63,10 @@ CREATE TABLE IF NOT EXISTS runs (
     target_root   TEXT,
     started_at    TEXT NOT NULL,
     completed_at  TEXT,
-    state         TEXT NOT NULL
+    state         TEXT NOT NULL,
+    capabilities_json TEXT NOT NULL DEFAULT '{"schema_version":1,"entries":[]}'
 );
-";
+"#;
 
 const CREATE_BUNDLES: &str = r"
 CREATE TABLE IF NOT EXISTS bundles (
@@ -128,7 +159,10 @@ pub(super) fn apply(conn: &mut Connection) -> rusqlite::Result<()> {
         &[
             CREATE_FILES,
             CREATE_FILES_HASH_IDX,
+            CREATE_SEMANTIC_ARTIFACTS,
             CREATE_RUNS,
+            CREATE_FILE_PROCESSING,
+            CREATE_FILE_PROCESSING_RUN_IDX,
             CREATE_BUNDLES,
             CREATE_CHANGE_PROPOSALS,
             CREATE_CHANGES_BUNDLE_IDX,
@@ -142,5 +176,12 @@ pub(super) fn apply(conn: &mut Connection) -> rusqlite::Result<()> {
     // Additive migrations for databases created before a column existed.
     add_column_if_missing(&tx, "backups", "content_hash", "TEXT")?;
     add_column_if_missing(&tx, "change_proposals", "content_hash", "TEXT")?;
+    add_column_if_missing(
+        &tx,
+        "runs",
+        "capabilities_json",
+        "TEXT NOT NULL DEFAULT '{\"schema_version\":1,\"entries\":[]}'",
+    )?;
+    add_column_if_missing(&tx, "semantic_artifacts", "embedding_blob", "BLOB")?;
     tx.commit()
 }

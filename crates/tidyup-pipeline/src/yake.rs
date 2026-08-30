@@ -122,7 +122,9 @@ pub fn extract_keywords(text: &str, k: usize) -> Vec<Keyword> {
         .map(|(term, s)| {
             #[allow(clippy::cast_precision_loss)]
             let freq = s.count as f32;
-            let t_case = f32::from(s.upper_count.max(s.acronym_count)) / (1.0 + freq.ln());
+            #[allow(clippy::cast_precision_loss)]
+            let case_count = s.upper_count.max(s.acronym_count) as f32;
+            let t_case = case_count / (1.0 + freq.ln());
             #[allow(clippy::cast_precision_loss)]
             let first_sent = s.sentences.iter().min().copied().unwrap_or(0) as f32;
             let t_position = (3.0 + first_sent).ln().ln();
@@ -213,8 +215,11 @@ fn ngram_candidates(
 #[derive(Default)]
 struct TermStats {
     count: u32,
-    upper_count: u8,
-    acronym_count: u8,
+    // Documents routinely repeat headings, names, and acronyms more than 255
+    // times. These counters must track the same practical range as `count`;
+    // `u8` panicked in debug builds and wrapped in release builds.
+    upper_count: u32,
+    acronym_count: u32,
     sentences: HashSet<usize>,
     left_context: HashSet<String>,
     right_context: HashSet<String>,
@@ -419,6 +424,13 @@ mod tests {
             out.iter().any(|k| k.term.contains("tax")),
             "expected a tax-related term in top 5; got {out:?}",
         );
+    }
+
+    #[test]
+    fn repeated_capitalized_term_does_not_overflow_case_counter() {
+        let text = "Quarterly ".repeat(300);
+        let out = extract_keywords(&text, 3);
+        assert!(out.iter().any(|keyword| keyword.term == "quarterly"));
     }
 
     #[test]

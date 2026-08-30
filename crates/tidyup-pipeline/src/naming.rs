@@ -1,22 +1,25 @@
-//! Extractive rename cascade — produces proposed filenames without fabrication.
+//! Grounded rename cascade — produces proposed filenames from file evidence.
 //!
 //! The cascade runs highest-signal to lowest and returns the first hit:
 //!
 //! 1. **Embedded metadata.** ID3 `title` / `artist`, EXIF `image_description`
 //!    or `make` + `model`, generic `title` keys. Any [`ExtractedContent::metadata`]
 //!    that names the content directly.
-//! 2. **Keyword-template fill.** Top-ranked YAKE terms from
+//! 2. **Keyword composition.** Top-ranked YAKE terms from
 //!    [`crate::yake::extract_keywords`] assembled into a `year_topic` style
 //!    name. Year comes from filename or content when available.
-//! 3. **No signal → no rename.** Returns `None`; the caller should keep the
+//! 3. **Semantic concepts.** A caller with a contrastive multimodal embedding
+//!    may provide scored visible/audible concepts through
+//!    [`propose_grounded_rename`]. This path is retrieval, not generation.
+//! 4. **No signal → no rename.** Returns `None`; the caller should keep the
 //!    original filename.
 //!
-//! # Why extractive-only
+//! # Why grounded-only
 //!
-//! Rename proposals are capped at extracted evidence per the policy in
-//! `CLAUDE.md` — no LLM-fabricated names even when `--features llm-fallback`
-//! is enabled. This module is structurally incapable of producing a name
-//! without either metadata or keywords from the file itself.
+//! Rename proposals are capped at inspectable evidence: exact metadata,
+//! extracted keywords, or concepts retrieved from a bounded contrastive-model
+//! bank. No LLM-fabricated name is accepted even when an optional fallback is
+//! enabled.
 //!
 //! # Gate
 //!
@@ -30,7 +33,9 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use serde_json::Value;
+use tidyup_domain::{ChangeProposal, ChangeType};
 
+use crate::semantic::ConceptMatch;
 use crate::yake::Keyword;
 
 /// Maximum number of distinct words composing a synthesized keyword stem. Keeps
@@ -50,13 +55,17 @@ pub enum RenameProposal {
     Keep,
 }
 
-/// Which tier of the cascade produced the rename.
+/// Which grounded evidence source produced the rename.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenameSource {
-    /// Pulled from embedded metadata (ID3, EXIF, PDF title, etc.).
+    /// Pulled from embedded metadata (for example ID3 or EXIF fields).
     Metadata,
+    /// Derived from text visibly present in an image via local OCR.
+    Ocr,
     /// Synthesized from YAKE top-k keywords plus optional year prefix.
     Keywords,
+    /// Retrieved from non-textual content through a contrastive model.
+    SemanticConcept,
 }
 
 impl RenameSource {
@@ -64,7 +73,9 @@ impl RenameSource {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Metadata => "metadata",
+            Self::Ocr => "local OCR",
             Self::Keywords => "keywords",
+            Self::SemanticConcept => "grounded semantic concepts",
         }
     }
 }
@@ -74,7 +85,7 @@ impl RenameSource {
 /// `metadata` is the `ExtractedContent::metadata` value returned by the
 /// extractor. `keywords` is the (possibly empty) YAKE output; empty input
 /// triggers fallthrough to `Keep`. `year` seeds the year prefix when the
-/// keyword tier fires — `None` drops the prefix.
+/// keyword-based rename path fires — `None` drops the prefix.
 #[must_use]
 pub fn propose_rename(
     original: &Path,
@@ -106,7 +117,11 @@ pub fn propose_rename(
             let name = finalize(&stem, ext.as_deref());
             return RenameProposal::Rename {
                 name,
-                source: RenameSource::Keywords,
+                source: if metadata.get("ocr_text").and_then(Value::as_str).is_some() {
+                    RenameSource::Ocr
+                } else {
+                    RenameSource::Keywords
+                },
             };
         }
     }
@@ -114,8 +129,97 @@ pub fn propose_rename(
     RenameProposal::Keep
 }
 
+/// Compose a deterministic filename from strongly grounded semantic concepts.
+///
+/// The caller owns confidence and mismatch gating. This renderer only accepts
+/// already-ranked concept labels and preserves the original extension.
+#[must_use]
+pub fn propose_grounded_rename(original: &Path, concepts: &[ConceptMatch]) -> RenameProposal {
+    let stem = concepts
+        .iter()
+        .take(2)
+        .map(|concept| sanitize_token(&concept.label))
+        .filter(|label| !label.is_empty())
+        .collect::<Vec<_>>()
+        .join("_on_");
+    let original_stem = original
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    if stem.is_empty() || is_trivial_rename(&stem, original_stem) {
+        return RenameProposal::Keep;
+    }
+    let extension = original
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase);
+    RenameProposal::Rename {
+        name: finalize(&stem, extension.as_deref()),
+        source: RenameSource::SemanticConcept,
+    }
+}
+
+/// Make proposed member filenames unique within one atomic collection.
+///
+/// Existing move-only names are reserved first so a generated rename cannot
+/// claim a sibling's unchanged basename. Colliding rename proposals receive a
+/// deterministic numeric suffix while retaining their extracted stem and
+/// extension. A move-only collision is rejected instead of fabricating an
+/// ungrounded rename. Comparisons are case-insensitive to stay safe on the
+/// default macOS and Windows filesystems.
+pub(crate) fn uniquify_bundle_member_names(proposals: &mut [ChangeProposal]) -> anyhow::Result<()> {
+    let mut claimed = HashSet::new();
+    for proposal in proposals
+        .iter()
+        .filter(|proposal| proposal.change_type == ChangeType::Move)
+    {
+        if !claimed.insert(proposal.proposed_name.to_lowercase()) {
+            return Err(anyhow::anyhow!(
+                "move-only bundle members collide at basename {}",
+                proposal.proposed_name
+            ));
+        }
+    }
+
+    for proposal in proposals.iter_mut().filter(|proposal| {
+        matches!(
+            proposal.change_type,
+            ChangeType::Rename | ChangeType::RenameAndMove
+        )
+    }) {
+        let original = proposal.proposed_name.clone();
+        if claimed.insert(original.to_lowercase()) {
+            continue;
+        }
+
+        for sequence in 2_u32.. {
+            let candidate = filename_with_sequence(&original, sequence);
+            if claimed.insert(candidate.to_lowercase()) {
+                proposal.proposed_name.clone_from(&candidate);
+                proposal.proposed_path.set_file_name(candidate);
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn filename_with_sequence(filename: &str, sequence: u32) -> String {
+    let path = Path::new(filename);
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or(filename);
+    path.extension()
+        .and_then(|value| value.to_str())
+        .map_or_else(
+            || format!("{stem}_{sequence}"),
+            |extension| format!("{stem}_{sequence}.{extension}"),
+        )
+}
+
 // ---------------------------------------------------------------------------
-// Tier 1 — embedded metadata
+// Rename evidence 1 — embedded metadata
 // ---------------------------------------------------------------------------
 
 /// Look up a rename candidate stem in the extractor metadata.
@@ -125,7 +229,7 @@ pub fn propose_rename(
 /// - `tags.title` (audio without artist)
 /// - `exif.image_description` (image)
 /// - `exif.make` + `exif.model` (image fallback)
-/// - `title` at the top level (PDF / generic)
+/// - `title` at the top level when supplied by an extractor
 fn stem_from_metadata(metadata: &Value) -> Option<String> {
     let tags = metadata.get("tags").and_then(Value::as_object);
     if let Some(tags) = tags {
@@ -163,7 +267,7 @@ fn stem_from_metadata(metadata: &Value) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Tier 2 — keyword-template fill
+// Grounded keyword composition
 // ---------------------------------------------------------------------------
 
 /// Compose a stem from the top YAKE keywords, optionally prefixed with a year.
@@ -291,8 +395,11 @@ fn is_trivial_rename(candidate_raw: &str, original_stem: &str) -> bool {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use chrono::Utc;
     use serde_json::json;
     use std::path::PathBuf;
+    use tidyup_domain::ChangeStatus;
+    use uuid::Uuid;
 
     use crate::yake::Keyword;
 
@@ -300,6 +407,27 @@ mod tests {
         Keyword {
             term: term.to_string(),
             score,
+        }
+    }
+
+    fn renamed_member(original: &str, proposed_name: String) -> ChangeProposal {
+        ChangeProposal {
+            id: Uuid::new_v4(),
+            file_id: None,
+            change_type: ChangeType::RenameAndMove,
+            original_path: PathBuf::from("/source").join(original),
+            proposed_path: PathBuf::from("/target/collection").join(&proposed_name),
+            proposed_name,
+            confidence: 0.95,
+            reasoning: "metadata rename".to_string(),
+            needs_review: false,
+            status: ChangeStatus::Pending,
+            created_at: Utc::now(),
+            applied_at: None,
+            bundle_id: None,
+            classification_confidence: Some(0.95),
+            rename_mismatch_score: Some(0.9),
+            content_hash: None,
         }
     }
 
@@ -373,6 +501,51 @@ mod tests {
     }
 
     #[test]
+    fn bundle_member_names_suffix_colliding_metadata_renames() {
+        let metadata = json!({"exif": {"make": "Canon", "model": "EOS R5"}});
+        let proposed_names =
+            ["IMG_0001.jpg", "IMG_0002.jpg"].map(|original| {
+                match propose_rename(
+                    &PathBuf::from("/source").join(original),
+                    &metadata,
+                    &[],
+                    None,
+                ) {
+                    RenameProposal::Rename { name, .. } => name,
+                    RenameProposal::Keep => panic!("camera metadata should propose a rename"),
+                }
+            });
+        assert_eq!(proposed_names[0], proposed_names[1]);
+
+        let mut members = vec![
+            renamed_member("IMG_0001.jpg", proposed_names[0].clone()),
+            renamed_member("IMG_0002.jpg", proposed_names[1].clone()),
+        ];
+        uniquify_bundle_member_names(&mut members).unwrap();
+
+        assert_eq!(members[0].proposed_name, "canon_eos_r5.jpg");
+        assert_eq!(members[1].proposed_name, "canon_eos_r5_2.jpg");
+        assert!(members[1].proposed_path.ends_with("canon_eos_r5_2.jpg"));
+    }
+
+    #[test]
+    fn move_only_collisions_are_rejected_instead_of_renamed_without_evidence() {
+        let mut members = vec![
+            renamed_member("A.txt", "A.txt".to_string()),
+            renamed_member("a.txt", "a.txt".to_string()),
+        ];
+        for member in &mut members {
+            member.change_type = ChangeType::Move;
+            member.rename_mismatch_score = None;
+        }
+
+        let error = uniquify_bundle_member_names(&mut members).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("move-only bundle members collide"));
+    }
+
+    #[test]
     fn metadata_tier_generic_title() {
         let meta = json!({"title": "Quarterly Report Q3 2024"});
         let p = propose_rename(&PathBuf::from("/d/scan.pdf"), &meta, &[], None);
@@ -386,6 +559,49 @@ mod tests {
             }
             RenameProposal::Keep => panic!("expected rename"),
         }
+    }
+
+    #[test]
+    fn ocr_uses_general_keyword_evidence() {
+        let meta = json!({"ocr_text": "Submitted quarterly expense report"});
+        let keywords = vec![kw("quarterly expense", 0.1), kw("report", 0.2)];
+        let p = propose_rename(
+            &PathBuf::from("/d/Screenshot 2026-08-25 at 10.10.36 PM.png"),
+            &meta,
+            &keywords,
+            None,
+        );
+        assert_eq!(
+            p,
+            RenameProposal::Rename {
+                name: "quarterly_expense_report.png".to_string(),
+                source: RenameSource::Ocr,
+            }
+        );
+    }
+
+    #[test]
+    fn grounded_concepts_name_non_textual_image() {
+        let concepts = vec![
+            ConceptMatch {
+                label: "cat".to_string(),
+                score: 0.86,
+                family: "animal".to_string(),
+            },
+            ConceptMatch {
+                label: "beach".to_string(),
+                score: 0.78,
+                family: "scene".to_string(),
+            },
+        ];
+        let p = propose_grounded_rename(&PathBuf::from("/d/image_2348985fg.png"), &concepts);
+        assert_eq!(
+            p,
+            RenameProposal::Rename {
+                name: "cat_on_beach.png".to_string(),
+                source: RenameSource::SemanticConcept,
+            }
+        );
     }
 
     #[test]
@@ -465,6 +681,10 @@ mod tests {
     fn rename_source_label() {
         assert_eq!(RenameSource::Metadata.label(), "metadata");
         assert_eq!(RenameSource::Keywords.label(), "keywords");
+        assert_eq!(
+            RenameSource::SemanticConcept.label(),
+            "grounded semantic concepts"
+        );
     }
 
     #[test]

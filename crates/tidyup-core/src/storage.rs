@@ -4,8 +4,9 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use tidyup_domain::{
-    BackupRecord, BundleProposal, ChangeProposal, FileId, IndexedFile, RestorePrecheck, RunRecord,
-    RunState,
+    BackupRecord, BundleProposal, ChangeProposal, ContentHash, FileId, FileProcessingRecord,
+    FileProcessingRole, FileProcessingStage, IndexedFile, RestorePrecheck, RunRecord, RunState,
+    SemanticArtifact,
 };
 use uuid::Uuid;
 
@@ -18,6 +19,58 @@ pub trait FileIndex: Send + Sync {
     async fn get(&self, id: &FileId) -> Result<Option<IndexedFile>>;
     async fn by_path(&self, path: &Path) -> Result<Option<IndexedFile>>;
     async fn list_under(&self, root: &Path) -> Result<Vec<IndexedFile>>;
+
+    /// Insert or replace the run-scoped processing state for one path.
+    async fn put_processing_record(&self, record: &FileProcessingRecord) -> Result<()>;
+
+    /// Insert or replace a stage's processing states as one logical batch.
+    ///
+    /// The default preserves compatibility for alternate stores. Transactional
+    /// implementations should override it to avoid one commit per file.
+    async fn put_processing_records(&self, records: &[FileProcessingRecord]) -> Result<()> {
+        for record in records {
+            self.put_processing_record(record).await?;
+        }
+        Ok(())
+    }
+
+    /// Return every recorded path state for a run, ordered deterministically.
+    async fn processing_for_run(&self, run_id: Uuid) -> Result<Vec<FileProcessingRecord>>;
+
+    /// Mark non-terminal source states as failed when a run aborts before it
+    /// can assign a per-file classification outcome.
+    async fn fail_incomplete_processing(
+        &self,
+        run_id: Uuid,
+        role: FileProcessingRole,
+        stage: FileProcessingStage,
+        reason: &str,
+    ) -> Result<()>;
+
+    /// Load an exact versioned semantic artifact by content identity. The
+    /// default keeps alternate storage implementations source-compatible while
+    /// safely behaving as a cache miss.
+    async fn semantic_artifact(
+        &self,
+        _content_hash: &ContentHash,
+        _model_id: &str,
+        _preprocessing_version: &str,
+        _latent_space: &str,
+    ) -> Result<Option<SemanticArtifact>> {
+        Ok(None)
+    }
+
+    /// Persist a semantic artifact. Cache writes are an optimization; the
+    /// default implementation deliberately succeeds without storing.
+    async fn put_semantic_artifact(&self, _artifact: &SemanticArtifact) -> Result<()> {
+        Ok(())
+    }
+
+    /// Delete semantic cache entries older than `days`. Returns the number of
+    /// rows removed. Alternate stores may treat the cache as ephemeral.
+    async fn prune_semantic_artifacts_older_than_days(&self, _days: u32) -> Result<usize> {
+        Ok(0)
+    }
 }
 
 /// Append-only log of proposed and applied changes. Drives diff view + audit trail.
