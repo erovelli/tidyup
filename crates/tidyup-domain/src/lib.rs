@@ -36,7 +36,19 @@ pub use run::{
 /// shared between CLI (`indicatif`) and UI (Dioxus signals).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Phase {
+    /// Frontend-only marker for work that precedes the first service call —
+    /// loading config and models. Services never emit it, but without it the
+    /// window sits blank while a model loads, which reads as a hang.
+    Preparing,
+    /// Walking the tree and persisting a stable identity per file.
     Indexing,
+    /// Grouping loose siblings into content bundles.
+    ///
+    /// Distinct from [`Self::Indexing`] on purpose: both used to report as
+    /// "Indexing", so two different stages were indistinguishable and the
+    /// second one — which has no meaningful total — looked like the first one
+    /// having stalled.
+    Clustering,
     Extracting,
     ProfilingTarget,
     Classifying,

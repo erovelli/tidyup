@@ -8,6 +8,14 @@ To break the "template" look common in utility software, this system utilizes **
 
 ---
 
+
+> **Loading the stylesheet.** `assets/theme.css` is compiled into the binary via
+> `include_str!` and rendered through `document::Style`. It is deliberately not
+> referenced with `asset!`, which resolves to a hashed URL that only exists once
+> the `dx` CLI has bundled assets — a plain `cargo run`/`cargo build` binary got
+> an unresolvable href and fell back to the webview's default stylesheet, so the
+> whole app rendered as unstyled serif HTML with a non-animating spinner.
+
 ## 2. Colors & Surface Philosophy
 The palette is a sophisticated "Spring" spectrum, balanced to provide high legibility without the harshness of pure white or high-contrast blacks.
 

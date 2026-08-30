@@ -159,7 +159,7 @@ pub async fn run_scan(
     progress: &dyn ProgressReporter,
 ) -> Result<ScanOutcome> {
     let semantic_cache = SemanticRunCache::new(multimodal.artifact_store);
-    progress.phase_started(Phase::Indexing, None).await;
+    progress.phase_started(Phase::Clustering, None).await;
     let tree = scanner::scan(source_root);
     // Content clustering: group loose siblings into photo bursts / music albums
     // / document series. Runs after the structural scanner; these move as
@@ -179,7 +179,7 @@ pub async fn run_scan(
         },
     )
     .await;
-    progress.phase_finished(Phase::Indexing).await;
+    progress.phase_finished(Phase::Clustering).await;
 
     let content_bundles = clustered.bundles;
     let loose_files = clustered.loose;
@@ -190,6 +190,19 @@ pub async fn run_scan(
         already_in_place: Vec::new(),
         visual_candidates_over_cap: clustered.visual_candidates_over_cap,
     };
+
+    // Bundles and loose files share one Classifying phase with one running
+    // counter. Both bundle loops below classify member files, and they used to
+    // run between `phase_finished(Indexing)` and `phase_started(Classifying)`
+    // with no progress events at all — the longest unreported stretch of the
+    // run, displayed by a frontend as whatever phase had last been announced.
+    let bundle_count = tree.bundles.len().saturating_add(content_bundles.len());
+    let classify_total =
+        u64::try_from(bundle_count.saturating_add(loose_files.len())).unwrap_or(u64::MAX);
+    progress
+        .phase_started(Phase::Classifying, Some(classify_total))
+        .await;
+    let mut classified_count: u64 = 0;
 
     // Structural bundles preserve their internal layout and names.
     for bundle in &tree.bundles {
@@ -205,6 +218,17 @@ pub async fn run_scan(
                     .await;
             }
         }
+        classified_count = classified_count.saturating_add(1);
+        progress
+            .item_completed(
+                Phase::Classifying,
+                ProgressItem {
+                    label: bundle.root.display().to_string(),
+                    current: classified_count,
+                    total: Some(classify_total),
+                },
+            )
+            .await;
     }
     // Content clusters classify each loose member so semantic collections can
     // carry evidence-backed screenshot renames while remaining atomic.
@@ -237,14 +261,20 @@ pub async fn run_scan(
                     .await;
             }
         }
+        classified_count = classified_count.saturating_add(1);
+        progress
+            .item_completed(
+                Phase::Classifying,
+                ProgressItem {
+                    label: bundle.root.display().to_string(),
+                    current: classified_count,
+                    total: Some(classify_total),
+                },
+            )
+            .await;
     }
 
-    let total = u64::try_from(loose_files.len()).unwrap_or(u64::MAX);
-    progress
-        .phase_started(Phase::Classifying, Some(total))
-        .await;
-
-    for (idx, path) in loose_files.iter().enumerate() {
+    for path in &loose_files {
         match classify_file(
             path,
             candidates,
@@ -286,13 +316,14 @@ pub async fn run_scan(
                 outcome.unclassified.push(path.clone());
             }
         }
+        classified_count = classified_count.saturating_add(1);
         progress
             .item_completed(
                 Phase::Classifying,
                 ProgressItem {
                     label: path.display().to_string(),
-                    current: u64::try_from(idx).unwrap_or(u64::MAX).saturating_add(1),
-                    total: Some(total),
+                    current: classified_count,
+                    total: Some(classify_total),
                 },
             )
             .await;
@@ -1150,6 +1181,26 @@ mod tests {
         async fn message(&self, _l: Level, _m: &str) {}
     }
 
+    /// Captures the progress stream so tests can assert what a frontend would
+    /// actually have been able to display.
+    #[derive(Default)]
+    struct RecordingProgress {
+        started: std::sync::Mutex<Vec<(Phase, Option<u64>)>>,
+        items: std::sync::Mutex<Vec<(Phase, u64, Option<u64>)>>,
+    }
+
+    #[async_trait]
+    impl ProgressReporter for RecordingProgress {
+        async fn phase_started(&self, p: Phase, t: Option<u64>) {
+            self.started.lock().unwrap().push((p, t));
+        }
+        async fn item_completed(&self, p: Phase, i: ProgressItem) {
+            self.items.lock().unwrap().push((p, i.current, i.total));
+        }
+        async fn phase_finished(&self, _p: Phase) {}
+        async fn message(&self, _l: Level, _m: &str) {}
+    }
+
     /// Deterministic embedder: sums byte values modulo 7 buckets.
     struct BucketEmbeddings;
     #[async_trait]
@@ -1369,6 +1420,90 @@ mod tests {
         assert!(out.proposals[0]
             .proposed_path
             .starts_with(td.path().join("Builds")));
+    }
+
+    /// Bundle classification used to run between `phase_finished(Indexing)`
+    /// and `phase_started(Classifying)` while emitting nothing at all, so a
+    /// frontend displayed a stale phase over the longest stretch of the run and
+    /// an ordinary scan looked like it had hung. Every classified unit —
+    /// bundles included — must now be covered by one continuous counter.
+    #[tokio::test]
+    async fn every_classified_unit_reports_progress() {
+        let td = TempDir::new().unwrap();
+        // A marker-root structural bundle plus loose siblings.
+        fs::create_dir_all(td.path().join("proj/src")).unwrap();
+        fs::write(td.path().join("proj/Cargo.toml"), b"[package]").unwrap();
+        fs::write(td.path().join("proj/src/main.rs"), b"fn main() {}").unwrap();
+        fs::write(td.path().join("tax invoice.blob"), b"tax invoice statement").unwrap();
+        fs::write(
+            td.path().join("build notes.blob"),
+            b"software project milestone",
+        )
+        .unwrap();
+
+        let embeddings = TopicEmbeddings;
+        let candidates = topic_candidates(&embeddings).await;
+        let extractors: Vec<Arc<dyn ContentExtractor>> = vec![Arc::new(PlainExtractor)];
+        let progress = RecordingProgress::default();
+        let out = run_scan(
+            td.path(),
+            &crate::indexing::SourceIdentities::default(),
+            td.path(),
+            &candidates,
+            &embeddings,
+            &MultimodalContext::default(),
+            None,
+            &extractors,
+            &ClassifierConfig::default(),
+            &progress,
+        )
+        .await
+        .unwrap();
+
+        let started = progress.started.lock().unwrap().clone();
+        // Discovery/clustering must not masquerade as identity indexing.
+        assert!(
+            started.iter().any(|(p, _)| *p == Phase::Clustering),
+            "discovery + clustering needs its own phase, got {started:?}"
+        );
+        assert!(
+            !started.iter().any(|(p, _)| *p == Phase::Indexing),
+            "the pipeline no longer reports Indexing; that is the app-layer pass"
+        );
+
+        let declared = started
+            .iter()
+            .find(|(p, _)| *p == Phase::Classifying)
+            .and_then(|(_, total)| *total)
+            .expect("Classifying must declare a total so a progress bar can render");
+
+        let units = out.bundles.len()
+            + out.proposals.len()
+            + out.unclassified.len()
+            + out.already_in_place.len();
+        assert_eq!(
+            declared,
+            u64::try_from(units).unwrap(),
+            "the declared total must cover bundles as well as loose files"
+        );
+
+        // One event per unit, strictly increasing, ending exactly at the total:
+        // no silent stretch where a frontend has nothing to show.
+        let items = progress.items.lock().unwrap().clone();
+        let ticks: Vec<u64> = items
+            .iter()
+            .filter(|(p, _, _)| *p == Phase::Classifying)
+            .map(|(_, current, _)| *current)
+            .collect();
+        assert_eq!(
+            ticks,
+            (1..=declared).collect::<Vec<_>>(),
+            "progress must advance once per unit with no gaps"
+        );
+        assert!(
+            items.iter().all(|(_, _, total)| *total == Some(declared)),
+            "every tick must carry the same denominator"
+        );
     }
 
     #[tokio::test]

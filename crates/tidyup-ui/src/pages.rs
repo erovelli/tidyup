@@ -2130,6 +2130,11 @@ fn launch_scan(state: &SharedState, source: PathBuf) {
 
     reset_run_state(signals);
     set_busy(signals, Busy::Scanning);
+    // Config and model loading happen below, before any service call and so
+    // before any phase event. Without this the banner renders nothing at all
+    // for the whole model load and the window looks inert right after the
+    // click that started the run.
+    set_phase(signals, tidyup_domain::Phase::Preparing);
 
     // `spawn_forever` (vs `spawn`): the reviewer flips `review_pending` mid-run,
     // which routes the app to `/review` and unmounts the calling page. A
@@ -2194,6 +2199,7 @@ fn launch_migrate(state: &SharedState, source: PathBuf, target: PathBuf) {
 
     reset_run_state(signals);
     set_busy(signals, Busy::Migrating);
+    set_phase(signals, tidyup_domain::Phase::Preparing);
 
     spawn_forever(async move {
         let result = async {
@@ -2391,6 +2397,11 @@ async fn refresh_runs_inner(signals: SignalBundle) {
     }
 }
 
+fn set_phase(signals: SignalBundle, phase: tidyup_domain::Phase) {
+    let mut p = signals.phase;
+    p.set(Some(phase));
+}
+
 fn set_busy(signals: SignalBundle, busy: Busy) {
     let mut b = signals.busy;
     b.set(busy);
@@ -2413,7 +2424,9 @@ fn reset_run_state(signals: SignalBundle) {
 
 const fn phase_label(phase: tidyup_domain::Phase) -> &'static str {
     match phase {
+        tidyup_domain::Phase::Preparing => "Loading models",
         tidyup_domain::Phase::Indexing => "Indexing",
+        tidyup_domain::Phase::Clustering => "Grouping related files",
         tidyup_domain::Phase::Extracting => "Extracting content",
         tidyup_domain::Phase::ProfilingTarget => "Profiling target hierarchy",
         tidyup_domain::Phase::Classifying => "Classifying",

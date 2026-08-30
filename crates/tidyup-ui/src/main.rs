@@ -24,11 +24,17 @@ use dioxus::prelude::*;
 use crate::pages::{Dashboard, Review, Runs, Settings};
 use crate::state::SharedState;
 
-// The dioxus `asset!` macro expands to code that trips clippy 1.95's
-// `volatile_composites` lint (`&[u8]` is not volatile-compatible); the
-// generated code is out of our hands, so allow it at this single call site.
-#[allow(clippy::volatile_composites)]
-const THEME_CSS: Asset = asset!("/assets/theme.css");
+/// The stylesheet is compiled into the binary rather than referenced through
+/// the `asset!` macro.
+///
+/// `asset!` resolves to a hashed URL that only exists once the `dx` CLI has
+/// collected assets into a bundle. A plain `cargo run`/`cargo build` binary —
+/// the command `README.md` documents — produced an unresolvable href, so the
+/// webview silently fell back to its default stylesheet and the whole app
+/// rendered as unstyled serif HTML with a non-animating spinner. Embedding the
+/// file removes the build-tool dependency and makes the documented command
+/// produce the design in `DESIGN.md`.
+const THEME_CSS: &str = include_str!("../assets/theme.css");
 
 fn main() {
     tracing_subscriber::fmt()
@@ -73,7 +79,7 @@ fn App() -> Element {
     provide_context(state);
 
     rsx! {
-        document::Stylesheet { href: THEME_CSS }
+        document::Style { {THEME_CSS} }
         Router::<Route> {}
     }
 }

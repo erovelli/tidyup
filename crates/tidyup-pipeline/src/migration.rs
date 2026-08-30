@@ -119,7 +119,7 @@ pub async fn run_migration(
     progress: &dyn ProgressReporter,
 ) -> Result<MigrationOutcome> {
     let semantic_cache = SemanticRunCache::new(multimodal.artifact_store);
-    progress.phase_started(Phase::Indexing, None).await;
+    progress.phase_started(Phase::Clustering, None).await;
     let tree = scanner::scan(source_root);
     let clustered = crate::clustering::cluster_loose_semantic(
         &tree.loose_files,
@@ -132,7 +132,7 @@ pub async fn run_migration(
         },
     )
     .await;
-    progress.phase_finished(Phase::Indexing).await;
+    progress.phase_finished(Phase::Clustering).await;
 
     let content_bundles = clustered.bundles;
     let loose_files = clustered.loose;
@@ -143,6 +143,18 @@ pub async fn run_migration(
         classifications: Vec::new(),
         unclassified: Vec::new(),
     };
+
+    // Bundles and loose files share one Classifying phase with one running
+    // counter. Both bundle loops classify member files, and they used to run
+    // between `phase_finished` and `phase_started(Classifying)` with no
+    // progress events at all — the longest unreported stretch of the run.
+    let bundle_count = tree.bundles.len().saturating_add(content_bundles.len());
+    let classify_total =
+        u64::try_from(bundle_count.saturating_add(loose_files.len())).unwrap_or(u64::MAX);
+    progress
+        .phase_started(Phase::Classifying, Some(classify_total))
+        .await;
+    let mut classified_count: u64 = 0;
 
     // Bundles first: they bypass per-file routing, while the aggregate still
     // targets the best-matching leaf folder.
@@ -159,6 +171,17 @@ pub async fn run_migration(
                     .await;
             }
         }
+        classified_count = classified_count.saturating_add(1);
+        progress
+            .item_completed(
+                Phase::Classifying,
+                ProgressItem {
+                    label: bundle.root.display().to_string(),
+                    current: classified_count,
+                    total: Some(classify_total),
+                },
+            )
+            .await;
     }
 
     // Semantic collections and other loose-file clusters need per-member
@@ -192,14 +215,20 @@ pub async fn run_migration(
                     .await;
             }
         }
+        classified_count = classified_count.saturating_add(1);
+        progress
+            .item_completed(
+                Phase::Classifying,
+                ProgressItem {
+                    label: bundle.root.display().to_string(),
+                    current: classified_count,
+                    total: Some(classify_total),
+                },
+            )
+            .await;
     }
 
-    let total = u64::try_from(loose_files.len()).unwrap_or(u64::MAX);
-    progress
-        .phase_started(Phase::Classifying, Some(total))
-        .await;
-
-    for (idx, path) in loose_files.iter().enumerate() {
+    for path in &loose_files {
         match classify_file(
             path,
             profiles,
@@ -232,13 +261,14 @@ pub async fn run_migration(
                 outcome.unclassified.push(path.clone());
             }
         }
+        classified_count = classified_count.saturating_add(1);
         progress
             .item_completed(
                 Phase::Classifying,
                 ProgressItem {
                     label: path.display().to_string(),
-                    current: u64::try_from(idx).unwrap_or(u64::MAX).saturating_add(1),
-                    total: Some(total),
+                    current: classified_count,
+                    total: Some(classify_total),
                 },
             )
             .await;
