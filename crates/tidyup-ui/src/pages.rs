@@ -73,6 +73,8 @@ pub(crate) fn Dashboard() -> Element {
 
     let source = use_signal(String::new);
     let target = use_signal(String::new);
+    let scan_dry_run = use_signal(|| true);
+    let migrate_dry_run = use_signal(|| true);
 
     let model_ok = signals.model_ready.read().unwrap_or(false);
     let busy = *signals.busy.read();
@@ -85,20 +87,27 @@ pub(crate) fn Dashboard() -> Element {
     let scan_state = state.clone();
     let on_scan = move |_| {
         let src = source.read().trim().to_string();
+        let dry_run = *scan_dry_run.read();
         if src.is_empty() {
             return;
         }
-        launch_scan(&scan_state, PathBuf::from(src));
+        launch_scan(&scan_state, PathBuf::from(src), dry_run);
     };
 
     let migrate_state = state.clone();
     let on_migrate = move |_| {
         let src = source.read().trim().to_string();
         let tgt = target.read().trim().to_string();
+        let dry_run = *migrate_dry_run.read();
         if src.is_empty() || tgt.is_empty() {
             return;
         }
-        launch_migrate(&migrate_state, PathBuf::from(src), PathBuf::from(tgt));
+        launch_migrate(
+            &migrate_state,
+            PathBuf::from(src),
+            PathBuf::from(tgt),
+            dry_run,
+        );
     };
 
     rsx! {
@@ -118,6 +127,7 @@ pub(crate) fn Dashboard() -> Element {
                 h2 { class: "card-title", "Scan" }
                 p { class: "card-subtitle", "Classify files in a directory against tidyup's built-in taxonomy." }
                 PathField { label: "Source directory", value: source, placeholder: "/Users/you/Downloads" }
+                DryRunToggle { value: scan_dry_run }
                 div {
                     class: "button-row",
                     button {
@@ -135,6 +145,7 @@ pub(crate) fn Dashboard() -> Element {
                 p { class: "card-subtitle", "Sort files from a source tree into the structure of an existing target hierarchy." }
                 PathField { label: "Source directory", value: source, placeholder: "/Users/you/Downloads/incoming" }
                 PathField { label: "Target hierarchy", value: target, placeholder: "/Users/you/Documents" }
+                DryRunToggle { value: migrate_dry_run }
                 div {
                     class: "button-row",
                     button {
@@ -200,8 +211,8 @@ pub(crate) fn Review() -> Element {
 
     let model = build_diff_model(&proposals);
     let applied_count = signals.last_report.read().as_ref().map_or(0, |r| match r {
-        LastReport::Scan(s) => s.applied,
-        LastReport::Migration(m) => m.applied,
+        LastReport::Scan { report, .. } => report.applied,
+        LastReport::Migration { report, .. } => report.applied,
         LastReport::Rollback(_) => 0,
     });
     let folder_count = count_folders(&model.left_rows);
@@ -1842,6 +1853,18 @@ fn PathField(label: &'static str, value: Signal<String>, placeholder: &'static s
 }
 
 #[component]
+fn DryRunToggle(value: Signal<bool>) -> Element {
+    let enabled = *value.read();
+    let on_change = move |event: Event<FormData>| value.set(event.checked());
+    rsx! {
+        label { class: "form-hint", style: "display: flex; gap: 8px; margin-bottom: var(--space-md); cursor: pointer;",
+            input { r#type: "checkbox", checked: enabled, onchange: on_change }
+            span { strong { "Preview only (dry run)" } " — reports what would apply; files, shelves, and proposal state stay unchanged." }
+        }
+    }
+}
+
+#[component]
 fn ModelBanner(signals: SignalBundle) -> Element {
     let ready = *signals.model_ready.read();
     match ready {
@@ -1981,9 +2004,10 @@ fn LastReportCard(signals: SignalBundle) -> Element {
     };
 
     match report {
-        LastReport::Scan(r) => rsx! {
+        LastReport::Scan { report: r, dry_run } => rsx! {
             ReportSummary {
-                title: "Scan complete",
+                title: if dry_run { "Scan preview complete" } else { "Scan complete" },
+                dry_run,
                 run_id: r.run_id,
                 indexed: r.indexed,
                 indexing_failed: r.indexing_failed,
@@ -1998,9 +2022,10 @@ fn LastReportCard(signals: SignalBundle) -> Element {
                 visual_candidates_over_cap: r.visual_candidates_over_cap,
             }
         },
-        LastReport::Migration(r) => rsx! {
+        LastReport::Migration { report: r, dry_run } => rsx! {
             ReportSummary {
-                title: "Migration complete",
+                title: if dry_run { "Migration preview complete" } else { "Migration complete" },
+                dry_run,
                 run_id: r.run_id,
                 indexed: r.source_indexed + r.target_indexed,
                 indexing_failed: r.indexing_failed,
@@ -2051,7 +2076,8 @@ fn LastReportCard(signals: SignalBundle) -> Element {
 #[component]
 #[allow(clippy::too_many_arguments)]
 fn ReportSummary(
-    title: &'static str,
+    title: String,
+    dry_run: bool,
     run_id: Uuid,
     indexed: usize,
     indexing_failed: usize,
@@ -2083,12 +2109,12 @@ fn ReportSummary(
                 if indexing_failed > 0 {
                     span { class: "chip chip-low", "{indexing_failed} indexing failure(s)" }
                 }
-                span { class: "chip chip-high",    "{applied} applied" }
+                span { class: "chip chip-high",    if dry_run { "{applied} would apply" } else { "{applied} applied" } }
                 if skipped > 0 { span { class: "chip chip-medium", "{skipped} skipped" } }
                 if failed  > 0 { span { class: "chip chip-low",    "{failed} failed" } }
                 if bundles > 0 {
                     span { class: "chip chip-neutral", "{bundles} bundle(s)" }
-                    span { class: "chip chip-high",    "{bundles_applied} bundle(s) applied" }
+                    span { class: "chip chip-high",    if dry_run { "{bundles_applied} bundle(s) would apply" } else { "{bundles_applied} bundle(s) applied" } }
                 }
                 if already_in_place > 0 {
                     span { class: "chip chip-neutral", "{already_in_place} already in place" }
@@ -2121,7 +2147,7 @@ fn current_activation(signals: SignalBundle) -> InferenceActivation {
     }
 }
 
-fn launch_scan(state: &SharedState, source: PathBuf) {
+fn launch_scan(state: &SharedState, source: PathBuf, dry_run: bool) {
     let signals = state.signals;
     let slot = state.review_slot.clone();
     let bundle_slot = state.bundle_review_slot.clone();
@@ -2158,7 +2184,7 @@ fn launch_scan(state: &SharedState, source: PathBuf) {
                     ScanRequest {
                         root: source,
                         taxonomy_path: None,
-                        dry_run: false,
+                        dry_run,
                         auto_approve_bundles: false,
                         bundle_min_confidence: 0.85,
                     },
@@ -2176,7 +2202,7 @@ fn launch_scan(state: &SharedState, source: PathBuf) {
         match result {
             Ok(r) => {
                 let mut last = signals.last_report;
-                last.set(Some(LastReport::Scan(r)));
+                last.set(Some(LastReport::Scan { report: r, dry_run }));
             }
             Err(e) => {
                 let mut err = signals.error;
@@ -2190,7 +2216,7 @@ fn launch_scan(state: &SharedState, source: PathBuf) {
     });
 }
 
-fn launch_migrate(state: &SharedState, source: PathBuf, target: PathBuf) {
+fn launch_migrate(state: &SharedState, source: PathBuf, target: PathBuf, dry_run: bool) {
     let signals = state.signals;
     let slot = state.review_slot.clone();
     let bundle_slot = state.bundle_review_slot.clone();
@@ -2214,7 +2240,7 @@ fn launch_migrate(state: &SharedState, source: PathBuf, target: PathBuf) {
                     MigrationRequest {
                         source,
                         target,
-                        dry_run: false,
+                        dry_run,
                         auto_approve_bundles: false,
                         bundle_min_confidence: 0.85,
                     },
@@ -2229,7 +2255,7 @@ fn launch_migrate(state: &SharedState, source: PathBuf, target: PathBuf) {
         match result {
             Ok(r) => {
                 let mut last = signals.last_report;
-                last.set(Some(LastReport::Migration(r)));
+                last.set(Some(LastReport::Migration { report: r, dry_run }));
             }
             Err(e) => {
                 let mut err = signals.error;

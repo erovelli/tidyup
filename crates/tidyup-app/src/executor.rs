@@ -1354,9 +1354,11 @@ mod tests {
         let dst = dir.path().join("out/p.txt");
 
         let proposal = sample_proposal(src.clone(), &dst);
+        let log = RecordingLog::new();
+        let shelf = NoopBackup::new();
         let deps = ExecutorDeps {
-            change_log: &RecordingLog::new(),
-            backup_store: &NoopBackup::new(),
+            change_log: &log,
+            backup_store: &shelf,
             progress: &NullProgress,
         };
         let decisions = vec![ReviewDecision::Approve(proposal.id)];
@@ -1366,6 +1368,8 @@ mod tests {
         assert_eq!(report.applied, 1, "dry-run reports what would apply");
         assert!(src.exists(), "dry-run must not touch source");
         assert!(!dst.exists(), "dry-run must not touch destination");
+        assert!(shelf.shelved.lock().unwrap().is_empty());
+        assert!(log.applied.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
