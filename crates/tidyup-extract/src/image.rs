@@ -142,6 +142,13 @@ struct ImageProbe {
     error: Option<String>,
 }
 
+// The OCR bounds are only read on macOS builds where the Vision helper
+// compiled. Elsewhere they are inert, and `-D warnings` would otherwise reject
+// them as unused; keep the real names so the macOS branch stays readable.
+#[cfg_attr(
+    not(all(target_os = "macos", macos_vision_ocr)),
+    allow(unused_variables)
+)]
 fn probe(path: &Path, ocr_enabled: bool, max_ocr_bytes: u64) -> ImageProbe {
     let dimensions = image::image_dimensions(path).ok();
 
