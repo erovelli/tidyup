@@ -17,5 +17,6 @@ pub mod profiler;
 pub mod scan;
 pub mod scanner;
 pub mod semantic;
+pub mod spine;
 pub mod text_util;
 pub mod yake;
