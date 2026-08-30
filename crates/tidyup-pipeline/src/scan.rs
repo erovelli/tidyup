@@ -38,12 +38,16 @@ use tidyup_core::inference::{
 };
 use tidyup_domain::change::{ChangeProposal, ChangeStatus, ChangeType};
 use tidyup_domain::{BundleProposal, ClassifierConfig, Phase};
-use uuid::Uuid;
 
-use crate::naming::{propose_rename, uniquify_bundle_member_names, RenameProposal};
+use crate::naming::{uniquify_bundle_member_names, RenameProposal};
 use crate::scanner::{self, DetectedBundle};
 use crate::semantic::{gate_grounded_rename, GroundedConcept, SemanticRunCache};
+use crate::spine::{
+    build_proposal as build_shared_proposal, cosine, file_modality, find_year, gate_rename,
+    normalize_semantic_text,
+};
 use crate::yake;
+use uuid::Uuid;
 
 /// A classification target: one leaf in the scan taxonomy.
 ///
@@ -288,7 +292,7 @@ pub async fn run_scan(
         .await
         {
             Ok(Some(classified)) => {
-                let mut proposal = build_proposal(path, output_root, &classified, identities);
+                let mut proposal = scan_proposal(path, output_root, &classified, identities);
                 // Report calibrated confidence (no-op under the default Identity
                 // calibration; applies Platt scaling when a fitted set is set).
                 proposal.confidence = config.calibration.calibrate(proposal.confidence);
@@ -453,7 +457,9 @@ async fn classify_file(
             } else {
                 text
             };
-            match tier3_rerank(backend, embeddings, llm_evidence, &filename, candidates).await {
+            match rerank_scan_candidates(backend, embeddings, llm_evidence, &filename, candidates)
+                .await
+            {
                 Ok(Some((llm_idx, llm_score, llm_gap, model_id))) if llm_score > chosen_score => {
                     chosen_idx = llm_idx;
                     chosen_score = llm_score;
@@ -587,13 +593,6 @@ async fn semantic_best_match(
     Ok((Some(index), score, gap, query))
 }
 
-fn normalize_semantic_text(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| if ch.is_alphanumeric() { ch } else { ' ' })
-        .collect::<String>()
-}
-
 /// Optional rerank: ask the LLM to classify the content, then re-embed its summary +
 /// category + tags as a richer query and re-rank the candidate list. Returns
 /// `(idx, score, gap, model_id)` for the new top, or `None` when the LLM
@@ -601,7 +600,7 @@ fn normalize_semantic_text(value: &str) -> String {
 ///
 /// We deliberately ignore the LLM's `suggested_name`: rename proposals use
 /// exact evidence or scored local concept retrieval, never LLM-authored text.
-async fn tier3_rerank(
+async fn rerank_scan_candidates(
     text_backend: &dyn TextBackend,
     embeddings: &dyn EmbeddingBackend,
     text: &str,
@@ -612,34 +611,18 @@ async fn tier3_rerank(
     // windows. Extractors may return very long PDFs; truncating on a character
     // boundary preserves deterministic, valid UTF-8 input.
     let bounded_text = crate::text_util::char_prefix(text, 12_000);
-    let classification = text_backend.classify_text(bounded_text, filename).await?;
-    let model_id = text_backend.model_id().to_string();
-    let query = build_llm_query(&classification);
-    if query.is_empty() {
+    let Some((query, model_id)) =
+        crate::spine::tier3_rerank(text_backend, bounded_text, filename).await?
+    else {
         return Ok(None);
-    }
+    };
     let llm_embedding = embeddings.embed_text(&query).await?;
     let (idx, score, gap) = best_match(&llm_embedding, candidates);
     Ok(idx.map(|i| (i, score, gap, model_id)))
 }
 
 /// Build a single dense query string from a [`ContentClassification`]. The
-/// summary carries most of the signal, but category + tags add lexical
-/// overlap with taxonomy descriptions (which use keyword-soup).
-fn build_llm_query(c: &tidyup_core::inference::ContentClassification) -> String {
-    let mut parts = Vec::with_capacity(3);
-    if !c.category.is_empty() {
-        parts.push(c.category.clone());
-    }
-    if !c.tags.is_empty() {
-        parts.push(c.tags.join(" "));
-    }
-    if !c.summary.is_empty() {
-        parts.push(c.summary.clone());
-    }
-    parts.join(" ")
-}
-
+// The shared helper builds the LLM query from summary, category, and tags.
 /// File size in bytes, or `0` if it can't be stat'd (treated as "small enough";
 /// the subsequent read then falls through safely).
 async fn file_len(path: &Path) -> u64 {
@@ -647,26 +630,7 @@ async fn file_len(path: &Path) -> u64 {
 }
 
 /// Select a compatible semantic capability from the centralized MIME result.
-/// Unknown/application types use the general text/context path; no local
-/// extension table controls inference behavior.
-fn file_modality(mime: Option<&str>) -> FileModality {
-    if let Some(m) = mime {
-        if m.starts_with("image/") {
-            return FileModality::Image;
-        }
-        if m.starts_with("audio/") {
-            return FileModality::Audio;
-        }
-        if m.starts_with("video/") {
-            return FileModality::Video;
-        }
-        if m.starts_with("text/") || m == "application/pdf" {
-            return FileModality::Text;
-        }
-    }
-    FileModality::Text
-}
-
+// Unknown/application types use the general text/context path.
 /// Image-modality routing — `SigLIP` cross-modal cosine against image taxonomy.
 ///
 /// Returns `Ok(None)` when the image fails to read or the candidate list is
@@ -770,79 +734,12 @@ async fn classify_audio(
     }))
 }
 
-struct GatedRename {
-    proposal: RenameProposal,
-    mismatch_score: Option<f32>,
-}
-
 /// Run the rename cascade and apply the two-signal gate from `RenameConfig`.
 ///
 /// Returns `RenameProposal::Keep` (and no mismatch score) when either gate
 /// fails, so downstream code can treat "Keep" uniformly without reading the
 /// thresholds itself. The raw mismatch score is surfaced when it was
 /// computed, so the proposal can log it even on Keep.
-#[allow(clippy::too_many_arguments)]
-async fn gate_rename(
-    path: &Path,
-    metadata: &serde_json::Value,
-    keywords: &[yake::Keyword],
-    year: Option<i32>,
-    classification_confidence: f32,
-    embeddings: &dyn EmbeddingBackend,
-    content_text: Option<&str>,
-    filename: &str,
-    config: &ClassifierConfig,
-) -> Result<GatedRename> {
-    let proposal = propose_rename(path, metadata, keywords, year);
-    if matches!(proposal, RenameProposal::Keep) {
-        return Ok(GatedRename {
-            proposal,
-            mismatch_score: None,
-        });
-    }
-
-    if classification_confidence < config.rename.min_classification_confidence {
-        return Ok(GatedRename {
-            proposal: RenameProposal::Keep,
-            mismatch_score: None,
-        });
-    }
-
-    let Some(content_text) = content_text else {
-        return Ok(GatedRename {
-            proposal: RenameProposal::Keep,
-            mismatch_score: None,
-        });
-    };
-
-    let filename_vec = embeddings.embed_text(filename).await?;
-    let content_vec = embeddings.embed_text(content_text).await?;
-    let cos = cosine(&filename_vec, &content_vec);
-    let mismatch = 1.0_f32 - cos;
-    if mismatch < config.rename.min_mismatch_score {
-        return Ok(GatedRename {
-            proposal: RenameProposal::Keep,
-            mismatch_score: Some(mismatch),
-        });
-    }
-
-    Ok(GatedRename {
-        proposal,
-        mismatch_score: Some(mismatch),
-    })
-}
-
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if na == 0.0 || nb == 0.0 {
-        0.0
-    } else {
-        dot / (na * nb)
-    }
-}
-
 fn best_match(vec: &[f32], candidates: &[ScanCandidate]) -> (Option<usize>, f32, f32) {
     if candidates.is_empty() {
         return (None, 0.0, 0.0);
@@ -876,52 +773,6 @@ fn year_from_path_and_text(path: &Path, text: Option<&str>) -> Option<i32> {
     text.and_then(|t| find_year(crate::text_util::char_prefix(t, 1000)))
 }
 
-fn find_year(s: &str) -> Option<i32> {
-    crate::text_util::find_year(s)
-}
-
-fn build_proposal(
-    source: &Path,
-    output_root: &Path,
-    c: &ClassifiedFile,
-    identities: &crate::indexing::SourceIdentities,
-) -> ChangeProposal {
-    let final_name = match &c.rename {
-        RenameProposal::Rename { name, .. } => name.clone(),
-        RenameProposal::Keep => source
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or_default()
-            .to_string(),
-    };
-    let destination_dir = destination_dir(output_root, &c.folder_path, c.year, c.temporal);
-    let proposed_path = destination_dir.join(&final_name);
-
-    let change_type = match c.rename {
-        RenameProposal::Rename { .. } => ChangeType::RenameAndMove,
-        RenameProposal::Keep => ChangeType::Move,
-    };
-
-    ChangeProposal {
-        id: Uuid::new_v4(),
-        file_id: identities.file_id(source),
-        change_type,
-        original_path: source.to_path_buf(),
-        proposed_path,
-        proposed_name: final_name,
-        confidence: c.confidence,
-        reasoning: c.reasoning.clone(),
-        needs_review: c.needs_review,
-        status: ChangeStatus::Pending,
-        created_at: Utc::now(),
-        applied_at: None,
-        bundle_id: None,
-        classification_confidence: c.classification_confidence,
-        rename_mismatch_score: c.rename_mismatch_score,
-        content_hash: identities.content_hash(source),
-    }
-}
-
 fn destination_dir(
     output_root: &Path,
     folder_path: &str,
@@ -940,6 +791,30 @@ fn destination_dir(
         }
     }
     dest
+}
+
+fn scan_proposal(
+    source: &Path,
+    output_root: &Path,
+    classified: &ClassifiedFile,
+    identities: &crate::indexing::SourceIdentities,
+) -> ChangeProposal {
+    build_shared_proposal(
+        source,
+        &destination_dir(
+            output_root,
+            &classified.folder_path,
+            classified.year,
+            classified.temporal,
+        ),
+        &classified.rename,
+        classified.confidence,
+        classified.reasoning.clone(),
+        classified.needs_review,
+        classified.classification_confidence,
+        classified.rename_mismatch_score,
+        identities,
+    )
 }
 
 async fn build_bundle_proposal(
@@ -1033,6 +908,7 @@ async fn build_bundle_proposal(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 async fn build_content_bundle_proposal(
     bundle: &DetectedBundle,
     identities: &crate::indexing::SourceIdentities,
@@ -1070,7 +946,7 @@ async fn build_content_bundle_proposal(
         )
         .await?
         .ok_or_else(|| anyhow::anyhow!("no classification for {}", member.display()))?;
-        let mut proposal = build_proposal(member, output_root, &classified, identities);
+        let mut proposal = scan_proposal(member, output_root, &classified, identities);
         confidence_sum += proposal.confidence;
         if !allow_renames {
             proposal.change_type = ChangeType::Move;
@@ -1110,7 +986,8 @@ async fn build_content_bundle_proposal(
     if uncertain && config.enable_llm_fallback {
         if let Some(backend) = text_backend {
             if let Ok(Some((llm_index, llm_score, llm_gap, _))) =
-                tier3_rerank(backend, embeddings, &collection_query, &label, candidates).await
+                rerank_scan_candidates(backend, embeddings, &collection_query, &label, candidates)
+                    .await
             {
                 if llm_score > collection_confidence {
                     chosen_index = Some(llm_index);
