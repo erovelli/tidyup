@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{anyhow, Context};
+use chrono::Utc as ChronoUtc;
 use tidyup_core::frontend::{Level, ProgressItem, ProgressReporter, ReviewHandler};
 use tidyup_core::storage::{BackupStore, ChangeLog};
 use tidyup_core::Result;
@@ -89,6 +90,47 @@ pub fn apply_envelope_capacity_limits(
         }
     }
     report
+}
+
+/// Avoid an unsafe overlay when an envelope's final directory already exists.
+///
+/// Directory merges are not a rename and cannot offer the same atomicity as an
+/// envelope move. Instead, select a unique temporal import parent and hold the
+/// redirected proposal for explicit review. This preserves both directory
+/// trees intact and leaves a future user-directed merge as a separate action.
+#[must_use]
+pub fn redirect_conflicting_directory_envelopes(bundles: &mut [BundleProposal]) -> usize {
+    let mut redirected = 0_usize;
+    let period = ChronoUtc::now().format("%Y-%m").to_string();
+    for bundle in bundles {
+        if !matches!(&bundle.kind, BundleKind::DirectoryEnvelope) {
+            continue;
+        }
+        let Some(leaf) = bundle.root.file_name() else {
+            continue;
+        };
+        if !bundle.target_parent.join(leaf).exists() {
+            continue;
+        }
+        let imports = bundle.target_parent.join("Tidyup Imports").join(&period);
+        let mut index = 1_u32;
+        let fallback = loop {
+            let candidate = imports.join(format!("batch-{index}"));
+            if !candidate.join(leaf).exists() {
+                break candidate;
+            }
+            index = index.saturating_add(1);
+        };
+        bundle.target_parent = fallback;
+        if let Some(envelope) = &mut bundle.envelope {
+            envelope.requires_review = true;
+            envelope.evidence.push(
+                "destination directory already exists; redirected to a temporal import parent instead of merging trees".to_string(),
+            );
+        }
+        redirected = redirected.saturating_add(1);
+    }
+    redirected
 }
 
 /// Collection of dependencies the executor needs.
@@ -1815,6 +1857,45 @@ mod tests {
         assert_eq!(report.held_count, 1);
         assert!(bundle.requires_explicit_review());
         assert!(select_auto_applied_bundles(&[bundle], true, 0.5).is_empty());
+    }
+
+    #[test]
+    fn existing_envelope_destination_redirects_to_temporal_import_parent() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("source/world");
+        std::fs::create_dir_all(&source).unwrap();
+        let target_parent = dir.path().join("Games");
+        std::fs::create_dir_all(target_parent.join("world")).unwrap();
+        let snapshot = tidyup_pipeline::envelopes::snapshot_directory(&source);
+        let mut bundle = BundleProposal::new(
+            source,
+            BundleKind::DirectoryEnvelope,
+            target_parent.clone(),
+            vec![],
+            0.9,
+            "envelope".to_string(),
+        )
+        .unwrap()
+        .with_envelope(DirectoryEnvelope {
+            boundary: DirectoryBoundary::Cohesive,
+            cohesion: 0.9,
+            snapshot,
+            evidence: Vec::new(),
+            provenance: Vec::new(),
+            requires_review: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            redirect_conflicting_directory_envelopes(std::slice::from_mut(&mut bundle)),
+            1,
+        );
+        assert_ne!(bundle.target_parent, target_parent);
+        assert!(bundle
+            .target_parent
+            .components()
+            .any(|part| part.as_os_str() == "Tidyup Imports"));
+        assert!(bundle.requires_explicit_review());
     }
 
     #[test]
