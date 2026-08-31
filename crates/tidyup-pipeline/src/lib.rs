@@ -9,6 +9,7 @@
 
 pub mod calibration;
 pub mod clustering;
+pub mod envelopes;
 pub mod hashing;
 pub mod indexing;
 pub mod migration;

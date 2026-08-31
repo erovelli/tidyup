@@ -39,6 +39,7 @@ pub struct TidyupConfig {
     pub extraction: ExtractionConfig,
     pub rename: RenameConfig,
     pub bundle_detection: BundleDetectionConfig,
+    pub directory_envelopes: DirectoryEnvelopeConfig,
 }
 
 /// Resource bounds for local content extraction.
@@ -231,6 +232,39 @@ impl Default for BundleDetectionConfig {
             enabled: true,
             extra_markers: Vec::new(),
             soft_bundle_enabled: true,
+        }
+    }
+}
+
+/// Policy and resource limits for hierarchy-selected directory envelopes.
+///
+/// This is intentionally separate from legacy marker detection. Markers may
+/// contribute provenance to an envelope, but they never switch the policy on
+/// or decide its destination.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DirectoryEnvelopeConfig {
+    /// Enable generalized parent-first boundary selection. Kept off until the
+    /// full execution and rollback path is active for a release.
+    pub enabled: bool,
+    pub cohesive_threshold: f32,
+    pub container_threshold: f32,
+    pub sample_cap: usize,
+    pub min_move_improvement: f32,
+    pub backup_warn_bytes: u64,
+    pub backup_hard_limit_bytes: u64,
+}
+
+impl Default for DirectoryEnvelopeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            cohesive_threshold: 0.60,
+            container_threshold: 0.35,
+            sample_cap: 24,
+            min_move_improvement: 0.05,
+            backup_warn_bytes: 2 * 1024 * 1024 * 1024,
+            backup_hard_limit_bytes: 10 * 1024 * 1024 * 1024,
         }
     }
 }

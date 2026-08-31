@@ -254,6 +254,34 @@ pub struct ClassifierConfig {
     /// Confidence calibration applied to reported classification confidence.
     /// Default [`Calibration::Identity`] (raw scores) — see [`Calibration`].
     pub calibration: Calibration,
+    /// Hierarchical directory-boundary policy. Kept separate from placement
+    /// thresholds because a directory may be cohesive even when its destination
+    /// is uncertain.
+    pub directory_envelopes: DirectoryEnvelopeConfig,
+}
+
+/// Configuration for generalized directory envelopes.
+#[derive(Debug, Clone)]
+pub struct DirectoryEnvelopeConfig {
+    /// Enables hierarchy-selected envelopes. The implementation is introduced
+    /// behind this gate so callers can retain legacy marker-only discovery
+    /// while the new model is calibrated.
+    pub enabled: bool,
+    /// Minimum aggregate affinity for a directory to become a cohesive boundary.
+    pub cohesive_threshold: f32,
+    /// Maximum aggregate affinity for a directory to be confidently treated as
+    /// a heterogeneous container and recursed into.
+    pub container_threshold: f32,
+    /// Deterministic cap on expensive descendant evidence extraction.
+    pub sample_cap: usize,
+    /// Scan only moves an envelope when its selected destination improves on
+    /// its current semantic placement by at least this amount.
+    pub min_move_improvement: f32,
+    /// Warn before shelving an envelope at or above this many bytes.
+    pub backup_warn_bytes: u64,
+    /// Hold an envelope from non-interactive application at or above this
+    /// amount unless the caller explicitly permits the large backup.
+    pub backup_hard_limit_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -297,6 +325,21 @@ impl Default for ClassifierConfig {
             weights: ScoreWeights::default(),
             rename: RenameConfig::default(),
             calibration: Calibration::default(),
+            directory_envelopes: DirectoryEnvelopeConfig::default(),
+        }
+    }
+}
+
+impl Default for DirectoryEnvelopeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            cohesive_threshold: 0.60,
+            container_threshold: 0.35,
+            sample_cap: 24,
+            min_move_improvement: 0.05,
+            backup_warn_bytes: 2 * 1024 * 1024 * 1024,
+            backup_hard_limit_bytes: 10 * 1024 * 1024 * 1024,
         }
     }
 }

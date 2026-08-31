@@ -124,7 +124,7 @@ pub async fn run_migration(
 ) -> Result<MigrationOutcome> {
     let semantic_cache = SemanticRunCache::new(multimodal.artifact_store);
     progress.phase_started(Phase::Clustering, None).await;
-    let tree = scanner::scan(source_root);
+    let tree = scanner::scan_with_policy(source_root, &config.directory_envelopes);
     let clustered = crate::clustering::cluster_loose_semantic(
         &tree.loose_files,
         extractors,
@@ -1105,7 +1105,10 @@ async fn build_bundle_proposal(
             proposed_name: name,
             confidence,
             reasoning: bundle.reasoning.clone(),
-            needs_review: false,
+            needs_review: bundle
+                .envelope
+                .as_ref()
+                .is_some_and(|envelope| envelope.requires_review),
             status: ChangeStatus::Pending,
             created_at: Utc::now(),
             applied_at: None,
@@ -1116,7 +1119,7 @@ async fn build_bundle_proposal(
         });
     }
 
-    Ok(BundleProposal::new(
+    let proposal = BundleProposal::new(
         bundle.root.clone(),
         bundle.kind.clone(),
         target_parent,
@@ -1130,7 +1133,20 @@ async fn build_bundle_proposal(
         } else {
             format!("{}; semantic bundle routing", bundle.reasoning)
         },
-    )?)
+    )?;
+    let mut envelope = bundle.envelope.clone();
+    if fallback {
+        if let Some(metadata) = &mut envelope {
+            metadata.requires_review = true;
+            metadata.evidence.push(
+                "no learned destination exists; target-root fallback requires review".to_string(),
+            );
+        }
+    }
+    match envelope {
+        Some(metadata) => proposal.with_envelope(metadata).map_err(Into::into),
+        None => Ok(proposal),
+    }
 }
 
 async fn pick_bundle_target(
@@ -1521,7 +1537,11 @@ mod tests {
         .unwrap();
         assert_eq!(out.bundles.len(), 1);
         let b = &out.bundles[0];
-        assert_eq!(b.kind, BundleKind::RustCrate);
+        assert_eq!(b.kind, BundleKind::DirectoryEnvelope);
+        assert!(b
+            .envelope
+            .as_ref()
+            .is_some_and(|metadata| !metadata.provenance.is_empty()));
         // target_parent is one of the registered leaves.
         assert!(profiles
             .last_scan

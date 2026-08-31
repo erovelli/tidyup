@@ -164,7 +164,7 @@ pub async fn run_scan(
 ) -> Result<ScanOutcome> {
     let semantic_cache = SemanticRunCache::new(multimodal.artifact_store);
     progress.phase_started(Phase::Clustering, None).await;
-    let tree = scanner::scan(source_root);
+    let tree = scanner::scan_with_policy(source_root, &config.directory_envelopes);
     // Content clustering: group loose siblings into photo bursts / music albums
     // / document series. Runs after the structural scanner; these move as
     // file-sets (each member individually, atomically) — see
@@ -889,7 +889,10 @@ async fn build_bundle_proposal(
             proposed_name: name,
             confidence,
             reasoning: bundle.reasoning.clone(),
-            needs_review: false,
+            needs_review: bundle
+                .envelope
+                .as_ref()
+                .is_some_and(|envelope| envelope.requires_review),
             status: ChangeStatus::Pending,
             created_at: Utc::now(),
             applied_at: None,
@@ -900,14 +903,18 @@ async fn build_bundle_proposal(
         });
     }
 
-    Ok(BundleProposal::new(
+    let proposal = BundleProposal::new(
         bundle.root.clone(),
         bundle.kind.clone(),
         target_parent,
         members,
         confidence,
         format!("{}; semantic bundle routing", bundle.reasoning),
-    )?)
+    )?;
+    match &bundle.envelope {
+        Some(envelope) => proposal.with_envelope(envelope.clone()).map_err(Into::into),
+        None => Ok(proposal),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1289,7 +1296,13 @@ mod tests {
             &MultimodalContext::default(),
             None,
             &extractors,
-            &ClassifierConfig::default(),
+            &ClassifierConfig {
+                directory_envelopes: tidyup_domain::DirectoryEnvelopeConfig {
+                    enabled: false,
+                    ..tidyup_domain::DirectoryEnvelopeConfig::default()
+                },
+                ..ClassifierConfig::default()
+            },
             &NullProgress,
         )
         .await
@@ -1515,7 +1528,11 @@ mod tests {
         .unwrap();
         assert_eq!(out.bundles.len(), 1);
         let bundle = &out.bundles[0];
-        assert_eq!(bundle.kind, BundleKind::RustCrate);
+        assert_eq!(bundle.kind, BundleKind::DirectoryEnvelope);
+        assert!(bundle
+            .envelope
+            .as_ref()
+            .is_some_and(|metadata| !metadata.provenance.is_empty()));
         assert_eq!(bundle.members.len(), 2);
         assert!(bundle.members.iter().any(|member| {
             member.original_path.ends_with("myproj/src/main.rs")

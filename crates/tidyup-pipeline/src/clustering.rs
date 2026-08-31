@@ -1040,6 +1040,7 @@ fn make_bundle(
         members,
         reasoning,
         target_subdir: Some(sanitize_subdir(subdir)),
+        envelope: None,
     }
 }
 

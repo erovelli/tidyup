@@ -36,6 +36,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use tidyup_domain::bundle::BundleKind;
+use tidyup_domain::{DirectoryEnvelope, DirectoryEnvelopeConfig};
 use walkdir::WalkDir;
 
 /// Output of a single source-tree scan. Consumed by the pipeline to emit
@@ -64,6 +65,9 @@ pub struct DetectedBundle {
     /// `"Burst 2024-01-15"`, an album title, or a filename family). `None` for
     /// directory bundles, which preserve their existing subtree layout.
     pub target_subdir: Option<String>,
+    /// Hierarchy-selected envelope metadata. `None` for legacy marker bundles
+    /// and file-set clusters.
+    pub envelope: Option<DirectoryEnvelope>,
 }
 
 /// Walk `root`, stop at recognized bundle roots, and recursively collect all
@@ -87,6 +91,36 @@ pub fn scan(root: &Path) -> ScanTree {
     tree
 }
 
+/// Scan using the configured hierarchy policy.
+///
+/// The legacy scanner remains available for compatibility and calibration. When
+/// generalized envelopes are enabled, parent-first discovery selects
+/// non-overlapping directory roots and exposes only files from confidently
+/// heterogeneous containers to loose classification and clustering.
+#[must_use]
+pub fn scan_with_policy(root: &Path, config: &DirectoryEnvelopeConfig) -> ScanTree {
+    if !config.enabled {
+        return scan(root);
+    }
+    let discovered = crate::envelopes::discover(root, config);
+    ScanTree {
+        root: root.to_path_buf(),
+        bundles: discovered
+            .envelopes
+            .into_iter()
+            .map(|envelope| DetectedBundle {
+                root: envelope.root,
+                kind: BundleKind::DirectoryEnvelope,
+                members: envelope.members,
+                reasoning: "hierarchy-selected directory envelope".to_string(),
+                target_subdir: None,
+                envelope: Some(envelope.metadata),
+            })
+            .collect(),
+        loose_files: discovered.loose_files,
+    }
+}
+
 fn scan_dir(dir: &Path, tree: &mut ScanTree) {
     if let Some((kind, reason)) = detect_bundle(dir) {
         let members = collect_members(dir);
@@ -96,6 +130,7 @@ fn scan_dir(dir: &Path, tree: &mut ScanTree) {
             members,
             reasoning: reason.to_string(),
             target_subdir: None,
+            envelope: None,
         });
         return;
     }
@@ -142,7 +177,11 @@ fn scan_dir(dir: &Path, tree: &mut ScanTree) {
 ///
 /// Returns `Some((kind, reason))` on match. Precedence runs from most-specific
 /// marker to least; see module docs for rationale.
-fn detect_bundle(dir: &Path) -> Option<(BundleKind, &'static str)> {
+/// Return descriptive marker evidence for a directory.
+///
+/// Generalized directory envelopes consume this as provenance only; marker
+/// matching must never become a destination-routing rule.
+pub(crate) fn detect_bundle(dir: &Path) -> Option<(BundleKind, &'static str)> {
     let entries = fs::read_dir(dir).ok()?;
 
     let mut has_cargo_toml = false;

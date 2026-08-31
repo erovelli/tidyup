@@ -11,7 +11,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Row, Transaction};
 use tidyup_core::storage::ChangeLog;
-use tidyup_domain::{BundleKind, BundleProposal, ChangeProposal, ChangeStatus, ChangeType, FileId};
+use tidyup_domain::{
+    BundleKind, BundleProposal, ChangeProposal, ChangeStatus, ChangeType, DirectoryEnvelope, FileId,
+};
 use uuid::Uuid;
 
 use crate::SqliteStore;
@@ -21,7 +23,7 @@ const CHANGE_COLS: &str = "id, file_id, change_type, original_path, proposed_pat
      bundle_id, classification_confidence, rename_mismatch_score, run_id, content_hash";
 
 const BUNDLE_COLS: &str = "id, root, kind, target_parent, status, reasoning, confidence, \
-     created_at, applied_at, run_id";
+     envelope_json, created_at, applied_at, run_id";
 
 fn parse_uuid(s: &str) -> rusqlite::Result<Uuid> {
     Uuid::parse_str(s).map_err(|e| {
@@ -91,6 +93,10 @@ fn row_to_bundle(row: &Row<'_>) -> rusqlite::Result<BundleProposal> {
     let kind: BundleKind = parse_domain(serde_json::from_str(&row.get::<_, String>("kind")?))?;
     let status = parse_domain(ChangeStatus::parse(&row.get::<_, String>("status")?))?;
     let confidence = f64_to_f32(row.get::<_, f64>("confidence")?);
+    let envelope: Option<DirectoryEnvelope> = row
+        .get::<_, Option<String>>("envelope_json")?
+        .map(|raw| parse_domain(serde_json::from_str(&raw)))
+        .transpose()?;
     Ok(BundleProposal {
         id,
         root: PathBuf::from(row.get::<_, String>("root")?),
@@ -102,6 +108,7 @@ fn row_to_bundle(row: &Row<'_>) -> rusqlite::Result<BundleProposal> {
         status,
         created_at: row.get::<_, DateTime<Utc>>("created_at")?,
         applied_at: row.get::<_, Option<DateTime<Utc>>>("applied_at")?,
+        envelope,
     })
 }
 
@@ -267,13 +274,19 @@ impl ChangeLog for SqliteStore {
         tokio::task::spawn_blocking(move || -> Result<()> {
             let kind_json =
                 serde_json::to_string(&bundle.kind).context("encoding BundleKind to JSON")?;
+            let envelope_json = bundle
+                .envelope
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .context("encoding directory envelope metadata")?;
             {
                 let mut guard = conn.lock().map_err(|e| anyhow!("lock poisoned: {e}"))?;
                 let tx = guard.transaction()?;
                 tx.execute(
                     &format!(
                         "INSERT INTO bundles ({BUNDLE_COLS}) VALUES \
-                         (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+                         (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
                     ),
                     params![
                         bundle.id.to_string(),
@@ -283,6 +296,7 @@ impl ChangeLog for SqliteStore {
                         bundle.status.as_str(),
                         bundle.reasoning,
                         f64::from(bundle.confidence),
+                        envelope_json,
                         bundle.created_at,
                         bundle.applied_at,
                         run_id.map(|r| r.to_string()),

@@ -26,6 +26,10 @@ use crate::change::{ChangeProposal, ChangeStatus, ChangeType, ParseError};
 /// or glob that clustered the members.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BundleKind {
+    /// A generalized, non-overlapping directory boundary selected from the
+    /// source hierarchy. Marker files may appear in its provenance, but they
+    /// never determine this kind or its destination.
+    DirectoryEnvelope,
     GitRepository,
     NodeProject,
     RustCrate,
@@ -49,6 +53,7 @@ impl BundleKind {
     /// Stable discriminator string for persistence. Parameterised variants drop their payload.
     pub const fn as_str(&self) -> &'static str {
         match self {
+            Self::DirectoryEnvelope => "DirectoryEnvelope",
             Self::GitRepository => "GitRepository",
             Self::NodeProject => "NodeProject",
             Self::RustCrate => "RustCrate",
@@ -68,6 +73,7 @@ impl BundleKind {
     /// payload because only the stable discriminator is on the wire; callers may rehydrate it.
     pub fn parse(s: &str) -> Result<Self, ParseError> {
         match s {
+            "DirectoryEnvelope" => Ok(Self::DirectoryEnvelope),
             "GitRepository" => Ok(Self::GitRepository),
             "NodeProject" => Ok(Self::NodeProject),
             "RustCrate" => Ok(Self::RustCrate),
@@ -112,6 +118,52 @@ impl BundleKind {
     }
 }
 
+/// Boundary confidence for a generalized directory envelope.
+///
+/// A cohesive directory is eligible for normal, confidence-gated application.
+/// An uncertain directory is kept intact for safety, but must remain in review
+/// until the boundary model has stronger evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DirectoryBoundary {
+    Cohesive,
+    Uncertain,
+}
+
+/// A deterministic snapshot of an envelope at planning time.
+///
+/// The executor recomputes this before applying a directory-root operation.
+/// It intentionally includes directories and symlinks, not only regular files,
+/// so empty folders and link topology participate in integrity checks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectorySnapshot {
+    /// Stable BLAKE3 digest over every relative entry and its identity token.
+    pub digest: String,
+    pub regular_files: u64,
+    pub directories: u64,
+    pub symlinks: u64,
+    pub total_bytes: u64,
+    /// `false` means discovery encountered an unreadable or unsupported entry.
+    /// Such an envelope must not be applied automatically.
+    pub complete: bool,
+}
+
+/// Audit and safety metadata for a [`BundleKind::DirectoryEnvelope`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DirectoryEnvelope {
+    pub boundary: DirectoryBoundary,
+    /// Aggregate affinity in the source hierarchy. This is deliberately
+    /// independent of destination-routing confidence.
+    pub cohesion: f32,
+    pub snapshot: DirectorySnapshot,
+    /// Machine-readable/plain-language evidence retained for review/history.
+    pub evidence: Vec<String>,
+    /// Descriptive structural observations, including recognized markers.
+    pub provenance: Vec<String>,
+    /// Whether this envelope is held for interactive review even when a caller
+    /// requested bulk approval.
+    pub requires_review: bool,
+}
+
 /// Atomic move proposal for a detected bundle. Either every member applies, or none do.
 ///
 /// Status transitions mirror `ChangeStatus`: `Pending → Approved → Applied`, with `Rejected`
@@ -132,6 +184,10 @@ pub struct BundleProposal {
     pub status: ChangeStatus,
     pub created_at: DateTime<Utc>,
     pub applied_at: Option<DateTime<Utc>>,
+    /// Present only for generalized directory envelopes. Kept optional so
+    /// persisted marker and file-set bundles remain backwards compatible.
+    #[serde(default)]
+    pub envelope: Option<DirectoryEnvelope>,
 }
 
 /// Construction-time invariant violations.
@@ -139,6 +195,8 @@ pub struct BundleProposal {
 pub enum BundleError {
     #[error("bundle must have at least one member")]
     Empty,
+    #[error("directory-envelope metadata may only be attached to a DirectoryEnvelope bundle")]
+    EnvelopeKind,
     #[error("bundle member has change_type {actual}; this bundle kind preserves member names")]
     MemberNotMove { actual: &'static str },
     #[error(
@@ -161,7 +219,7 @@ impl BundleProposal {
         confidence: f32,
         reasoning: String,
     ) -> Result<Self, BundleError> {
-        if members.is_empty() {
+        if members.is_empty() && !matches!(kind, BundleKind::DirectoryEnvelope) {
             return Err(BundleError::Empty);
         }
         let id = Uuid::new_v4();
@@ -192,7 +250,32 @@ impl BundleProposal {
             status: ChangeStatus::Pending,
             created_at: Utc::now(),
             applied_at: None,
+            envelope: None,
         })
+    }
+
+    /// Attach the immutable boundary snapshot and evidence for a generalized
+    /// directory envelope.
+    ///
+    /// # Errors
+    /// Returns [`BundleError::EnvelopeKind`] when called for any other bundle
+    /// shape, preventing marker/file-set proposals from masquerading as a
+    /// hierarchy-selected envelope.
+    pub fn with_envelope(mut self, envelope: DirectoryEnvelope) -> Result<Self, BundleError> {
+        if !matches!(self.kind, BundleKind::DirectoryEnvelope) {
+            return Err(BundleError::EnvelopeKind);
+        }
+        self.envelope = Some(envelope);
+        Ok(self)
+    }
+
+    /// Whether this proposal is intentionally held from non-interactive bulk
+    /// approval because its boundary evidence is incomplete or uncertain.
+    #[must_use]
+    pub fn requires_explicit_review(&self) -> bool {
+        self.envelope
+            .as_ref()
+            .is_some_and(|envelope| envelope.requires_review || !envelope.snapshot.complete)
     }
 }
 
@@ -234,6 +317,7 @@ mod tests {
             BundleKind::XcodeProject,
             BundleKind::AndroidStudioProject,
             BundleKind::JupyterNotebookSet,
+            BundleKind::DirectoryEnvelope,
             BundleKind::PhotoBurst,
             BundleKind::MusicAlbum,
             BundleKind::SemanticCollection {
@@ -264,6 +348,7 @@ mod tests {
         assert!(!BundleKind::RustCrate.moves_as_file_set());
         assert!(!BundleKind::GitRepository.moves_as_file_set());
         assert!(!BundleKind::JupyterNotebookSet.moves_as_file_set());
+        assert!(!BundleKind::DirectoryEnvelope.moves_as_file_set());
         assert!(!BundleKind::Generic.moves_as_file_set());
     }
 
@@ -325,6 +410,20 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, BundleError::Empty));
+    }
+
+    #[test]
+    fn directory_envelope_allows_empty_directory() {
+        let bundle = BundleProposal::new(
+            PathBuf::from("/src/empty"),
+            BundleKind::DirectoryEnvelope,
+            PathBuf::from("/target"),
+            vec![],
+            0.6,
+            "hierarchy boundary".to_string(),
+        )
+        .unwrap();
+        assert!(bundle.members.is_empty());
     }
 
     #[test]
