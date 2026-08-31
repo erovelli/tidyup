@@ -13,3 +13,11 @@
 *.flac binary
 *.ogg  binary
 *.onnx binary
+
+# Brand assets under assets/brand/. Same reasoning: an icon container or a
+# compressed webfont that Git "helpfully" line-ends on a Windows checkout is a
+# corrupt file, and the failure shows up as a blank window icon or a silent
+# fallback to the system font rather than an error.
+*.ico   binary
+*.icns  binary
+*.woff2 binary

@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="tidyup">
+  <!-- PLACEHOLDER MARK — not the final identity.
+       Geometry and palette follow DESIGN.md ("The Verdant Archive"): a contained
+       rounded square in `primary` so the mark survives dark taskbar chrome, and
+       three descending `primary-container` bars for the "sorted stack" motif.
+       Replace this file, then regenerate the rasters (see README.md here). -->
+  <rect x="16" y="16" width="224" height="224" rx="56.32" fill="#48664c"/>
+  <g fill="#c8ebca">
+    <rect x="61.44" y="79.04"  width="133.12" height="21.76" rx="10.88"/>
+    <rect x="61.44" y="117.12" width="95.85"  height="21.76" rx="10.88"/>
+    <rect x="61.44" y="155.20" width="58.57"  height="21.76" rx="10.88"/>
+  </g>
+</svg>

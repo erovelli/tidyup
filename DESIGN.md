@@ -63,6 +63,22 @@ In this system, elevation is a product of light and shadow, not lines.
 
 ---
 
+## 4b. Brand Mark & Window Identity
+
+The mark lives in `assets/brand/` at the workspace root — one canonical copy read
+by the desktop binary, the README, and the packaging manifests alike. The files
+currently checked in are **placeholders** following this palette; see
+`assets/brand/README.md` for the regeneration commands.
+
+*   **Application display name is `Tidyup`.** The `tidyup-desktop` binary name is a developer-facing handle that disambiguates it from the `tidyup` CLI at the `cargo run` level; users should never see it. The window title, the freedesktop entry, and the bundle manifests all say `Tidyup`.
+*   **Set the title in code, not the manifest.** dioxus-desktop falls back to the literal `"Dioxus App"` whenever `dioxus_cli_config::app_title()` is unset, and it is always unset under the plain `cargo run` that `README.md` documents — `Dioxus.toml` only feeds that value under the `dx` CLI. Same for the icon: with `window_icon` unset, dioxus-desktop substitutes *its own* logo.
+*   **The mark must survive foreign chrome.** In-app it sits on `surface` (#f9f9f9), but on Linux and Windows the OS composites it against a panel colour we do not control. Draw it as a filled container shape rather than bare `primary` strokes on transparency, which vanish on a dark panel. macOS ignores window icons entirely and reads the `.icns` from the app bundle.
+*   **Legibility floor is 16px.** That is the size Linux taskbars and Windows title bars use. Detail that does not resolve there is decoration, not identity.
+*   **Window geometry:** 1280×860 default, 960×640 minimum. The floor is a layout constraint, not taste — the review diff draws connectors in the gutter between two columns and they overlap below that width.
+*   **Paint the host surface.** The window background is set to `surface` at launch so the webview does not flash white before the stylesheet paints.
+
+---
+
 ## 5. Components
 
 ### Tree Views & Navigation
