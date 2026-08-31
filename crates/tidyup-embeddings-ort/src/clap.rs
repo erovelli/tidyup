@@ -83,6 +83,7 @@ pub struct Config {
     pub model_id: String,
     pub dims: usize,
     pub max_seq_len: usize,
+    pub preprocessing_version: String,
     pub intra_threads: Option<usize>,
 }
 
@@ -97,6 +98,7 @@ impl Config {
             model_id: bundle.model_id.clone(),
             dims: bundle.dimensions,
             max_seq_len: bundle.max_sequence_length,
+            preprocessing_version: bundle.preprocessing_version.clone(),
             intra_threads: None,
         })
     }
@@ -109,6 +111,7 @@ pub struct ClapEmbeddings {
     tokenizer: Arc<Tokenizer>,
     dims: usize,
     model_id: String,
+    preprocessing_version: String,
 }
 
 impl std::fmt::Debug for ClapEmbeddings {
@@ -167,6 +170,7 @@ impl ClapEmbeddings {
             tokenizer: Arc::new(tokenizer),
             dims: config.dims,
             model_id: config.model_id,
+            preprocessing_version: config.preprocessing_version,
         })
     }
 
@@ -230,6 +234,10 @@ impl AudioEmbeddingBackend for ClapEmbeddings {
 
     fn model_id(&self) -> &str {
         &self.model_id
+    }
+
+    fn preprocessing_version(&self) -> &str {
+        &self.preprocessing_version
     }
 }
 
@@ -663,6 +671,7 @@ mod tests {
             model_id: "test".into(),
             dims: 512,
             max_seq_len: 77,
+            preprocessing_version: "test-v1".to_string(),
             intra_threads: None,
         };
         let err = ClapEmbeddings::load(cfg).unwrap_err();

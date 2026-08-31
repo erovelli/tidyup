@@ -48,7 +48,7 @@ use crate::scanner::{self, DetectedBundle};
 use crate::semantic::{gate_grounded_rename, GroundedConcept, SemanticRunCache};
 use crate::spine::{
     build_proposal as build_shared_proposal, cosine, file_modality, find_year, gate_rename,
-    normalize_semantic_text,
+    gate_rename_with_thresholds, normalize_semantic_text,
 };
 use crate::text_util::char_prefix;
 use crate::yake;
@@ -124,7 +124,8 @@ pub async fn run_migration(
 ) -> Result<MigrationOutcome> {
     let semantic_cache = SemanticRunCache::new(multimodal.artifact_store);
     progress.phase_started(Phase::Clustering, None).await;
-    let tree = scanner::scan_with_policy(source_root, &config.directory_envelopes);
+    let tree =
+        scanner::scan_with_policy(source_root, &config.directory_envelopes, &config.discovery);
     let clustered = crate::clustering::cluster_loose_semantic(
         &tree.loose_files,
         extractors,
@@ -171,6 +172,7 @@ pub async fn run_migration(
             embeddings,
             extractors,
             config.directory_envelopes.sample_cap,
+            config,
         )
         .await
         {
@@ -345,6 +347,8 @@ async fn classify_file(
         effective_mime.as_deref(),
         multimodal,
         profiles,
+        embeddings,
+        extracted.as_ref(),
         config,
         semantic_cache,
     )
@@ -565,12 +569,15 @@ async fn rerank_migration_profiles(
 /// in that modality's latent space. Returns `None` (fall through to text) when
 /// the modality has no backend, the file can't be read or embedded, or no
 /// folder carries a centroid in that space.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn classify_modality_file(
     path: &Path,
     modality: FileModality,
     mime: Option<&str>,
     multimodal: MigrationMultimodal<'_>,
     profiles: &ProfileCache,
+    text_embeddings: &dyn EmbeddingBackend,
+    extracted: Option<&tidyup_core::extractor::ExtractedContent>,
     config: &ClassifierConfig,
     semantic_cache: &SemanticRunCache<'_>,
 ) -> Option<Verdict> {
@@ -592,13 +599,51 @@ async fn classify_modality_file(
                 "image",
                 backend.model_id(),
             )?;
-            let grounded = gate_grounded_rename(
+            let mut grounded = gate_grounded_rename(
                 path,
                 embedding.as_slice(),
                 multimodal.image_concepts,
                 verdict.confidence,
                 config,
             );
+            if let Some(extracted) = extracted.filter(|value| {
+                value
+                    .metadata
+                    .get("ocr_text")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some()
+            }) {
+                if let Some(content_text) = extracted
+                    .text
+                    .as_deref()
+                    .filter(|text| !text.trim().is_empty())
+                {
+                    let keywords = yake::extract_keywords(content_text, 8);
+                    let filename = path
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or_default();
+                    if let Ok(ocr) = gate_rename_with_thresholds(
+                        path,
+                        &extracted.metadata,
+                        &keywords,
+                        find_year(char_prefix(content_text, 1000)),
+                        verdict.confidence,
+                        text_embeddings,
+                        Some(content_text),
+                        filename,
+                        config.image_embedding_threshold,
+                        config.rename.min_ocr_mismatch_score,
+                    )
+                    .await
+                    {
+                        if !matches!(ocr.proposal, RenameProposal::Keep) {
+                            grounded.proposal = ocr.proposal;
+                            grounded.mismatch_score = ocr.mismatch_score;
+                        }
+                    }
+                }
+            }
             if !matches!(grounded.proposal, RenameProposal::Keep) {
                 verdict.result.needs_review = true;
                 verdict.result.suggested_rename = match &grounded.proposal {
@@ -694,7 +739,12 @@ fn rank_modality_profiles(
 
     let (folder, score, _) = ranked.first().cloned()?;
     let gap = ranked.get(1).map_or(score, |(_, next, _)| score - next);
-    let needs_review = score < config.embedding_threshold || gap < config.ambiguity_gap;
+    let (threshold, ambiguity_gap) = if modality_label == "image" {
+        (config.image_embedding_threshold, config.image_ambiguity_gap)
+    } else {
+        (config.embedding_threshold, config.ambiguity_gap)
+    };
+    let needs_review = score < threshold || gap < ambiguity_gap;
 
     let candidates: Vec<Candidate> = ranked
         .iter()
@@ -1025,7 +1075,7 @@ async fn choose_collection_target(
     let ranked = rank_profiles(&embedding, profiles, &bundle.root, &config.weights);
     let (mut folder, mut score, _) = ranked.first()?.clone();
     let mut gap = ranked.get(1).map_or(score, |(_, second, _)| score - second);
-    if (score < config.embedding_threshold || gap < config.ambiguity_gap)
+    if (score < config.bundle_embedding_threshold || gap < config.bundle_ambiguity_gap)
         && config.enable_llm_fallback
     {
         if let Some(backend) = text_backend {
@@ -1058,7 +1108,7 @@ async fn choose_collection_target(
     // the target root with mandatory review — the honest "I could not place
     // this" — not a confident-looking destination nobody chose. The default
     // build has no LLM, so this is the ordinary path, not an edge case.
-    if score < config.embedding_threshold || gap < config.ambiguity_gap {
+    if score < config.bundle_embedding_threshold || gap < config.bundle_ambiguity_gap {
         return Some(CollectionTarget {
             parent: profiles.target_root.clone(),
             abstained: true,
@@ -1079,6 +1129,7 @@ async fn build_bundle_proposal(
     embeddings: &dyn EmbeddingBackend,
     extractors: &[Arc<dyn ContentExtractor>],
     evidence_sample_cap: usize,
+    config: &ClassifierConfig,
 ) -> Result<BundleProposal> {
     let leaf_name = bundle
         .root
@@ -1090,7 +1141,7 @@ async fn build_bundle_proposal(
     let (target_parent, confidence, fallback) = if profiles.last_scan.leaf_folders.is_empty() {
         (profiles.target_root.clone(), 0.0, true)
     } else {
-        let (target, score) = pick_bundle_target(
+        let (target, score, gap) = pick_bundle_target(
             bundle,
             profiles,
             embeddings,
@@ -1100,7 +1151,11 @@ async fn build_bundle_proposal(
         )
         .await
         .ok_or_else(|| anyhow::anyhow!("no semantic destination for bundle {leaf_name}"))?;
-        (target, score, false)
+        if score < config.bundle_embedding_threshold || gap < config.bundle_ambiguity_gap {
+            (profiles.target_root.clone(), 0.0, true)
+        } else {
+            (target, score, false)
+        }
     };
 
     let bundle_target_root = target_parent.join(&leaf_name);
@@ -1174,7 +1229,7 @@ async fn pick_bundle_target(
     leaf_name: &str,
     extractors: &[Arc<dyn ContentExtractor>],
     evidence_sample_cap: usize,
-) -> Option<(PathBuf, f32)> {
+) -> Option<(PathBuf, f32, f32)> {
     // Bundle kind controls atomicity, not placement. Placement is ranked from
     // the kind label, collection name, and member names against the learned
     // target-folder profiles.
@@ -1191,24 +1246,24 @@ async fn pick_bundle_target(
         evidence_sample_cap,
     )
     .await;
-    let query = format!(
-        "atomic collection kind {} name {} members {} extracted evidence {}",
-        bundle.kind.as_str(),
-        leaf_name,
-        members,
-        extracted_evidence
-    );
+    let query = format!("{leaf_name}; {members}; {extracted_evidence}");
     let query_embedding = embeddings.embed_text(&query).await.ok()?;
-    let mut best: Option<(PathBuf, f32)> = None;
+    let mut ranked = Vec::new();
     for path in &profiles.last_scan.leaf_folders {
         if let Some(profile) = profiles.profiles.get(path) {
             let score = cosine(&query_embedding, &profile.name_embedding);
-            if best.as_ref().is_none_or(|(_, s)| score > *s) {
-                best = Some((path.clone(), score));
-            }
+            ranked.push((path.clone(), score));
         }
     }
-    best
+    ranked.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let (path, score) = ranked.first()?.clone();
+    let gap = ranked.get(1).map_or(score, |(_, next)| score - next);
+    Some((path, score, gap))
 }
 
 #[cfg(test)]
@@ -1549,6 +1604,11 @@ mod tests {
         let profiles = sample_cache(tgt.path(), &eb).await;
         let ex: Vec<Arc<dyn ContentExtractor>> = vec![Arc::new(PlainExtractor)];
 
+        let config = ClassifierConfig {
+            bundle_embedding_threshold: 0.0,
+            bundle_ambiguity_gap: 0.0,
+            ..ClassifierConfig::default()
+        };
         let out = run_migration(
             src.path(),
             &crate::indexing::SourceIdentities::default(),
@@ -1557,7 +1617,7 @@ mod tests {
             None,
             MigrationMultimodal::default(),
             &ex,
-            &ClassifierConfig::default(),
+            &config,
             &NullProgress,
         )
         .await

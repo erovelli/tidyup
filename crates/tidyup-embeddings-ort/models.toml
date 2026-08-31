@@ -17,6 +17,7 @@ pad_to_max_length = false
 source = "https://huggingface.co/BAAI/bge-small-en-v1.5"
 revision = "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a"
 precision = "fp32"
+preprocessing_version = "bge-small-v1"
 
 [[bundle.artifact]]
 role = "model"
@@ -46,6 +47,7 @@ pad_to_max_length = true
 source = "https://huggingface.co/Xenova/siglip-base-patch16-224"
 revision = "4649052661e53c7000355844105f8a1792088239"
 precision = "int8"
+preprocessing_version = "siglip-fixed64-eos-int8-v2"
 
 # INT8 split towers retain the reference model's ranking quality while cutting
 # the installed footprint to ~205 MB. Local cross-modal quality and latency
@@ -84,6 +86,7 @@ pad_to_max_length = false
 source = "https://huggingface.co/Xenova/clap-htsat-unfused"
 revision = "9dcb1c1c44eaadc06be08ed5618fcf765671ccdf"
 precision = "fp32"
+preprocessing_version = "clap-v1"
 
 [[bundle.artifact]]
 role = "audio"

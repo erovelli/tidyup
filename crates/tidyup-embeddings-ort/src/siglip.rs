@@ -73,6 +73,7 @@ pub struct Config {
     pub pad_token_id: u32,
     pub pad_token: String,
     pub pad_to_max_length: bool,
+    pub preprocessing_version: String,
     pub intra_threads: Option<usize>,
 }
 
@@ -92,6 +93,7 @@ impl Config {
             pad_token_id: bundle.pad_token_id,
             pad_token: bundle.pad_token.clone(),
             pad_to_max_length: bundle.pad_to_max_length,
+            preprocessing_version: bundle.preprocessing_version.clone(),
             intra_threads: None,
         })
     }
@@ -106,6 +108,7 @@ pub struct SigLipEmbeddings {
     image_size: u32,
     pad_token_id: u32,
     model_id: String,
+    preprocessing_version: String,
 }
 
 impl std::fmt::Debug for SigLipEmbeddings {
@@ -173,6 +176,7 @@ impl SigLipEmbeddings {
             image_size: config.image_size,
             pad_token_id: config.pad_token_id,
             model_id: config.model_id,
+            preprocessing_version: config.preprocessing_version,
         })
     }
 
@@ -242,6 +246,10 @@ impl ImageEmbeddingBackend for SigLipEmbeddings {
 
     fn model_id(&self) -> &str {
         &self.model_id
+    }
+
+    fn preprocessing_version(&self) -> &str {
+        &self.preprocessing_version
     }
 }
 
@@ -512,6 +520,7 @@ mod tests {
             pad_token_id: 1,
             pad_token: "</s>".to_string(),
             pad_to_max_length: true,
+            preprocessing_version: "test-v1".to_string(),
             intra_threads: None,
         };
         let err = SigLipEmbeddings::load(cfg).unwrap_err();

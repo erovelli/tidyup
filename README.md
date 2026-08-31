@@ -256,6 +256,16 @@ backup_retention_days = 30             # shelved originals older than this are e
 [classifier]
 tiers = ["embeddings"]                 # compatibility field; only semantic embeddings are currently used
 min_confidence = 0.75                  # --yes threshold for loose move-only proposals; renames remain review-only
+text_min_similarity = 0.35             # BGE routing floor for text and general files
+text_ambiguity_gap = 0.05              # required separation from the runner-up text destination
+image_min_similarity = 0.04            # SigLIP scores have a different scale from BGE
+image_ambiguity_gap = 0.01
+bundle_min_similarity = 0.35           # aggregate structural/collection routing floor
+bundle_ambiguity_gap = 0.03             # ambiguous collections stay in place for review
+
+[discovery]
+include_hidden = false                 # ignore dotfiles and dot-directories by default
+ignore_names = [".DS_Store", ".localized", "Thumbs.db", "desktop.ini"]
 
 [inference]
 backends = ["embeddings-ort"]          # reserved: parsed for forward-compat but not yet consulted; the
@@ -277,9 +287,10 @@ ocr_max_bytes = 20971520               # 20 MiB cap for a whole image passed to 
 [rename]
 min_classification_confidence = 0.85   # both thresholds must clear before a rename is proposed
 min_mismatch_score = 0.60              # 1.0 - cosine(embed(filename), content_embedding)
+min_ocr_mismatch_score = 0.30          # OCR is direct visual evidence; use a separate mismatch floor
 min_grounded_mismatch = 0.60           # fraction of selected visual concepts absent from filename tokens
-min_grounding_confidence = 0.30        # raw contrastive score floor for non-textual concepts
-min_grounding_gap = 0.02               # selected concept must separate from the next candidate
+min_grounding_confidence = 0.05        # raw SigLIP concept-score floor for non-textual concepts
+min_grounding_gap = 0.01               # selected concept must separate from the next candidate
 
 [bundle_detection]
 enabled = true
@@ -287,7 +298,7 @@ extra_markers = []                     # extra directory-bundle marker filenames
 soft_bundle_enabled = true             # metadata clusters: EXIF photo bursts, ID3 albums, filename series
 ```
 
-`classifier.tiers` is retained so old config files continue to parse; the current classifier always uses semantic embeddings and ignores unknown/removed values. Opaque recognized structural bundles use a separate internal raw-cosine auto-approval floor of `0.50`; file-set collections and every rename remain review-only. The OCR controls are live in both CLI and desktop service construction. The `[bundle_detection]` fields are parsed but not yet wired into the pipeline.
+`classifier.tiers` is retained so old config files continue to parse; the current classifier always uses semantic embeddings and ignores unknown/removed values. Text, image, and aggregate-bundle thresholds are separate because their model score distributions are not interchangeable. An aggregate bundle that misses its routing floor or ambiguity gap is held at its source location instead of being forced into the least-bad destination. Opaque recognized structural bundles use a separate internal raw-cosine auto-approval floor of `0.50`; file-set collections and every rename remain review-only. The discovery and OCR controls are live in both CLI and desktop service construction. The `[bundle_detection]` fields are parsed but not yet wired into the pipeline.
 
 ---
 

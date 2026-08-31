@@ -219,10 +219,16 @@ impl ContentExtractor for PlainTextExtractor {
             .await
             .unwrap_or_else(|| "text/plain".to_string());
 
-        let metadata = serde_json::json!({
+        let document_title = markdown_title(path, &text);
+        let mut metadata = serde_json::json!({
             "byte_count": buf.len(),
             "truncated": truncated,
         });
+        if let Some(title) = document_title {
+            if let Some(object) = metadata.as_object_mut() {
+                object.insert("title".to_string(), serde_json::Value::String(title));
+            }
+        }
 
         Ok(ExtractedContent {
             text: Some(text),
@@ -230,6 +236,17 @@ impl ContentExtractor for PlainTextExtractor {
             metadata,
         })
     }
+}
+
+fn markdown_title(path: &Path, text: &str) -> Option<String> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    if !matches!(extension.as_str(), "md" | "markdown") {
+        return None;
+    }
+    text.lines().find_map(|line| {
+        let title = line.trim().strip_prefix("# ")?.trim();
+        (!title.is_empty()).then(|| title.to_string())
+    })
 }
 
 #[cfg(test)]
@@ -257,6 +274,21 @@ mod tests {
         let e = PlainTextExtractor::new();
         assert!(e.supports(Path::new("/repo/Dockerfile"), None));
         assert!(e.supports(Path::new("/repo/LICENSE"), None));
+    }
+
+    #[test]
+    fn markdown_h1_is_direct_title_metadata() {
+        assert_eq!(
+            markdown_title(
+                Path::new("plan.md"),
+                "# Generalized Semantic Organization Plan\nbody"
+            ),
+            Some("Generalized Semantic Organization Plan".to_string())
+        );
+        assert_eq!(
+            markdown_title(Path::new("notes.txt"), "# Not metadata"),
+            None
+        );
     }
 
     #[test]

@@ -84,6 +84,9 @@ pub struct BundleSpec {
     pub revision: String,
     /// Stored-weight precision/quantization.
     pub precision: String,
+    /// Stable cache identity for preprocessing semantics. Change this whenever
+    /// tokenization, padding, normalization, or decoding changes.
+    pub preprocessing_version: String,
 }
 
 #[derive(Debug, Deserialize)]

@@ -124,7 +124,12 @@ impl<'a> SemanticRunCache<'a> {
         let content_hash = ContentHash(blake3::hash(&bytes).to_hex().to_string());
         if let Some(store) = self.persistent {
             match store
-                .semantic_artifact(&content_hash, backend.model_id(), "image-v1", "image")
+                .semantic_artifact(
+                    &content_hash,
+                    backend.model_id(),
+                    backend.preprocessing_version(),
+                    "image",
+                )
                 .await
             {
                 Ok(Some(artifact)) if artifact.embedding.len() == backend.dimensions() => {
@@ -145,7 +150,7 @@ impl<'a> SemanticRunCache<'a> {
         self.persist_embedding(
             content_hash,
             backend.model_id(),
-            "image-v1",
+            backend.preprocessing_version(),
             "image",
             embedding.as_slice(),
         )
@@ -173,7 +178,12 @@ impl<'a> SemanticRunCache<'a> {
         let content_hash = ContentHash(blake3::hash(&bytes).to_hex().to_string());
         if let Some(store) = self.persistent {
             match store
-                .semantic_artifact(&content_hash, backend.model_id(), "audio-v1", "audio")
+                .semantic_artifact(
+                    &content_hash,
+                    backend.model_id(),
+                    backend.preprocessing_version(),
+                    "audio",
+                )
                 .await
             {
                 Ok(Some(artifact)) if artifact.embedding.len() == backend.dimensions() => {
@@ -194,7 +204,7 @@ impl<'a> SemanticRunCache<'a> {
         self.persist_embedding(
             content_hash,
             backend.model_id(),
-            "audio-v1",
+            backend.preprocessing_version(),
             "audio",
             embedding.as_slice(),
         )
@@ -320,7 +330,7 @@ pub(crate) fn gate_grounded_rename(
     classification_confidence: f32,
     config: &ClassifierConfig,
 ) -> GroundedRename {
-    if classification_confidence < config.embedding_threshold {
+    if classification_confidence < config.image_embedding_threshold {
         return GroundedRename {
             proposal: RenameProposal::Keep,
             mismatch_score: None,

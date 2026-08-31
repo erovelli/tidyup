@@ -1,5 +1,6 @@
 import CoreImage
 import Foundation
+import ImageIO
 import Vision
 
 guard CommandLine.arguments.count == 2 else {
@@ -9,26 +10,48 @@ guard CommandLine.arguments.count == 2 else {
 
 let url = URL(fileURLWithPath: CommandLine.arguments[1])
 
-func recognize(_ handler: VNImageRequestHandler) -> [String]? {
+func recognize(_ handler: VNImageRequestHandler) -> Result<[String], Error> {
     let request = VNRecognizeTextRequest()
     request.recognitionLevel = .accurate
     request.usesLanguageCorrection = true
     do {
         try handler.perform([request])
-        return (request.results ?? []).compactMap { observation in
+        return .success((request.results ?? []).compactMap { observation in
             observation.topCandidates(1).first?.string
-        }
+        })
     } catch {
-        return nil
+        return .failure(error)
     }
 }
 
-let direct = recognize(VNImageRequestHandler(url: url, options: [:]))
-let lines = direct ?? CIImage(contentsOf: url).flatMap { image in
-    recognize(VNImageRequestHandler(ciImage: image, options: [:]))
+var failures: [String] = []
+var attempts: [VNImageRequestHandler] = [VNImageRequestHandler(url: url, options: [:])]
+if let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+   let image = CGImageSourceCreateImageAtIndex(source, 0, nil) {
+    attempts.append(VNImageRequestHandler(cgImage: image, options: [:]))
+} else {
+    failures.append("ImageIO could not decode the image")
 }
+if let image = CIImage(contentsOf: url) {
+    attempts.append(VNImageRequestHandler(ciImage: image, options: [:]))
+} else {
+    failures.append("CoreImage could not decode the image")
+}
+
+var lines: [String]?
+for handler in attempts {
+    switch recognize(handler) {
+    case .success(let recognized):
+        lines = recognized
+    case .failure(let error):
+        failures.append(error.localizedDescription)
+    }
+    if lines != nil { break }
+}
+
 guard let lines else {
-    FileHandle.standardError.write(Data("OCR failed for both image decoders\n".utf8))
+    let detail = failures.joined(separator: "; ")
+    FileHandle.standardError.write(Data("OCR failed: \(detail)\n".utf8))
     exit(5)
 }
 for line in lines {

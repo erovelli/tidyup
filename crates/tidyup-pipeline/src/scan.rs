@@ -44,7 +44,7 @@ use crate::scanner::{self, DetectedBundle};
 use crate::semantic::{gate_grounded_rename, GroundedConcept, SemanticRunCache};
 use crate::spine::{
     build_proposal as build_shared_proposal, cosine, file_modality, find_year, gate_rename,
-    normalize_semantic_text,
+    gate_rename_with_thresholds, normalize_semantic_text,
 };
 use crate::yake;
 use uuid::Uuid;
@@ -164,7 +164,8 @@ pub async fn run_scan(
 ) -> Result<ScanOutcome> {
     let semantic_cache = SemanticRunCache::new(multimodal.artifact_store);
     progress.phase_started(Phase::Clustering, None).await;
-    let tree = scanner::scan_with_policy(source_root, &config.directory_envelopes);
+    let tree =
+        scanner::scan_with_policy(source_root, &config.directory_envelopes, &config.discovery);
     // Content clustering: group loose siblings into photo bursts / music albums
     // / document series. Runs after the structural scanner; these move as
     // file-sets (each member individually, atomically) — see
@@ -219,6 +220,7 @@ pub async fn run_scan(
             embeddings,
             extractors,
             config.directory_envelopes.sample_cap,
+            config,
         )
         .await
         {
@@ -406,6 +408,7 @@ async fn classify_file(
             if let Some(verdict) = classify_image(
                 path,
                 img_ctx,
+                embeddings,
                 effective_mime.as_deref(),
                 extracted.as_ref(),
                 config,
@@ -651,6 +654,7 @@ async fn file_len(path: &Path) -> u64 {
 async fn classify_image(
     path: &Path,
     ctx: &ImageContext<'_>,
+    text_embeddings: &dyn EmbeddingBackend,
     mime: Option<&str>,
     extracted: Option<&tidyup_core::extractor::ExtractedContent>,
     config: &ClassifierConfig,
@@ -673,10 +677,50 @@ async fn classify_image(
     let Some(candidate) = ctx.candidates.get(idx) else {
         return Ok(None);
     };
-    let needs_review = best_score < config.embedding_threshold || gap < config.ambiguity_gap;
+    let needs_review =
+        best_score < config.image_embedding_threshold || gap < config.image_ambiguity_gap;
     let year = year_from_path_and_text(path, extracted.and_then(|e| e.text.as_deref()));
-    let grounded =
+    let mut grounded =
         gate_grounded_rename(path, embedding.as_slice(), ctx.concepts, best_score, config);
+    // Screenshots often contain stronger local OCR evidence than the bounded
+    // visual concept bank. Keep SigLIP for destination routing, but allow the
+    // exact extracted text to author a review-only filename.
+    if let Some(extracted) = extracted.filter(|value| {
+        value
+            .metadata
+            .get("ocr_text")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+    }) {
+        if let Some(content_text) = extracted
+            .text
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+        {
+            let keywords = yake::extract_keywords(content_text, 8);
+            let filename = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default();
+            let ocr = gate_rename_with_thresholds(
+                path,
+                &extracted.metadata,
+                &keywords,
+                year,
+                best_score,
+                text_embeddings,
+                Some(content_text),
+                filename,
+                config.image_embedding_threshold,
+                config.rename.min_ocr_mismatch_score,
+            )
+            .await?;
+            if !matches!(ocr.proposal, RenameProposal::Keep) {
+                grounded.proposal = ocr.proposal;
+                grounded.mismatch_score = ocr.mismatch_score;
+            }
+        }
+    }
     let concept_reasoning = grounded
         .concepts
         .iter()
@@ -830,6 +874,7 @@ fn scan_proposal(
     )
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn build_bundle_proposal(
     bundle: &DetectedBundle,
     identities: &crate::indexing::SourceIdentities,
@@ -838,6 +883,7 @@ async fn build_bundle_proposal(
     embeddings: &dyn EmbeddingBackend,
     extractors: &[Arc<dyn ContentExtractor>],
     evidence_sample_cap: usize,
+    config: &ClassifierConfig,
 ) -> Result<BundleProposal> {
     let leaf = bundle
         .root
@@ -858,18 +904,26 @@ async fn build_bundle_proposal(
     )
     .await;
     let query = format!(
-        "atomic collection kind {} name {} members {} extracted evidence {}",
-        bundle.kind.as_str(),
+        "{}; {}; {}",
         normalize_semantic_text(leaf),
         normalize_semantic_text(&member_names),
         normalize_semantic_text(&extracted_evidence),
     );
     let embedding = embeddings.embed_text(&query).await?;
-    let (candidate_index, confidence, _) = best_match(&embedding, candidates);
-    let candidate = candidate_index
-        .and_then(|index| candidates.get(index))
-        .ok_or_else(|| anyhow::anyhow!("no semantic destination candidate for bundle {leaf}"))?;
-    let target_parent = output_root.join(candidate.folder_path.trim_end_matches('/'));
+    let (candidate_index, raw_confidence, gap) = best_match(&embedding, candidates);
+    let uncertain =
+        raw_confidence < config.bundle_embedding_threshold || gap < config.bundle_ambiguity_gap;
+    let confidence = if uncertain { 0.0 } else { raw_confidence };
+    let target_parent = if uncertain {
+        output_root.to_path_buf()
+    } else {
+        let candidate = candidate_index
+            .and_then(|index| candidates.get(index))
+            .ok_or_else(|| {
+                anyhow::anyhow!("no semantic destination candidate for bundle {leaf}")
+            })?;
+        output_root.join(candidate.folder_path.trim_end_matches('/'))
+    };
 
     // Directory bundles keep their subtree under a folder named after the root
     // (members relocate relative to the root). File-set clusters (photo bursts,
@@ -908,10 +962,11 @@ async fn build_bundle_proposal(
             proposed_name: name,
             confidence,
             reasoning: bundle.reasoning.clone(),
-            needs_review: bundle
-                .envelope
-                .as_ref()
-                .is_some_and(|envelope| envelope.requires_review),
+            needs_review: uncertain
+                || bundle
+                    .envelope
+                    .as_ref()
+                    .is_some_and(|envelope| envelope.requires_review),
             status: ChangeStatus::Pending,
             created_at: Utc::now(),
             applied_at: None,
@@ -928,7 +983,17 @@ async fn build_bundle_proposal(
         target_parent,
         members,
         confidence,
-        format!("{}; semantic bundle routing", bundle.reasoning),
+        if uncertain {
+            format!(
+                "{}; bundle routing abstained: cos={raw_confidence:.3} gap={gap:.3}",
+                bundle.reasoning
+            )
+        } else {
+            format!(
+                "{}; semantic bundle routing: cos={confidence:.3} gap={gap:.3}",
+                bundle.reasoning
+            )
+        },
     )?;
     match &bundle.envelope {
         Some(envelope) => proposal.with_envelope(envelope.clone()).map_err(Into::into),
@@ -1011,8 +1076,8 @@ async fn build_content_bundle_proposal(
         best_match(&collection_embedding, candidates);
     let mut chosen_index = candidate_index;
     let mut routing_tier = "semantic embedding";
-    let uncertain =
-        collection_confidence < config.embedding_threshold || collection_gap < config.ambiguity_gap;
+    let uncertain = collection_confidence < config.bundle_embedding_threshold
+        || collection_gap < config.bundle_ambiguity_gap;
     if uncertain && config.enable_llm_fallback {
         if let Some(backend) = text_backend {
             if let Ok(Some((llm_index, llm_score, llm_gap, _))) =
@@ -1028,11 +1093,17 @@ async fn build_content_bundle_proposal(
             }
         }
     }
-    let taxonomy = chosen_index
-        .and_then(|index| candidates.get(index))
-        .map(|candidate| candidate.folder_path.as_str())
-        .ok_or_else(|| anyhow::anyhow!("no semantic destination for collection {label}"))?;
-    let target_parent = output_root.join(taxonomy.trim_end_matches('/'));
+    let abstained = collection_confidence < config.bundle_embedding_threshold
+        || collection_gap < config.bundle_ambiguity_gap;
+    let target_parent = if abstained {
+        output_root.to_path_buf()
+    } else {
+        let taxonomy = chosen_index
+            .and_then(|index| candidates.get(index))
+            .map(|candidate| candidate.folder_path.as_str())
+            .ok_or_else(|| anyhow::anyhow!("no semantic destination for collection {label}"))?;
+        output_root.join(taxonomy.trim_end_matches('/'))
+    };
     let collection_root = target_parent.join(&label);
     for proposal in &mut proposals {
         proposal.proposed_path = collection_root.join(&proposal.proposed_name);
@@ -1045,7 +1116,11 @@ async fn build_content_bundle_proposal(
     } else {
         confidence_sum / f32::from(count)
     };
-    let confidence = member_confidence.min(collection_confidence);
+    let confidence = if abstained {
+        0.0
+    } else {
+        member_confidence.min(collection_confidence)
+    };
     Ok(BundleProposal::new(
         bundle.root.clone(),
         bundle.kind.clone(),
@@ -1053,8 +1128,9 @@ async fn build_content_bundle_proposal(
         proposals,
         confidence,
         format!(
-            "{}; {routing_tier} collection routing: cos={collection_confidence:.3} gap={collection_gap:.3}",
-            bundle.reasoning
+            "{}; {routing_tier} collection routing: cos={collection_confidence:.3} gap={collection_gap:.3}{}",
+            bundle.reasoning,
+            if abstained { "; abstained to source root" } else { "" }
         ),
     )?)
 }

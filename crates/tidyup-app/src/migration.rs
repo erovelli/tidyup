@@ -157,11 +157,12 @@ impl MigrationService {
         // Persist identity for both sides of a migration before semantic
         // profiling/classification. This makes unchanged files reusable and
         // ensures failures remain visible in the durable index.
-        let target_indexed = tidyup_pipeline::indexing::index_directory(
+        let target_indexed = tidyup_pipeline::indexing::index_directory_with_config(
             &request.target,
             self.ctx.file_index.as_ref(),
             run_id,
             FileProcessingRole::TargetProfile,
+            &self.ctx.classifier.discovery,
         )
         .await?;
         report_indexing(&target_indexed, progress).await;
@@ -237,11 +238,12 @@ impl MigrationService {
             .phase_finished(tidyup_domain::Phase::ProfilingTarget)
             .await;
 
-        let source_indexed = tidyup_pipeline::indexing::index_directory(
+        let source_indexed = tidyup_pipeline::indexing::index_directory_with_config(
             &request.source,
             self.ctx.file_index.as_ref(),
             run_id,
             FileProcessingRole::Source,
+            &self.ctx.classifier.discovery,
         )
         .await?;
         report_indexing(&source_indexed, progress).await;

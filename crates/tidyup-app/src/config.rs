@@ -37,6 +37,7 @@ pub struct TidyupConfig {
     pub classifier: ClassifierConfig,
     pub inference: InferenceConfig,
     pub extraction: ExtractionConfig,
+    pub discovery: DiscoveryConfig,
     pub rename: RenameConfig,
     pub bundle_detection: BundleDetectionConfig,
     pub directory_envelopes: DirectoryEnvelopeConfig,
@@ -94,6 +95,15 @@ pub struct ClassifierConfig {
     /// Fallback auto-classify threshold for the composite score. Used when a tier
     /// doesn't provide its own threshold.
     pub min_confidence: f32,
+    /// `BGE` text-routing similarity and ambiguity thresholds.
+    pub text_min_similarity: f32,
+    pub text_min_gap: f32,
+    /// `SigLIP` image-routing thresholds, on its separate raw cosine scale.
+    pub image_min_similarity: f32,
+    pub image_min_gap: f32,
+    /// Atomic collection/directory routing thresholds.
+    pub bundle_min_similarity: f32,
+    pub bundle_min_gap: f32,
 }
 
 impl Default for ClassifierConfig {
@@ -101,6 +111,34 @@ impl Default for ClassifierConfig {
         Self {
             tiers: vec!["embeddings".to_string()],
             min_confidence: 0.75,
+            text_min_similarity: 0.35,
+            text_min_gap: 0.05,
+            image_min_similarity: 0.04,
+            image_min_gap: 0.01,
+            bundle_min_similarity: 0.35,
+            bundle_min_gap: 0.03,
+        }
+    }
+}
+
+/// Filesystem entries excluded before identity indexing and organization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DiscoveryConfig {
+    pub include_hidden: bool,
+    pub ignore_names: Vec<String>,
+}
+
+impl Default for DiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            include_hidden: false,
+            ignore_names: vec![
+                ".DS_Store".to_string(),
+                ".localized".to_string(),
+                "Thumbs.db".to_string(),
+                "desktop.ini".to_string(),
+            ],
         }
     }
 }
@@ -180,6 +218,8 @@ pub struct RenameConfig {
     pub min_classification_confidence: f32,
     /// Lower bound on `1.0 - cosine(embed(filename), content_embedding)`. Default 0.60.
     pub min_mismatch_score: f32,
+    /// Filename/OCR-text mismatch floor for local screenshot renames.
+    pub min_ocr_mismatch_score: f32,
     /// Lower bound on the fraction of retrieved non-textual concept labels
     /// absent from the filename. Separate scale from text cosine mismatch.
     pub min_grounded_mismatch: f32,
@@ -196,9 +236,10 @@ impl Default for RenameConfig {
         Self {
             min_classification_confidence: 0.85,
             min_mismatch_score: 0.60,
+            min_ocr_mismatch_score: 0.30,
             min_grounded_mismatch: 0.60,
-            min_grounding_confidence: 0.30,
-            min_grounding_gap: 0.02,
+            min_grounding_confidence: 0.05,
+            min_grounding_gap: 0.01,
         }
     }
 }

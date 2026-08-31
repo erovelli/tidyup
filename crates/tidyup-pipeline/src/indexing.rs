@@ -12,8 +12,8 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use tidyup_core::storage::FileIndex;
 use tidyup_domain::{
-    ContentHash, FileId, FileProcessingRecord, FileProcessingRole, FileProcessingStage,
-    FileProcessingState, IndexedFile,
+    ContentHash, DiscoveryConfig, FileId, FileProcessingRecord, FileProcessingRole,
+    FileProcessingStage, FileProcessingState, IndexedFile,
 };
 use uuid::Uuid;
 use walkdir::WalkDir;
@@ -106,7 +106,18 @@ pub async fn index_directory(
     run_id: Uuid,
     role: FileProcessingRole,
 ) -> Result<IndexSummary> {
-    let (paths, discovery_failures) = collect_entries(root);
+    index_directory_with_config(root, index, run_id, role, &DiscoveryConfig::default()).await
+}
+
+/// Index a directory using the caller's discovery exclusions.
+pub async fn index_directory_with_config(
+    root: &Path,
+    index: &dyn FileIndex,
+    run_id: Uuid,
+    role: FileProcessingRole,
+    discovery: &DiscoveryConfig,
+) -> Result<IndexSummary> {
+    let (paths, discovery_failures) = collect_entries(root, discovery);
     let mut summary = IndexSummary {
         failed: discovery_failures.len(),
         ..IndexSummary::default()
@@ -182,10 +193,19 @@ pub async fn index_directory(
     Ok(summary)
 }
 
-fn collect_entries(root: &Path) -> (Vec<PathBuf>, Vec<(PathBuf, String)>) {
+fn collect_entries(
+    root: &Path,
+    discovery: &DiscoveryConfig,
+) -> (Vec<PathBuf>, Vec<(PathBuf, String)>) {
     let mut paths = Vec::new();
     let mut failures = Vec::new();
-    for entry in WalkDir::new(root).follow_links(false) {
+    for entry in WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            entry.depth() == 0 || !crate::scanner::is_ignored(entry.path(), discovery)
+        })
+    {
         match entry {
             Ok(entry) if entry.file_type().is_file() => paths.push(entry.into_path()),
             Ok(_) => {}
@@ -323,7 +343,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accounts_for_dotfiles_and_dot_subtrees() {
+    async fn default_discovery_excludes_dotfiles_and_dot_subtrees() {
         let dir = TempDir::new().unwrap();
         write(dir.path(), "keep.txt", b"visible");
         write(dir.path(), ".hidden", b"nope");
@@ -331,7 +351,28 @@ mod tests {
         write(dir.path(), "sub/.cache/data", b"still nope");
         let store = SqliteStore::open_in_memory().unwrap();
 
-        let (_, indexed) = run(&store, dir.path()).await;
+        let (run_id, indexed) = run(&store, dir.path()).await;
+        let mut names = indexed
+            .indexed
+            .iter()
+            .map(|file| file.name.as_str())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        assert_eq!(names, ["keep.txt"]);
+
+        let include_hidden = DiscoveryConfig {
+            include_hidden: true,
+            ignore_names: Vec::new(),
+        };
+        let indexed = index_directory_with_config(
+            dir.path(),
+            &store,
+            run_id,
+            FileProcessingRole::Source,
+            &include_hidden,
+        )
+        .await
+        .unwrap();
         let mut names = indexed
             .indexed
             .iter()

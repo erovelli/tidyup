@@ -36,7 +36,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use tidyup_domain::bundle::BundleKind;
-use tidyup_domain::{DirectoryEnvelope, DirectoryEnvelopeConfig};
+use tidyup_domain::{DirectoryEnvelope, DirectoryEnvelopeConfig, DiscoveryConfig};
 use walkdir::WalkDir;
 
 /// Output of a single source-tree scan. Consumed by the pipeline to emit
@@ -98,11 +98,15 @@ pub fn scan(root: &Path) -> ScanTree {
 /// non-overlapping directory roots and exposes only files from confidently
 /// heterogeneous containers to loose classification and clustering.
 #[must_use]
-pub fn scan_with_policy(root: &Path, config: &DirectoryEnvelopeConfig) -> ScanTree {
+pub fn scan_with_policy(
+    root: &Path,
+    config: &DirectoryEnvelopeConfig,
+    discovery: &DiscoveryConfig,
+) -> ScanTree {
     if !config.enabled {
-        return scan(root);
+        return scan_with_discovery(root, discovery);
     }
-    let discovered = crate::envelopes::discover(root, config);
+    let discovered = crate::envelopes::discover(root, config, discovery);
     ScanTree {
         root: root.to_path_buf(),
         bundles: discovered
@@ -121,7 +125,21 @@ pub fn scan_with_policy(root: &Path, config: &DirectoryEnvelopeConfig) -> ScanTr
     }
 }
 
+fn scan_with_discovery(root: &Path, discovery: &DiscoveryConfig) -> ScanTree {
+    let mut tree = ScanTree {
+        root: root.to_path_buf(),
+        bundles: Vec::new(),
+        loose_files: Vec::new(),
+    };
+    scan_dir_with_discovery(root, &mut tree, discovery);
+    tree
+}
+
 fn scan_dir(dir: &Path, tree: &mut ScanTree) {
+    scan_dir_with_discovery(dir, tree, &DiscoveryConfig::default());
+}
+
+fn scan_dir_with_discovery(dir: &Path, tree: &mut ScanTree, discovery: &DiscoveryConfig) {
     if let Some((kind, reason)) = detect_bundle(dir) {
         let members = collect_members(dir);
         tree.bundles.push(DetectedBundle {
@@ -165,9 +183,12 @@ fn scan_dir(dir: &Path, tree: &mut ScanTree) {
             continue;
         }
         let path = entry.path();
+        if is_ignored(&path, discovery) {
+            continue;
+        }
         if file_type.is_dir() {
-            scan_dir(&path, tree);
-        } else if file_type.is_file() && !is_noise(&path) {
+            scan_dir_with_discovery(&path, tree, discovery);
+        } else if file_type.is_file() {
             tree.loose_files.push(path);
         }
     }
@@ -275,15 +296,12 @@ fn collect_members(root: &Path) -> Vec<PathBuf> {
 /// Noise files that shouldn't surface in classification — OS metadata, icon
 /// caches, folder-preview artifacts. Bundle walks intentionally preserve
 /// these because they're part of the atomic subtree; loose scans skip them.
-fn is_noise(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|s| s.to_str())
-        .is_some_and(|name| {
-            matches!(
-                name,
-                ".DS_Store" | "Thumbs.db" | "desktop.ini" | ".localized",
-            )
-        })
+pub(crate) fn is_ignored(path: &Path, config: &DiscoveryConfig) -> bool {
+    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    config.ignore_names.iter().any(|ignored| ignored == name)
+        || (!config.include_hidden && name.starts_with('.'))
 }
 
 #[cfg(test)]
