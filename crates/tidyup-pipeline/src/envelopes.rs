@@ -306,7 +306,13 @@ fn profile_node(
         .files
         .iter()
         .chain(node.children.iter())
-        .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
+        // File suffixes are deliberately excluded: a shared extension is not
+        // evidence that two files belong to the same directory envelope.
+        .filter_map(|path| {
+            path.file_stem()
+                .or_else(|| path.file_name())
+                .and_then(|name| name.to_str())
+        })
         .map(normalize_label)
         .filter(|label| !label.is_empty())
         .take(config.sample_cap)
@@ -329,7 +335,7 @@ fn profile_node(
         BoundaryDecision::Uncertain
     } else if cohesion >= config.cohesive_threshold {
         BoundaryDecision::Cohesive
-    } else if cohesion <= config.container_threshold && labels.len() >= 3 {
+    } else if cohesion <= config.container_threshold && labels.len() >= 2 {
         BoundaryDecision::Container
     } else {
         BoundaryDecision::Uncertain

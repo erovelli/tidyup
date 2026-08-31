@@ -1296,13 +1296,7 @@ mod tests {
             &MultimodalContext::default(),
             None,
             &extractors,
-            &ClassifierConfig {
-                directory_envelopes: tidyup_domain::DirectoryEnvelopeConfig {
-                    enabled: false,
-                    ..tidyup_domain::DirectoryEnvelopeConfig::default()
-                },
-                ..ClassifierConfig::default()
-            },
+            &ClassifierConfig::default(),
             &NullProgress,
         )
         .await
