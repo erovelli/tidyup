@@ -1690,6 +1690,65 @@ fn RunRow(run: RunRecord, busy: Busy) -> Element {
 // Settings
 // ---------------------------------------------------------------------------
 
+/// Build provenance for bug reports.
+///
+/// The README tells users not to point tidyup at files they care about, which
+/// invites reports from a pre-alpha. A report is only actionable if it says
+/// which build produced it: the version alone does not distinguish two commits
+/// on `0.1.0`, and the compiled feature set decides whether an optional
+/// reranker could have touched the result at all.
+///
+/// Everything here is either a compile-time constant or a single filesystem
+/// probe — nothing is inferred. In particular the embedding-model row reports
+/// what `quick_model_check` actually found on disk, never a guess from config.
+#[component]
+fn About() -> Element {
+    // One probe per mount rather than per render: `verify_default_model` hits
+    // the filesystem, and this card is not the reason to do that repeatedly.
+    let model_status = use_hook(|| match quick_model_check() {
+        Ok(()) => "present".to_owned(),
+        Err(_) => "not installed".to_owned(),
+    });
+
+    let version = env!("CARGO_PKG_VERSION");
+    // Absent in any checkout without a `.git` directory — a release tarball or
+    // a vendored source drop. That is a normal build, not a broken one.
+    let build = option_env!("TIDYUP_GIT_SHA").unwrap_or("unknown");
+
+    // Compiled-in optional backends. `cfg!` reports what the binary can do at
+    // all, which is the first of the three privacy gates; the LLM card below
+    // reports the remaining two. The UI deliberately never links the remote
+    // backend, so there is no row for it.
+    let llm_feature = if cfg!(feature = "llm-fallback") {
+        "compiled in"
+    } else {
+        "not compiled in"
+    };
+
+    rsx! {
+        div {
+            class: "card",
+            h2 { class: "card-title", "About" }
+            div {
+                class: "kv",
+                div { class: "kv-key", "version" }
+                div { class: "kv-value", "{version}" }
+                div { class: "kv-key", "build" }
+                div { class: "kv-value", "{build}" }
+                div { class: "kv-key", "embedding model" }
+                div { class: "kv-value", "{model_status}" }
+                div { class: "kv-key", "llm reranker" }
+                div { class: "kv-value", "{llm_feature}" }
+            }
+            p {
+                class: "small muted",
+                style: "margin: 12px 0 0;",
+                "tidyup is pre-alpha and confidence thresholds are not calibrated. Please include the version and build above in any bug report."
+            }
+        }
+    }
+}
+
 #[component]
 pub(crate) fn Settings() -> Element {
     // Hook: must be called unconditionally (before the fallible config load) so
@@ -1740,6 +1799,8 @@ pub(crate) fn Settings() -> Element {
                         "Read-only view of the loaded TOML config. Edit the file directly; changes apply on next launch."
                     }
 
+                    About {}
+
                     div {
                         class: "card",
                         h2 { class: "card-title", "Paths" }
@@ -1786,6 +1847,9 @@ pub(crate) fn Settings() -> Element {
                 }
             }
         }
+        // The About card renders here too. A failed config load is exactly the
+        // situation someone files a report about, so the build identifiers must
+        // not disappear along with the rest of the page.
         Err(e) => rsx! {
             div {
                 h1 { class: "page-title", "Settings" }
@@ -1794,6 +1858,7 @@ pub(crate) fn Settings() -> Element {
                     strong { "Could not load config." }
                     pre { "{e}" }
                 }
+                About {}
             }
         },
     }
