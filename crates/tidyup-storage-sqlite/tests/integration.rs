@@ -120,6 +120,31 @@ async fn proposal_content_hash_round_trips_through_pending() {
 }
 
 #[tokio::test]
+async fn reviewed_target_override_round_trips_for_apply_and_rollback() {
+    let dir = TempDir::new().unwrap();
+    let store = new_store(&dir);
+    let p = sample_proposal("/src/Screenshot.png", "/Screenshots/generated.png", None);
+    store.record_proposal(&p, None).await.unwrap();
+
+    let edited = PathBuf::from("/Screenshots/robot_fleet_dashboard.png");
+    store
+        .update_proposed_target(
+            p.id,
+            &edited,
+            "robot_fleet_dashboard.png",
+            ChangeType::RenameAndMove,
+        )
+        .await
+        .unwrap();
+
+    let pending = store.pending().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].proposed_path, edited);
+    assert_eq!(pending[0].proposed_name, "robot_fleet_dashboard.png");
+    assert_eq!(pending[0].change_type, ChangeType::RenameAndMove);
+}
+
+#[tokio::test]
 async fn mark_rejected_removes_proposal_from_pending() {
     let dir = TempDir::new().unwrap();
     let store = new_store(&dir);

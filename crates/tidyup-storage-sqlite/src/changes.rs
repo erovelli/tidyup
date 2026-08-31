@@ -4,7 +4,7 @@
 //! transaction. `pending` returns only loose proposals (`bundle_id IS NULL`); bundle members
 //! are exposed exclusively through `pending_bundles`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -112,7 +112,7 @@ fn row_to_bundle(row: &Row<'_>) -> rusqlite::Result<BundleProposal> {
     })
 }
 
-fn path_str(p: &std::path::Path) -> Result<&str> {
+fn path_str(p: &Path) -> Result<&str> {
     p.to_str()
         .ok_or_else(|| anyhow!("path is not valid UTF-8: {}", p.display()))
 }
@@ -172,6 +172,39 @@ impl ChangeLog for SqliteStore {
         })
         .await
         .context("join record_proposal task")??;
+        Ok(())
+    }
+
+    async fn update_proposed_target(
+        &self,
+        proposal_id: Uuid,
+        proposed_path: &Path,
+        proposed_name: &str,
+        change_type: ChangeType,
+    ) -> tidyup_core::Result<()> {
+        let conn = self.conn();
+        let proposed_path = path_str(proposed_path)?.to_string();
+        let proposed_name = proposed_name.to_string();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let guard = conn.lock().map_err(|e| anyhow!("lock poisoned: {e}"))?;
+            guard
+                .execute(
+                    "UPDATE change_proposals \
+                     SET proposed_path = ?1, proposed_name = ?2, change_type = ?3 \
+                     WHERE id = ?4 AND status = ?5",
+                    params![
+                        proposed_path,
+                        proposed_name,
+                        change_type.as_str(),
+                        proposal_id.to_string(),
+                        ChangeStatus::Pending.as_str(),
+                    ],
+                )
+                .context("updating reviewed proposal target")?;
+            Ok(())
+        })
+        .await
+        .context("join update_proposed_target task")??;
         Ok(())
     }
 

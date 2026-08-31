@@ -707,6 +707,33 @@ fn decision_state_of(
     }
 }
 
+fn approve_proposal(signals: SignalBundle, proposal_id: Uuid) {
+    let decision = signals
+        .proposals
+        .read()
+        .iter()
+        .find(|proposal| proposal.id == proposal_id)
+        .map_or(ReviewDecision::Approve(proposal_id), approval_decision);
+    let mut decisions = signals.decisions;
+    decisions.with_mut(|items| {
+        items.insert(proposal_id, decision);
+    });
+}
+
+fn approval_decision(proposal: &ChangeProposal) -> ReviewDecision {
+    if matches!(
+        proposal.change_type,
+        ChangeType::Rename | ChangeType::RenameAndMove
+    ) {
+        ReviewDecision::Override {
+            proposal_id: proposal.id,
+            new_target: proposal.proposed_path.clone(),
+        }
+    } else {
+        ReviewDecision::Approve(proposal.id)
+    }
+}
+
 const fn row_state_class(state: DecisionState) -> &'static str {
     match state {
         DecisionState::Approved => " row-approved",
@@ -978,7 +1005,7 @@ fn TreeRowView(
                     onmouseenter: on_enter,
                     onmouseleave: on_leave,
                     onclick: on_click,
-                    span { class: "tree-file-name", "{name}" }
+                    span { class: "tree-file-name", title: "{name}", "{name}" }
                     span {
                         class: "tree-row-meta",
                         if is_rename {
@@ -1028,10 +1055,7 @@ fn CurrentRow(
 
     let on_approve = move |ev: MouseEvent| {
         ev.stop_propagation(); // don't also toggle the row selection
-        let mut d = signals.decisions;
-        d.with_mut(|map| {
-            map.insert(pid, ReviewDecision::Approve(pid));
-        });
+        approve_proposal(signals, pid);
     };
     let on_reject = move |ev: MouseEvent| {
         ev.stop_propagation();
@@ -1059,7 +1083,7 @@ fn CurrentRow(
             onmouseenter: on_enter,
             onmouseleave: on_leave,
             onclick: on_click,
-            span { class: "current-name", "{entry.display_name}" }
+            span { class: "current-name", title: "{entry.display_name}", "{entry.display_name}" }
             if is_selected && !locked {
                 span {
                     class: "current-actions",
@@ -1181,13 +1205,7 @@ fn ProposalCard(proposal: ChangeProposal, signals: SignalBundle) -> Element {
     let change_label = proposal.change_type.label();
 
     let on_approve = move |_| {
-        let mut d = decisions;
-        d.with_mut(|map| {
-            map.insert(
-                proposal_id,
-                tidyup_domain::ReviewDecision::Approve(proposal_id),
-            );
-        });
+        approve_proposal(signals, proposal_id);
     };
     let on_reject = move |_| {
         let mut d = decisions;
@@ -1217,6 +1235,7 @@ fn ProposalCard(proposal: ChangeProposal, signals: SignalBundle) -> Element {
                 class: "proposal-meta",
                 div {
                     class: "proposal-target",
+                    title: "{proposal.proposed_name}",
                     "{proposal.proposed_name}"
                 }
                 div {
@@ -1228,6 +1247,9 @@ fn ProposalCard(proposal: ChangeProposal, signals: SignalBundle) -> Element {
                 div {
                     class: "proposal-reason",
                     "{proposal.reasoning}"
+                }
+                if is_rename {
+                    ProposalRenameEditor { proposal: proposal.clone(), signals }
                 }
                 div {
                     class: "button-row small",
@@ -1256,6 +1278,171 @@ fn ProposalCard(proposal: ChangeProposal, signals: SignalBundle) -> Element {
                 }
             }
         }
+    }
+}
+
+#[component]
+fn ProposalRenameEditor(proposal: ChangeProposal, signals: SignalBundle) -> Element {
+    let mut validation_error = use_signal(|| None::<String>);
+    let proposal_id = proposal.id;
+    let proposed_name = proposal.proposed_name.clone();
+    let original_name = proposal
+        .original_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let destination_folder = proposal
+        .proposed_path
+        .parent()
+        .map_or_else(String::new, |path| path.display().to_string());
+    let on_input = move |event: Event<FormData>| {
+        validation_error.set(
+            update_loose_proposal_name(signals, proposal_id, &event.value())
+                .err()
+                .map(str::to_string),
+        );
+    };
+    let validation_message = validation_error.read().clone();
+    let invalid = validation_message.is_some();
+    let input_class = if invalid {
+        "form-input rename-input input-error"
+    } else {
+        "form-input rename-input"
+    };
+
+    rsx! {
+        div { class: "proposal-rename-editor",
+            div { class: "rename-editor-row",
+                span { class: "rename-editor-label", "Original filename" }
+                code { class: "rename-editor-value", title: "{original_name}", "{original_name}" }
+            }
+            label { class: "rename-editor-row",
+                span { class: "rename-editor-label", "Proposed filename" }
+                input {
+                    r#type: "text",
+                    class: "{input_class}",
+                    value: "{proposed_name}",
+                    title: "{proposed_name}",
+                    oninput: on_input,
+                    aria_label: "Override proposed filename for {original_name}",
+                    aria_invalid: invalid,
+                }
+            }
+            div { class: "rename-editor-row",
+                span { class: "rename-editor-label", "Destination folder" }
+                code {
+                    class: "rename-editor-value rename-destination",
+                    title: "{destination_folder}",
+                    "{destination_folder}"
+                }
+            }
+            if let Some(ref message) = validation_message {
+                span { class: "field-error rename-editor-error", "{message}" }
+            }
+            p {
+                class: "form-hint",
+                "Editing the filename creates an explicit override. The destination folder stays unchanged."
+            }
+        }
+    }
+}
+
+fn update_loose_proposal_name(
+    signals: SignalBundle,
+    proposal_id: Uuid,
+    raw_name: &str,
+) -> Result<(), &'static str> {
+    let proposals = signals.proposals.read();
+    let name = validate_loose_proposal_name(&proposals, proposal_id, raw_name)?;
+    drop(proposals);
+
+    let mut updated_target = None;
+    let mut proposals = signals.proposals;
+    proposals.with_mut(|items| {
+        let Some(proposal) = items.iter_mut().find(|proposal| proposal.id == proposal_id) else {
+            return;
+        };
+        proposal.proposed_name.clone_from(&name);
+        proposal.proposed_path.set_file_name(&name);
+        proposal.change_type =
+            change_type_for_paths(&proposal.original_path, &proposal.proposed_path);
+        updated_target = Some(proposal.proposed_path.clone());
+    });
+
+    if let Some(new_target) = updated_target {
+        let mut decisions = signals.decisions;
+        decisions.with_mut(|items| {
+            if matches!(
+                items.get(&proposal_id),
+                Some(ReviewDecision::Approve(_) | ReviewDecision::Override { .. })
+            ) {
+                items.insert(
+                    proposal_id,
+                    ReviewDecision::Override {
+                        proposal_id,
+                        new_target,
+                    },
+                );
+            }
+        });
+    }
+    Ok(())
+}
+
+fn validate_loose_proposal_name(
+    proposals: &[ChangeProposal],
+    proposal_id: Uuid,
+    raw_name: &str,
+) -> Result<String, &'static str> {
+    let proposal = proposals
+        .iter()
+        .find(|proposal| proposal.id == proposal_id)
+        .ok_or("This proposal is no longer available.")?;
+    let name = raw_name.trim();
+    if name.is_empty() {
+        return Err("Filename cannot be empty.");
+    }
+    if name == "." || name == ".." || name.contains('/') || name.contains('\\') {
+        return Err("Enter a filename, not a path.");
+    }
+
+    let expected_extension = Path::new(&proposal.proposed_name)
+        .extension()
+        .and_then(|extension| extension.to_str());
+    let supplied_extension = Path::new(name)
+        .extension()
+        .and_then(|extension| extension.to_str());
+    if !extensions_match(expected_extension, supplied_extension) {
+        return Err("Filename extension must stay the same.");
+    }
+
+    let destination_parent = proposal.proposed_path.parent();
+    if proposals.iter().any(|other| {
+        other.id != proposal_id
+            && other.proposed_path.parent() == destination_parent
+            && other.proposed_name.eq_ignore_ascii_case(name)
+    }) {
+        return Err("Another proposal in this folder already uses that filename.");
+    }
+    Ok(name.to_string())
+}
+
+const fn extensions_match(expected: Option<&str>, supplied: Option<&str>) -> bool {
+    match (expected, supplied) {
+        (Some(expected), Some(supplied)) => expected.eq_ignore_ascii_case(supplied),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn change_type_for_paths(original: &Path, proposed: &Path) -> ChangeType {
+    let renamed = original.file_name() != proposed.file_name();
+    let moved = original.parent() != proposed.parent();
+    match (renamed, moved) {
+        (true, true) => ChangeType::RenameAndMove,
+        (true, false) => ChangeType::Rename,
+        _ => ChangeType::Move,
     }
 }
 
@@ -2684,6 +2871,52 @@ mod tests {
         assert_eq!(
             validate_semantic_member_name(&bundle, first_id, "renamed.png").unwrap(),
             "renamed.png",
+        );
+    }
+
+    #[test]
+    fn loose_rename_editor_validates_filename_extension_and_collision() {
+        let mut first = move_proposal("first.png");
+        first.change_type = ChangeType::RenameAndMove;
+        first.proposed_name = "project_dashboard.png".to_string();
+        first.proposed_path.set_file_name(&first.proposed_name);
+        let first_id = first.id;
+        let second = move_proposal("existing.png");
+        let proposals = vec![first, second];
+
+        assert_eq!(
+            validate_loose_proposal_name(&proposals, first_id, "robot_fleet.png").unwrap(),
+            "robot_fleet.png",
+        );
+        assert_eq!(
+            validate_loose_proposal_name(&proposals, first_id, "robot_fleet.jpg"),
+            Err("Filename extension must stay the same."),
+        );
+        assert_eq!(
+            validate_loose_proposal_name(&proposals, first_id, "EXISTING.PNG"),
+            Err("Another proposal in this folder already uses that filename."),
+        );
+        assert_eq!(
+            validate_loose_proposal_name(&proposals, first_id, "nested/robot_fleet.png"),
+            Err("Enter a filename, not a path."),
+        );
+    }
+
+    #[test]
+    fn approving_a_loose_rename_carries_the_edited_target() {
+        let mut proposal = move_proposal("Screenshot.png");
+        proposal.change_type = ChangeType::RenameAndMove;
+        proposal.proposed_name = "robot_fleet_dashboard.png".to_string();
+        proposal
+            .proposed_path
+            .set_file_name(&proposal.proposed_name);
+
+        assert_eq!(
+            approval_decision(&proposal),
+            ReviewDecision::Override {
+                proposal_id: proposal.id,
+                new_target: proposal.proposed_path.clone(),
+            },
         );
     }
 }

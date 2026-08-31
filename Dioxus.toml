@@ -30,10 +30,10 @@ approval, and every applied move is reversible.
 # One canonical mark, shared with the README and the freedesktop entry. See
 # assets/brand/README.md.
 icon = [
-    "assets/brand/icon-256.png",
-    "assets/brand/icon-512.png",
-    "assets/brand/icon.ico",
-    "assets/brand/icon.icns",
+    "../../assets/brand/icon-256.png",
+    "../../assets/brand/icon-512.png",
+    "../../assets/brand/icon.ico",
+    "../../assets/brand/icon.icns",
 ]
 
 [bundle.macos]
