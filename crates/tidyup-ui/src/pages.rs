@@ -1186,7 +1186,10 @@ fn ProposalCard(proposal: ChangeProposal, signals: SignalBundle) -> Element {
     let state = decision_state_of(&decisions.read(), proposal.id);
 
     let from = proposal.original_path.display().to_string();
-    let to = proposal.proposed_path.display().to_string();
+    let destination = proposal
+        .proposed_path
+        .parent()
+        .map_or_else(String::new, |path| path.display().to_string());
     let conf = proposal.confidence;
     let chip = confidence_chip(conf);
 
@@ -1235,14 +1238,14 @@ fn ProposalCard(proposal: ChangeProposal, signals: SignalBundle) -> Element {
                 class: "proposal-meta",
                 div {
                     class: "proposal-target",
-                    title: "{proposal.proposed_name}",
-                    "{proposal.proposed_name}"
+                    title: "{from}",
+                    "{proposal.original_path.file_name().and_then(|name| name.to_str()).unwrap_or(\"File\")}"
                 }
                 div {
                     class: "proposal-path",
                     "{from}"
                     span { class: "proposal-arrow", " → " }
-                    "{to}"
+                    "{destination}/ (1 file)"
                 }
                 div {
                     class: "proposal-reason",
@@ -1292,10 +1295,6 @@ fn ProposalRenameEditor(proposal: ChangeProposal, signals: SignalBundle) -> Elem
         .and_then(|name| name.to_str())
         .unwrap_or_default()
         .to_string();
-    let destination_folder = proposal
-        .proposed_path
-        .parent()
-        .map_or_else(String::new, |path| path.display().to_string());
     let on_input = move |event: Event<FormData>| {
         validation_error.set(
             update_loose_proposal_name(signals, proposal_id, &event.value())
@@ -1304,45 +1303,16 @@ fn ProposalRenameEditor(proposal: ChangeProposal, signals: SignalBundle) -> Elem
         );
     };
     let validation_message = validation_error.read().clone();
-    let invalid = validation_message.is_some();
-    let input_class = if invalid {
-        "form-input rename-input input-error"
-    } else {
-        "form-input rename-input"
-    };
-
     rsx! {
-        div { class: "proposal-rename-editor",
-            div { class: "rename-editor-row",
-                span { class: "rename-editor-label", "Original filename" }
-                code { class: "rename-editor-value", title: "{original_name}", "{original_name}" }
-            }
-            label { class: "rename-editor-row",
-                span { class: "rename-editor-label", "Proposed filename" }
-                input {
-                    r#type: "text",
-                    class: "{input_class}",
-                    value: "{proposed_name}",
-                    title: "{proposed_name}",
-                    oninput: on_input,
-                    aria_label: "Override proposed filename for {original_name}",
-                    aria_invalid: invalid,
-                }
-            }
-            div { class: "rename-editor-row",
-                span { class: "rename-editor-label", "Destination folder" }
-                code {
-                    class: "rename-editor-value rename-destination",
-                    title: "{destination_folder}",
-                    "{destination_folder}"
-                }
-            }
-            if let Some(ref message) = validation_message {
-                span { class: "field-error rename-editor-error", "{message}" }
-            }
-            p {
-                class: "form-hint",
-                "Editing the filename creates an explicit override. The destination folder stays unchanged."
+        div {
+            class: "semantic-members",
+            style: "margin-top: 12px; display: grid; gap: 8px;",
+            FilenameRenameEditor {
+                original: original_name.clone(),
+                proposed: proposed_name,
+                validation_message,
+                aria_label: format!("Proposed filename for {original_name}"),
+                oninput: on_input,
             }
         }
     }
@@ -1543,22 +1513,15 @@ fn CombinedReview(state: SharedState) -> Element {
             div { class: "section-heading", style: "margin-top: 24px;", "PLAN OVERVIEW" }
             DiffView { model, hovered, selected, signals, locked_ids }
             DiffLegend {}
-            div { class: "section-heading", style: "margin-top: 24px;", "ATOMIC DIRECTORIES & COLLECTIONS" }
+            div { class: "section-heading", style: "margin-top: 24px;", "CHANGES" }
             div {
                 class: "card-stack",
                 style: "margin-top: 16px;",
                 for b in bundles.iter().cloned() {
                     BundleReviewCard { key: "{b.id}", bundle: b, signals }
                 }
-            }
-            if !proposals.is_empty() {
-                div { class: "section-heading", style: "margin-top: 24px;", "INDIVIDUAL CHANGES" }
-                div {
-                    class: "card-stack",
-                    style: "margin-top: 16px;",
-                    for proposal in proposals.iter().cloned() {
-                        ProposalCard { key: "{proposal.id}", proposal, signals }
-                    }
+                for proposal in proposals.iter().cloned() {
+                    ProposalCard { key: "{proposal.id}", proposal, signals }
                 }
             }
         }
@@ -1716,6 +1679,25 @@ fn SemanticMemberEditor(bundle_id: Uuid, member: ChangeProposal, signals: Signal
         );
     };
     let validation_message = validation_error.read().clone();
+    rsx! {
+        FilenameRenameEditor {
+            original: original.clone(),
+            proposed,
+            validation_message,
+            aria_label: format!("Proposed filename for {original}"),
+            oninput: on_input,
+        }
+    }
+}
+
+#[component]
+fn FilenameRenameEditor(
+    original: String,
+    proposed: String,
+    validation_message: Option<String>,
+    aria_label: String,
+    oninput: EventHandler<Event<FormData>>,
+) -> Element {
     let invalid = validation_message.is_some();
     let input_class = if invalid {
         "path-input input-error"
@@ -1732,8 +1714,9 @@ fn SemanticMemberEditor(bundle_id: Uuid, member: ChangeProposal, signals: Signal
                 r#type: "text",
                 class: "{input_class}",
                 value: "{proposed}",
-                oninput: on_input,
-                aria_label: "Proposed filename for {original}",
+                title: "{proposed}",
+                oninput: move |event| oninput.call(event),
+                aria_label,
                 aria_invalid: invalid,
             }
             if let Some(ref message) = validation_message {
