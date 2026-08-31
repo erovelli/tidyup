@@ -1703,12 +1703,26 @@ fn RunRow(run: RunRecord, busy: Busy) -> Element {
 /// what `quick_model_check` actually found on disk, never a guess from config.
 #[component]
 fn About() -> Element {
-    // One probe per mount rather than per render: `verify_default_model` hits
-    // the filesystem, and this card is not the reason to do that repeatedly.
-    let model_status = use_hook(|| match quick_model_check() {
-        Ok(()) => "present".to_owned(),
-        Err(_) => "not installed".to_owned(),
+    let state = use_context::<SharedState>();
+    let mut model_ready = state.signals.model_ready;
+
+    // Reuse the Dashboard's cached probe rather than hitting the filesystem
+    // again — `model_ready` exists precisely so `verify_default_model` runs once
+    // per session. It is only `None` if this card renders before the Dashboard
+    // ever mounted, in which case populate it here so the Dashboard inherits
+    // the answer instead of repeating the work.
+    let ready = use_hook(move || {
+        if model_ready.peek().is_none() {
+            model_ready.set(Some(quick_model_check().is_ok()));
+        }
+        *model_ready.peek()
     });
+
+    let model_status = match ready {
+        Some(true) => "present",
+        Some(false) => "not installed",
+        None => "unknown",
+    };
 
     let version = env!("CARGO_PKG_VERSION");
     // Absent in any checkout without a `.git` directory — a release tarball or
