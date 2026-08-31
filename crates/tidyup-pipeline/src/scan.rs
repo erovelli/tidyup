@@ -211,7 +211,17 @@ pub async fn run_scan(
 
     // Structural bundles preserve their internal layout and names.
     for bundle in &tree.bundles {
-        match build_bundle_proposal(bundle, identities, output_root, candidates, embeddings).await {
+        match build_bundle_proposal(
+            bundle,
+            identities,
+            output_root,
+            candidates,
+            embeddings,
+            extractors,
+            config.directory_envelopes.sample_cap,
+        )
+        .await
+        {
             Ok(bp) => outcome.bundles.push(bp),
             Err(e) => {
                 outcome.unclassified.extend(bundle.members.iter().cloned());
@@ -826,6 +836,8 @@ async fn build_bundle_proposal(
     output_root: &Path,
     candidates: &[ScanCandidate],
     embeddings: &dyn EmbeddingBackend,
+    extractors: &[Arc<dyn ContentExtractor>],
+    evidence_sample_cap: usize,
 ) -> Result<BundleProposal> {
     let leaf = bundle
         .root
@@ -839,11 +851,18 @@ async fn build_bundle_proposal(
         .filter_map(|member| member.file_name().and_then(|name| name.to_str()))
         .collect::<Vec<_>>()
         .join(" ");
+    let extracted_evidence = crate::envelopes::aggregate_semantic_evidence(
+        &bundle.members,
+        extractors,
+        evidence_sample_cap,
+    )
+    .await;
     let query = format!(
-        "atomic collection kind {} name {} members {}",
+        "atomic collection kind {} name {} members {} extracted evidence {}",
         bundle.kind.as_str(),
         normalize_semantic_text(leaf),
-        normalize_semantic_text(&member_names)
+        normalize_semantic_text(&member_names),
+        normalize_semantic_text(&extracted_evidence),
     );
     let embedding = embeddings.embed_text(&query).await?;
     let (candidate_index, confidence, _) = best_match(&embedding, candidates);

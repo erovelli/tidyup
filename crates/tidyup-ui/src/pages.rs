@@ -1468,6 +1468,18 @@ fn BundleReviewCard(bundle: BundleProposal, signals: SignalBundle) -> Element {
                 if let Some(detail) = envelope_detail {
                     div { class: "proposal-reason", "{detail}" }
                 }
+                if bundle.envelope.is_some() && !bundle.members.is_empty() {
+                    details {
+                        class: "semantic-members",
+                        style: "margin-top: 10px;",
+                        summary { "Show preserved descendants (read-only)" }
+                        ul {
+                            for member in bundle.members.iter().take(64) {
+                                li { "{member.original_path.display()}" }
+                            }
+                        }
+                    }
+                }
                 if bundle.kind.allows_member_renames() {
                     div {
                         class: "semantic-members",

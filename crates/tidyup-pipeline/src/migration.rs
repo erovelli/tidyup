@@ -164,7 +164,16 @@ pub async fn run_migration(
     // Bundles first: they bypass per-file routing, while the aggregate still
     // targets the best-matching leaf folder.
     for bundle in &tree.bundles {
-        match build_bundle_proposal(bundle, identities, profiles, embeddings).await {
+        match build_bundle_proposal(
+            bundle,
+            identities,
+            profiles,
+            embeddings,
+            extractors,
+            config.directory_envelopes.sample_cap,
+        )
+        .await
+        {
             Ok(bp) => outcome.bundles.push(bp),
             Err(e) => {
                 outcome.unclassified.extend(bundle.members.iter().cloned());
@@ -1068,6 +1077,8 @@ async fn build_bundle_proposal(
     identities: &crate::indexing::SourceIdentities,
     profiles: &ProfileCache,
     embeddings: &dyn EmbeddingBackend,
+    extractors: &[Arc<dyn ContentExtractor>],
+    evidence_sample_cap: usize,
 ) -> Result<BundleProposal> {
     let leaf_name = bundle
         .root
@@ -1079,9 +1090,16 @@ async fn build_bundle_proposal(
     let (target_parent, confidence, fallback) = if profiles.last_scan.leaf_folders.is_empty() {
         (profiles.target_root.clone(), 0.0, true)
     } else {
-        let (target, score) = pick_bundle_target(bundle, profiles, embeddings, &leaf_name)
-            .await
-            .ok_or_else(|| anyhow::anyhow!("no semantic destination for bundle {leaf_name}"))?;
+        let (target, score) = pick_bundle_target(
+            bundle,
+            profiles,
+            embeddings,
+            &leaf_name,
+            extractors,
+            evidence_sample_cap,
+        )
+        .await
+        .ok_or_else(|| anyhow::anyhow!("no semantic destination for bundle {leaf_name}"))?;
         (target, score, false)
     };
 
@@ -1154,6 +1172,8 @@ async fn pick_bundle_target(
     profiles: &ProfileCache,
     embeddings: &dyn EmbeddingBackend,
     leaf_name: &str,
+    extractors: &[Arc<dyn ContentExtractor>],
+    evidence_sample_cap: usize,
 ) -> Option<(PathBuf, f32)> {
     // Bundle kind controls atomicity, not placement. Placement is ranked from
     // the kind label, collection name, and member names against the learned
@@ -1165,11 +1185,18 @@ async fn pick_bundle_target(
         .filter_map(|member| member.file_name().and_then(|name| name.to_str()))
         .collect::<Vec<_>>()
         .join(" ");
+    let extracted_evidence = crate::envelopes::aggregate_semantic_evidence(
+        &bundle.members,
+        extractors,
+        evidence_sample_cap,
+    )
+    .await;
     let query = format!(
-        "atomic collection kind {} name {} members {}",
+        "atomic collection kind {} name {} members {} extracted evidence {}",
         bundle.kind.as_str(),
         leaf_name,
-        members
+        members,
+        extracted_evidence
     );
     let query_embedding = embeddings.embed_text(&query).await.ok()?;
     let mut best: Option<(PathBuf, f32)> = None;

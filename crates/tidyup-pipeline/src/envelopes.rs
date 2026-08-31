@@ -8,7 +8,9 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use tidyup_core::extractor::ContentExtractor;
 use tidyup_domain::{
     DirectoryBoundary, DirectoryEnvelope, DirectoryEnvelopeConfig, DirectorySnapshot,
 };
@@ -33,6 +35,40 @@ pub struct EnvelopeDiscovery {
     pub envelopes: Vec<DetectedEnvelope>,
     /// Files exposed by directories confidently identified as containers.
     pub loose_files: Vec<PathBuf>,
+}
+
+/// Bounded descendant evidence for aggregate directory routing.
+///
+/// Extractors contribute descriptive content and metadata only; they never
+/// create a descendant proposal or alter the selected directory boundary.
+pub async fn aggregate_semantic_evidence(
+    members: &[PathBuf],
+    extractors: &[Arc<dyn ContentExtractor>],
+    sample_cap: usize,
+) -> String {
+    let mut evidence = Vec::new();
+    for member in members.iter().take(sample_cap) {
+        let Some(extractor) = extractors
+            .iter()
+            .find(|extractor| extractor.supports(member, None))
+        else {
+            continue;
+        };
+        let Ok(extracted) = extractor.extract(member).await else {
+            continue;
+        };
+        if let Some(text) = extracted.text {
+            let bounded = text.chars().take(400).collect::<String>();
+            if !bounded.trim().is_empty() {
+                evidence.push(bounded);
+            }
+        }
+        let metadata = extracted.metadata.to_string();
+        if metadata != "null" && metadata != "{}" {
+            evidence.push(metadata.chars().take(240).collect());
+        }
+    }
+    evidence.join(" ")
 }
 
 #[derive(Debug, Clone, Default)]
