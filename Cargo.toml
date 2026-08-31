@@ -92,7 +92,7 @@ chrono       = { version = "0.4.44", features = ["serde"] }
 blake3       = "1.8"
 walkdir      = "2.5"
 dirs         = "6"
-infer        = "0.19"
+infer        = "0.22"
 mime_guess   = "2.0"
 
 # Content extraction (feature-gated per format in tidyup-extract)
