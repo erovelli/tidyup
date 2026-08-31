@@ -291,10 +291,12 @@ struct DiffModel {
     left_rows: Vec<TreeRow>,
     /// Proposal id → row index in `left_rows`.
     file_row_by_id: HashMap<Uuid, usize>,
-    /// Entries for the right column, pre-ordered to minimise curve crossings.
-    right_entries: Vec<RightEntry>,
-    /// Displayed label for the root (derived from the common parent of all proposed paths).
-    root_label: String,
+    /// Source hierarchy shown in the right column.
+    right_rows: Vec<CurrentTreeRow>,
+    /// Proposal id → row index in `right_rows`.
+    current_file_row_by_id: HashMap<Uuid, usize>,
+    /// Per-file metadata used to draw connectors between both trees.
+    connector_entries: Vec<RightEntry>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -319,6 +321,19 @@ struct RightEntry {
     display_name: String,
     confidence: f32,
     rename: bool,
+}
+
+#[derive(Clone, PartialEq)]
+enum CurrentTreeRow {
+    Folder {
+        name: String,
+        depth: usize,
+        file_count: usize,
+    },
+    File {
+        entry: RightEntry,
+        depth: usize,
+    },
 }
 
 fn build_diff_model(proposals: &[ChangeProposal]) -> DiffModel {
@@ -347,7 +362,7 @@ fn build_diff_model(proposals: &[ChangeProposal]) -> DiffModel {
             .iter()
             .all(|parent| parent.starts_with(&source_root))
     {
-        source_root
+        source_root.clone()
     } else if !proposed_root.as_os_str().is_empty()
         && parents.iter().all(|parent| parent == &proposed_root)
     {
@@ -357,11 +372,6 @@ fn build_diff_model(proposals: &[ChangeProposal]) -> DiffModel {
     } else {
         proposed_root
     };
-    let root_label = root
-        .file_name()
-        .and_then(|s| s.to_str())
-        .map_or_else(|| root.display().to_string(), ToString::to_string);
-
     // Build tree keyed by relative path components.
     let mut tree = TreeBuilder::default();
     for (idx, p) in proposals.iter().enumerate() {
@@ -384,9 +394,7 @@ fn build_diff_model(proposals: &[ChangeProposal]) -> DiffModel {
     let mut file_row_by_id = HashMap::new();
     tree.flatten(0, proposals, &mut left_rows, &mut file_row_by_id);
 
-    // Order right entries by corresponding left row index — the key to keeping
-    // bezier curves from spaghetti-ing across each other.
-    let mut right_entries: Vec<RightEntry> = proposals
+    let connector_entries: Vec<RightEntry> = proposals
         .iter()
         .map(|p| RightEntry {
             proposal_id: p.id,
@@ -405,19 +413,61 @@ fn build_diff_model(proposals: &[ChangeProposal]) -> DiffModel {
             ),
         })
         .collect();
-    right_entries.sort_by_key(|e| {
-        file_row_by_id
-            .get(&e.proposal_id)
-            .copied()
-            .unwrap_or(usize::MAX)
-    });
+
+    let (right_rows, current_file_row_by_id) =
+        build_current_tree(proposals, &source_root, &connector_entries);
 
     DiffModel {
         left_rows,
         file_row_by_id,
-        right_entries,
-        root_label,
+        right_rows,
+        current_file_row_by_id,
+        connector_entries,
     }
+}
+
+/// Preserve the original source hierarchy instead of flattening every file
+/// into a filename-only list. The explicit root row makes it clear which files
+/// sit directly in the scan root and which live inside containers.
+fn build_current_tree(
+    proposals: &[ChangeProposal],
+    source_root: &Path,
+    entries: &[RightEntry],
+) -> (Vec<CurrentTreeRow>, HashMap<Uuid, usize>) {
+    let mut current_tree = TreeBuilder::default();
+    for (idx, proposal) in proposals.iter().enumerate() {
+        let parent = proposal
+            .original_path
+            .parent()
+            .unwrap_or_else(|| Path::new(""));
+        let rel: Vec<String> = parent
+            .strip_prefix(source_root)
+            .unwrap_or(parent)
+            .components()
+            .filter_map(|component| component.as_os_str().to_str().map(ToString::to_string))
+            .collect();
+        let filename = proposal
+            .original_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map_or_else(
+                || proposal.original_path.display().to_string(),
+                ToString::to_string,
+            );
+        current_tree.insert(&rel, filename, idx);
+    }
+    let source_root_label = source_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map_or_else(|| source_root.display().to_string(), ToString::to_string);
+    let mut right_rows = vec![CurrentTreeRow::Folder {
+        name: source_root_label,
+        depth: 0,
+        file_count: proposals.len(),
+    }];
+    let mut current_file_row_by_id = HashMap::new();
+    current_tree.flatten_current(1, entries, &mut right_rows, &mut current_file_row_by_id);
+    (right_rows, current_file_row_by_id)
 }
 
 fn common_ancestor(paths: &[PathBuf]) -> PathBuf {
@@ -498,6 +548,32 @@ impl TreeBuilder {
                 proposal_id: p.id,
             });
             file_row_by_id.insert(p.id, row_idx);
+        }
+    }
+
+    fn flatten_current(
+        &self,
+        depth: usize,
+        entries: &[RightEntry],
+        rows: &mut Vec<CurrentTreeRow>,
+        file_row_by_id: &mut HashMap<Uuid, usize>,
+    ) {
+        for (name, child) in &self.folders {
+            rows.push(CurrentTreeRow::Folder {
+                name: name.clone(),
+                depth,
+                file_count: child.file_count(),
+            });
+            child.flatten_current(depth.saturating_add(1), entries, rows, file_row_by_id);
+        }
+        let mut files = self.files.clone();
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        for (_, idx) in files {
+            let Some(entry) = entries.get(idx).cloned() else {
+                continue;
+            };
+            file_row_by_id.insert(entry.proposal_id, rows.len());
+            rows.push(CurrentTreeRow::File { entry, depth });
         }
     }
 }
@@ -752,15 +828,15 @@ fn DiffView(
 ) -> Element {
     let locked_ids: HashSet<Uuid> = locked_ids.into_iter().collect();
     let left_height = rows_to_height(model.left_rows.len());
-    let right_height = rows_to_height(model.right_entries.len());
+    let right_height = rows_to_height(model.right_rows.len());
     let svg_height = left_height.max(right_height);
 
     let connectors: Vec<ConnectorRender> = model
-        .right_entries
+        .connector_entries
         .iter()
-        .enumerate()
-        .filter_map(|(right_idx, entry)| {
+        .filter_map(|entry| {
             let &left_idx = model.file_row_by_id.get(&entry.proposal_id)?;
+            let &right_idx = model.current_file_row_by_id.get(&entry.proposal_id)?;
             let ly = row_center_y(left_idx);
             let ry = row_center_y(right_idx);
             let d = format!("M 0 {ly} C 50 {ly}, 50 {ry}, 100 {ry}");
@@ -829,11 +905,11 @@ fn DiffView(
                 div {
                     class: "diff-col-body",
                     style: "height: {right_height}px;",
-                    for entry in model.right_entries.iter().cloned() {
-                        CurrentRow {
-                            key: "{entry.proposal_id}",
-                            locked: locked_ids.contains(&entry.proposal_id),
-                            entry,
+                    for (i, row) in model.right_rows.iter().cloned().enumerate() {
+                        CurrentTreeRowView {
+                            key: "{current_tree_row_key(i, &row)}",
+                            row,
+                            locked_ids: locked_ids.clone(),
                             hovered,
                             selected,
                             signals,
@@ -841,6 +917,15 @@ fn DiffView(
                     }
                 }
             }
+        }
+    }
+}
+
+fn current_tree_row_key(i: usize, row: &CurrentTreeRow) -> String {
+    match row {
+        CurrentTreeRow::File { entry, .. } => format!("current-file-{}", entry.proposal_id),
+        CurrentTreeRow::Folder { name, depth, .. } => {
+            format!("current-folder-{i}-{depth}-{name}")
         }
     }
 }
@@ -1022,6 +1107,7 @@ fn TreeRowView(
 #[component]
 fn CurrentRow(
     entry: RightEntry,
+    depth: usize,
     hovered: Signal<Option<Uuid>>,
     selected: Signal<Option<Uuid>>,
     signals: SignalBundle,
@@ -1080,6 +1166,7 @@ fn CurrentRow(
     rsx! {
         div {
             class: "{row_class}",
+            style: "padding-left: {depth.saturating_mul(24).saturating_add(12)}px;",
             onmouseenter: on_enter,
             onmouseleave: on_leave,
             onclick: on_click,
@@ -1103,6 +1190,43 @@ fn CurrentRow(
             }
             if is_selected && locked {
                 span { class: "chip chip-neutral", "approve with collection" }
+            }
+        }
+    }
+}
+
+#[component]
+fn CurrentTreeRowView(
+    row: CurrentTreeRow,
+    hovered: Signal<Option<Uuid>>,
+    selected: Signal<Option<Uuid>>,
+    signals: SignalBundle,
+    locked_ids: HashSet<Uuid>,
+) -> Element {
+    match row {
+        CurrentTreeRow::Folder {
+            name,
+            depth,
+            file_count,
+        } => {
+            let pad = depth.saturating_mul(24).saturating_add(12);
+            rsx! {
+                div {
+                    class: "tree-row tree-folder current-folder",
+                    style: "padding-left: {pad}px;",
+                    span { class: "tree-caret", "▸" }
+                    span { class: "tree-folder-name", title: "{name}", "{name}/" }
+                    span {
+                        class: "tree-filecount",
+                        if file_count == 1 { "1 file" } else { "{file_count} files" }
+                    }
+                }
+            }
+        }
+        CurrentTreeRow::File { entry, depth } => {
+            let locked = locked_ids.contains(&entry.proposal_id);
+            rsx! {
+                CurrentRow { entry, depth, hovered, selected, signals, locked }
             }
         }
     }
@@ -2820,6 +2944,50 @@ mod tests {
             matches!(row, TreeRow::Folder { name, depth: 1, .. } if name == "Career")
         }));
         assert_eq!(count_folders(&model.left_rows), 2);
+    }
+
+    #[test]
+    fn diff_model_preserves_current_source_directories_and_root_files() {
+        let root_file = move_proposal("semantic.md");
+        let root_file_id = root_file.id;
+        let mut nested_file = move_proposal("Back Piece.stl");
+        nested_file.original_path = PathBuf::from("/Users/example/Desktop/zprint/Back Piece.stl");
+        let nested_file_id = nested_file.id;
+
+        let model = build_diff_model(&[root_file, nested_file]);
+
+        assert!(matches!(
+            model.right_rows.first(),
+            Some(CurrentTreeRow::Folder {
+                name,
+                depth: 0,
+                file_count: 2,
+            }) if name == "Desktop"
+        ));
+        assert!(model.right_rows.iter().any(|row| {
+            matches!(
+                row,
+                CurrentTreeRow::Folder {
+                    name,
+                    depth: 1,
+                    file_count: 1,
+                } if name == "zprint"
+            )
+        }));
+        assert!(model.right_rows.iter().any(|row| {
+            matches!(
+                row,
+                CurrentTreeRow::File { entry, depth: 1 }
+                    if entry.proposal_id == root_file_id
+            )
+        }));
+        assert!(model.right_rows.iter().any(|row| {
+            matches!(
+                row,
+                CurrentTreeRow::File { entry, depth: 2 }
+                    if entry.proposal_id == nested_file_id
+            )
+        }));
     }
 
     #[test]
