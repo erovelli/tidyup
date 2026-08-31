@@ -642,6 +642,11 @@ a { color: inherit; text-decoration: none; }
     transition: background 160ms ease-out, color 160ms ease-out;
 }
 .current-folder { margin: 0; }
+.current-bundle {
+    background: var(--surface-container-low);
+    font-family: var(--font-body);
+    font-weight: 600;
+}
 
 /* Shared row interaction states (tree-file + current-row) */
 .row-hovered {

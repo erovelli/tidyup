@@ -211,7 +211,12 @@ pub(crate) fn Review() -> Element {
 
     let source_root = signals.review_source_root.read().clone();
     let target_root = signals.review_target_root.read().clone();
-    let model = build_diff_model(&proposals, source_root.as_deref(), target_root.as_deref());
+    let model = build_diff_model(
+        &proposals,
+        &[],
+        source_root.as_deref(),
+        target_root.as_deref(),
+    );
     let applied_count = signals.last_report.read().as_ref().map_or(0, |r| match r {
         LastReport::Scan { report, .. } => report.applied,
         LastReport::Migration { report, .. } => report.applied,
@@ -314,7 +319,27 @@ enum TreeRow {
         confidence: f32,
         change_type: ChangeType,
         proposal_id: Uuid,
+        bundle_kind: Option<OverviewBundleKind>,
+        file_count: usize,
     },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OverviewBundleKind {
+    Directory,
+    Collection,
+}
+
+#[derive(Clone)]
+struct OverviewEntry {
+    id: Uuid,
+    original_path: PathBuf,
+    proposed_path: PathBuf,
+    proposed_name: String,
+    confidence: f32,
+    change_type: ChangeType,
+    bundle_kind: Option<OverviewBundleKind>,
+    file_count: usize,
 }
 
 #[derive(Clone, PartialEq)]
@@ -323,6 +348,8 @@ struct RightEntry {
     display_name: String,
     confidence: f32,
     rename: bool,
+    bundle_kind: Option<OverviewBundleKind>,
+    file_count: usize,
 }
 
 #[derive(Clone, PartialEq)]
@@ -340,10 +367,12 @@ enum CurrentTreeRow {
 
 fn build_diff_model(
     proposals: &[ChangeProposal],
+    bundles: &[BundleProposal],
     explicit_source_root: Option<&Path>,
     explicit_target_root: Option<&Path>,
 ) -> DiffModel {
-    let parents: Vec<PathBuf> = proposals
+    let entries = overview_entries(proposals, bundles);
+    let parents: Vec<PathBuf> = entries
         .iter()
         .map(|p| {
             p.proposed_path
@@ -352,7 +381,7 @@ fn build_diff_model(
                 .unwrap_or_default()
         })
         .collect();
-    let original_parents: Vec<PathBuf> = proposals
+    let original_parents: Vec<PathBuf> = entries
         .iter()
         .filter_map(|proposal| proposal.original_path.parent().map(Path::to_path_buf))
         .collect();
@@ -387,7 +416,7 @@ fn build_diff_model(
     );
     // Build tree keyed by relative path components.
     let mut tree = TreeBuilder::default();
-    for (idx, p) in proposals.iter().enumerate() {
+    for (idx, p) in entries.iter().enumerate() {
         let parent = p.proposed_path.parent().unwrap_or_else(|| Path::new(""));
         let rel: Vec<String> = parent
             .strip_prefix(&root)
@@ -400,19 +429,20 @@ fn build_diff_model(
             .file_name()
             .and_then(|s| s.to_str())
             .map_or_else(|| p.proposed_name.clone(), ToString::to_string);
-        tree.insert(&rel, filename, idx);
+        tree.insert(&rel, filename, idx, p.file_count);
     }
 
+    let total_file_count = overview_file_count(proposals, bundles);
     let root_label = path_display_name(&root);
     let mut left_rows = vec![TreeRow::Folder {
         name: root_label,
         depth: 0,
-        file_count: proposals.len(),
+        file_count: total_file_count,
     }];
     let mut file_row_by_id = HashMap::new();
-    tree.flatten(1, proposals, &mut left_rows, &mut file_row_by_id);
+    tree.flatten(1, &entries, &mut left_rows, &mut file_row_by_id);
 
-    let connector_entries: Vec<RightEntry> = proposals
+    let connector_entries: Vec<RightEntry> = entries
         .iter()
         .map(|p| RightEntry {
             proposal_id: p.id,
@@ -429,11 +459,18 @@ fn build_diff_model(
                 p.change_type,
                 ChangeType::Rename | ChangeType::RenameAndMove
             ),
+            bundle_kind: p.bundle_kind,
+            file_count: p.file_count,
         })
         .collect();
 
-    let (right_rows, current_file_row_by_id) =
-        build_current_tree(proposals, &source_root, &connector_entries, &file_row_by_id);
+    let (right_rows, current_file_row_by_id) = build_current_tree(
+        &entries,
+        &source_root,
+        &connector_entries,
+        &file_row_by_id,
+        total_file_count,
+    );
 
     DiffModel {
         left_rows,
@@ -448,10 +485,11 @@ fn build_diff_model(
 /// into a filename-only list. The explicit root row makes it clear which files
 /// sit directly in the scan root and which live inside containers.
 fn build_current_tree(
-    proposals: &[ChangeProposal],
+    proposals: &[OverviewEntry],
     source_root: &Path,
     entries: &[RightEntry],
     destination_row_by_id: &HashMap<Uuid, usize>,
+    total_file_count: usize,
 ) -> (Vec<CurrentTreeRow>, HashMap<Uuid, usize>) {
     let mut current_tree = TreeBuilder::default();
     for (idx, proposal) in proposals.iter().enumerate() {
@@ -473,13 +511,13 @@ fn build_current_tree(
                 || proposal.original_path.display().to_string(),
                 ToString::to_string,
             );
-        current_tree.insert(&rel, filename, idx);
+        current_tree.insert(&rel, filename, idx, proposal.file_count);
     }
     let source_root_label = path_display_name(source_root);
     let mut right_rows = vec![CurrentTreeRow::Folder {
         name: source_root_label,
         depth: 0,
-        file_count: proposals.len(),
+        file_count: total_file_count,
     }];
     let mut current_file_row_by_id = HashMap::new();
     current_tree.flatten_current(
@@ -490,6 +528,80 @@ fn build_current_tree(
         &mut current_file_row_by_id,
     );
     (right_rows, current_file_row_by_id)
+}
+
+fn overview_entries(
+    proposals: &[ChangeProposal],
+    bundles: &[BundleProposal],
+) -> Vec<OverviewEntry> {
+    let mut entries = proposals
+        .iter()
+        .map(|proposal| OverviewEntry {
+            id: proposal.id,
+            original_path: proposal.original_path.clone(),
+            proposed_path: proposal.proposed_path.clone(),
+            proposed_name: proposal.proposed_name.clone(),
+            confidence: proposal.confidence,
+            change_type: proposal.change_type.clone(),
+            bundle_kind: None,
+            file_count: 1,
+        })
+        .collect::<Vec<_>>();
+    entries.extend(bundles.iter().filter_map(collapsed_bundle_entry));
+    entries
+}
+
+fn collapsed_bundle_entry(bundle: &BundleProposal) -> Option<OverviewEntry> {
+    let file_count = bundle.members.len();
+    let label = match &bundle.kind {
+        tidyup_domain::BundleKind::SemanticCollection { label } => label.clone(),
+        _ => path_display_name(&bundle.root),
+    };
+    let (original_path, proposed_path, bundle_kind) = if bundle.kind.moves_as_file_set() {
+        let proposed_parents = bundle
+            .members
+            .iter()
+            .filter_map(|member| member.proposed_path.parent().map(Path::to_path_buf))
+            .collect::<Vec<_>>();
+        let proposed_path = common_ancestor(&proposed_parents);
+        (
+            bundle.root.join(&label),
+            proposed_path,
+            OverviewBundleKind::Collection,
+        )
+    } else {
+        let leaf = bundle.root.file_name()?;
+        (
+            bundle.root.clone(),
+            bundle.target_parent.join(leaf),
+            OverviewBundleKind::Directory,
+        )
+    };
+
+    let moves = if bundle.kind.moves_as_file_set() {
+        bundle
+            .members
+            .iter()
+            .any(|member| member.original_path != member.proposed_path)
+    } else {
+        original_path != proposed_path
+    };
+    moves.then_some(OverviewEntry {
+        id: bundle.id,
+        original_path,
+        proposed_path,
+        proposed_name: label,
+        confidence: bundle.confidence,
+        change_type: ChangeType::Move,
+        bundle_kind: Some(bundle_kind),
+        file_count,
+    })
+}
+
+fn overview_file_count(proposals: &[ChangeProposal], bundles: &[BundleProposal]) -> usize {
+    bundles.iter().fold(proposals.len(), |count, bundle| {
+        count.saturating_add(bundle.members.len())
+    })
 }
 
 fn path_display_name(path: &Path) -> String {
@@ -526,7 +638,7 @@ fn common_ancestor(paths: &[PathBuf]) -> PathBuf {
 #[derive(Default)]
 struct TreeBuilder {
     folders: BTreeMap<String, Self>,
-    files: Vec<(String, usize)>, // (filename, proposal index)
+    files: Vec<(String, usize, usize)>, // (name, overview-entry index, represented files)
 }
 
 enum CurrentChild<'a> {
@@ -535,26 +647,27 @@ enum CurrentChild<'a> {
 }
 
 impl TreeBuilder {
-    fn insert(&mut self, folders: &[String], filename: String, idx: usize) {
+    fn insert(&mut self, folders: &[String], filename: String, idx: usize, file_count: usize) {
         let mut node = self;
         for folder in folders {
             node = node.folders.entry(folder.clone()).or_default();
         }
-        node.files.push((filename, idx));
+        node.files.push((filename, idx, file_count));
     }
 
     fn file_count(&self) -> usize {
-        self.folders
-            .values()
-            .fold(self.files.len(), |count, folder| {
-                count.saturating_add(folder.file_count())
-            })
+        self.folders.values().fold(
+            self.files
+                .iter()
+                .fold(0_usize, |count, (_, _, files)| count.saturating_add(*files)),
+            |count, folder| count.saturating_add(folder.file_count()),
+        )
     }
 
     fn flatten(
         &self,
         depth: usize,
-        proposals: &[ChangeProposal],
+        proposals: &[OverviewEntry],
         rows: &mut Vec<TreeRow>,
         file_row_by_id: &mut HashMap<Uuid, usize>,
     ) {
@@ -568,7 +681,7 @@ impl TreeBuilder {
         }
         let mut files = self.files.clone();
         files.sort_by(|a, b| a.0.cmp(&b.0));
-        for (name, idx) in files {
+        for (name, idx, _) in files {
             let Some(p) = proposals.get(idx) else {
                 continue;
             };
@@ -579,6 +692,8 @@ impl TreeBuilder {
                 confidence: p.confidence,
                 change_type: p.change_type.clone(),
                 proposal_id: p.id,
+                bundle_kind: p.bundle_kind,
+                file_count: p.file_count,
             });
             file_row_by_id.insert(p.id, row_idx);
         }
@@ -599,7 +714,7 @@ impl TreeBuilder {
             .chain(
                 self.files
                     .iter()
-                    .map(|(name, idx)| CurrentChild::File(name, *idx)),
+                    .map(|(name, idx, _)| CurrentChild::File(name, *idx)),
             )
             .collect();
         children.sort_by(|a, b| {
@@ -642,7 +757,7 @@ impl TreeBuilder {
     ) -> usize {
         self.files
             .iter()
-            .filter_map(|(_, idx)| entries.get(*idx))
+            .filter_map(|(_, idx, _)| entries.get(*idx))
             .filter_map(|entry| destination_row_by_id.get(&entry.proposal_id).copied())
             .chain(
                 self.folders
@@ -1154,6 +1269,8 @@ fn TreeRowView(
             confidence,
             change_type,
             proposal_id,
+            bundle_kind,
+            file_count,
         } => {
             let pad = depth.saturating_mul(24).saturating_add(12);
             let chip = confidence_chip(confidence);
@@ -1165,7 +1282,11 @@ fn TreeRowView(
             let is_selected = selected_id == Some(proposal_id);
             let state = decision_state_of(&signals.decisions.read(), proposal_id);
 
-            let mut row_class = String::from("tree-row tree-file");
+            let mut row_class = if bundle_kind.is_some() {
+                String::from("tree-row tree-folder tree-bundle")
+            } else {
+                String::from("tree-row tree-file")
+            };
             row_class.push_str(row_state_class(state));
             if is_hovered {
                 row_class.push_str(" row-hovered");
@@ -1191,13 +1312,22 @@ fn TreeRowView(
                     onmouseenter: on_enter,
                     onmouseleave: on_leave,
                     onclick: on_click,
-                    span { class: "tree-file-name", title: "{name}", "{name}" }
-                    span {
-                        class: "tree-row-meta",
-                        if is_rename {
-                            span { class: "chip chip-neutral", "rename" }
+                    if bundle_kind.is_some() {
+                        span { class: "tree-caret", "▸" }
+                        span { class: "tree-folder-name", title: "{name}", "{name}/" }
+                        span {
+                            class: "tree-filecount",
+                            if file_count == 1 { "1 file" } else { "{file_count} files" }
                         }
-                        span { class: "chip {chip.0} tree-confidence", "{chip.1}" }
+                    } else {
+                        span { class: "tree-file-name", title: "{name}", "{name}" }
+                        span {
+                            class: "tree-row-meta",
+                            if is_rename {
+                                span { class: "chip chip-neutral", "rename" }
+                            }
+                            span { class: "chip {chip.0} tree-confidence", "{chip.1}" }
+                        }
                     }
                 }
             }
@@ -1220,7 +1350,11 @@ fn CurrentRow(
     let is_selected = selected_id == Some(entry.proposal_id);
     let state = decision_state_of(&signals.decisions.read(), entry.proposal_id);
 
-    let mut row_class = String::from("current-row");
+    let mut row_class = if entry.bundle_kind.is_some() {
+        String::from("current-row current-bundle")
+    } else {
+        String::from("current-row")
+    };
     row_class.push_str(row_state_class(state));
     if is_hovered {
         row_class.push_str(" row-hovered");
@@ -1271,7 +1405,24 @@ fn CurrentRow(
             onmouseenter: on_enter,
             onmouseleave: on_leave,
             onclick: on_click,
-            span { class: "current-name", title: "{entry.display_name}", "{entry.display_name}" }
+            if let Some(bundle_kind) = entry.bundle_kind {
+                span { class: "tree-caret", "▸" }
+                span {
+                    class: "current-name",
+                    title: "{entry.display_name}",
+                    if bundle_kind == OverviewBundleKind::Directory {
+                        "{entry.display_name}/"
+                    } else {
+                        "{entry.display_name} collection"
+                    }
+                }
+                span {
+                    class: "tree-filecount",
+                    if entry.file_count == 1 { "1 file" } else { "{entry.file_count} files" }
+                }
+            } else {
+                span { class: "current-name", title: "{entry.display_name}", "{entry.display_name}" }
+            }
             if is_selected && !locked {
                 span {
                     class: "current-actions",
@@ -1665,20 +1816,12 @@ fn CombinedReview(state: SharedState) -> Element {
     let total_files = loose_count.saturating_add(collection_files);
     let indexed_count = usize::try_from(*signals.indexed_count.read()).unwrap_or(usize::MAX);
     let approved_n = approvals.values().filter(|v| **v).count();
-    let mut plan_changes = proposals.clone();
-    let locked_ids: Vec<Uuid> = bundles
-        .iter()
-        .flat_map(|bundle| bundle.members.iter().map(|member| member.id))
-        .collect();
-    plan_changes.extend(
-        bundles
-            .iter()
-            .flat_map(|bundle| bundle.members.iter().cloned()),
-    );
+    let locked_ids: Vec<Uuid> = bundles.iter().map(|bundle| bundle.id).collect();
     let source_root = signals.review_source_root.read().clone();
     let target_root = signals.review_target_root.read().clone();
     let model = build_diff_model(
-        &plan_changes,
+        &proposals,
+        &bundles,
         source_root.as_deref(),
         target_root.as_deref(),
     );
@@ -3051,7 +3194,12 @@ mod tests {
             move_proposal("Resume_Evan_Rovelli.pdf"),
             move_proposal("Resume_Evan_Rovelli_Audible.pdf"),
         ];
-        let model = build_diff_model(&proposals, Some(Path::new("/Users/example/Desktop")), None);
+        let model = build_diff_model(
+            &proposals,
+            &[],
+            Some(Path::new("/Users/example/Desktop")),
+            None,
+        );
         assert!(model.left_rows.iter().any(|row| {
             matches!(row, TreeRow::Folder { name, depth: 0, .. } if name == "Desktop")
         }));
@@ -3074,6 +3222,7 @@ mod tests {
 
         let model = build_diff_model(
             &[root_file, nested_file],
+            &[],
             Some(Path::new("/Users/example/Desktop")),
             None,
         );
@@ -3120,6 +3269,7 @@ mod tests {
 
         let model = build_diff_model(
             &[proposal],
+            &[],
             Some(Path::new("/Users/example/Incoming")),
             Some(Path::new("/Users/example/Documents")),
         );
@@ -3145,11 +3295,77 @@ mod tests {
 
         let model = build_diff_model(
             &[first_source_alphabetically, last_source_alphabetically],
+            &[],
             Some(Path::new("/Users/example/Desktop")),
             None,
         );
 
         assert!(model.current_file_row_by_id[&last_id] < model.current_file_row_by_id[&first_id]);
+    }
+
+    #[test]
+    fn plan_overview_collapses_moved_bundles_and_omits_stationary_bundles() {
+        let mut moved_member = move_proposal("Back Piece.stl");
+        moved_member.original_path = PathBuf::from("/Users/example/Desktop/zprint/Back Piece.stl");
+        moved_member.proposed_path =
+            PathBuf::from("/Users/example/Desktop/3D Models/zprint/Back Piece.stl");
+        let moved_member_id = moved_member.id;
+        let moved = BundleProposal::new(
+            PathBuf::from("/Users/example/Desktop/zprint"),
+            tidyup_domain::BundleKind::DirectoryEnvelope,
+            PathBuf::from("/Users/example/Desktop/3D Models"),
+            vec![moved_member],
+            0.7,
+            "move directory as one unit".to_string(),
+        )
+        .unwrap();
+        let moved_id = moved.id;
+
+        let mut stationary_member = move_proposal("keep.txt");
+        stationary_member.original_path = PathBuf::from("/Users/example/Desktop/keep/keep.txt");
+        stationary_member.proposed_path = stationary_member.original_path.clone();
+        let stationary = BundleProposal::new(
+            PathBuf::from("/Users/example/Desktop/keep"),
+            tidyup_domain::BundleKind::DirectoryEnvelope,
+            PathBuf::from("/Users/example/Desktop"),
+            vec![stationary_member],
+            0.9,
+            "already in place".to_string(),
+        )
+        .unwrap();
+        let stationary_id = stationary.id;
+
+        let model = build_diff_model(
+            &[],
+            &[moved, stationary],
+            Some(Path::new("/Users/example/Desktop")),
+            None,
+        );
+
+        assert_eq!(model.connector_entries.len(), 1);
+        assert_eq!(model.connector_entries[0].proposal_id, moved_id);
+        assert_eq!(model.connector_entries[0].file_count, 1);
+        assert!(matches!(
+            model.left_rows.first(),
+            Some(TreeRow::Folder { file_count: 2, .. })
+        ));
+        assert!(matches!(
+            model.right_rows.first(),
+            Some(CurrentTreeRow::Folder { file_count: 2, .. })
+        ));
+        assert!(!model.file_row_by_id.contains_key(&moved_member_id));
+        assert!(!model.file_row_by_id.contains_key(&stationary_id));
+        assert!(model.left_rows.iter().any(|row| {
+            matches!(
+                row,
+                TreeRow::File {
+                    proposal_id,
+                    bundle_kind: Some(OverviewBundleKind::Directory),
+                    file_count: 1,
+                    ..
+                } if *proposal_id == moved_id
+            )
+        }));
     }
 
     #[test]
