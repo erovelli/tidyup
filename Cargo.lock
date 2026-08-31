@@ -765,6 +765,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cfb"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a347dcabdae9c31b0825fd6a8bed285ec9c2acb89c47827126d52fa4f59cece3"
+dependencies = [
+ "fnv",
+ "uuid 1.25.0",
+ "web-time",
+]
+
+[[package]]
 name = "cff-parser"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1715,7 +1726,7 @@ checksum = "84235ff0e272f15d4537603cdd50df6d45d50e51bb96326dbc0bdfd01d825226"
 dependencies = [
  "dioxus-cli-config",
  "http",
- "infer",
+ "infer 0.19.0",
  "jni 0.21.1",
  "ndk",
  "ndk-context",
@@ -1819,7 +1830,7 @@ dependencies = [
  "generational-box",
  "global-hotkey",
  "image",
- "infer",
+ "infer 0.19.0",
  "jni 0.21.1",
  "lazy-js-bundle",
  "libc",
@@ -3850,7 +3861,16 @@ version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a588916bfdfd92e71cacef98a63d9b1f0d74d6599980d11894290e7ddefffcf7"
 dependencies = [
- "cfb",
+ "cfb 0.7.3",
+]
+
+[[package]]
+name = "infer"
+version = "0.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4200d433cbd5178df7797c9c2e75b348b728e39631cf14520d1e2fc424201f4"
+dependencies = [
+ "cfb 0.14.0",
 ]
 
 [[package]]
@@ -8485,7 +8505,7 @@ dependencies = [
  "async-trait",
  "calamine",
  "image",
- "infer",
+ "infer 0.22.0",
  "kamadak-exif",
  "lofty",
  "mime_guess",
@@ -8533,7 +8553,7 @@ dependencies = [
  "blake3",
  "chrono",
  "image",
- "infer",
+ "infer 0.22.0",
  "mime_guess",
  "serde",
  "serde_json",
