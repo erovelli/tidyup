@@ -1271,6 +1271,11 @@ fn CombinedReview(state: SharedState) -> Element {
     let threshold_label = format!("{threshold_val:.2}");
     let loose_count = proposals.len();
     let collection_count = bundles.len();
+    let envelope_count = bundles
+        .iter()
+        .filter(|bundle| matches!(&bundle.kind, tidyup_domain::BundleKind::DirectoryEnvelope))
+        .count();
+    let file_set_count = collection_count.saturating_sub(envelope_count);
     let collection_files = bundles
         .iter()
         .map(|bundle| bundle.members.len())
@@ -1317,7 +1322,7 @@ fn CombinedReview(state: SharedState) -> Element {
                 h2 { class: "card-title", "Complete organization plan" }
                 p {
                     class: "card-subtitle muted",
-                    "{loose_count} individual change(s) and {collection_count} semantic collection(s), covering {total_files} files. Collections move atomically and require explicit approval; anything undecided is held."
+                    "{loose_count} individual change(s), {envelope_count} preserved directory envelope(s), and {file_set_count} file-set collection(s), covering {total_files} files. Existing folders move as one unit; anything undecided is held."
                 }
                 div {
                     class: "button-row",
@@ -1351,7 +1356,7 @@ fn CombinedReview(state: SharedState) -> Element {
             div { class: "section-heading", style: "margin-top: 24px;", "PLAN OVERVIEW" }
             DiffView { model, hovered, selected, signals, locked_ids }
             DiffLegend {}
-            div { class: "section-heading", style: "margin-top: 24px;", "SEMANTIC COLLECTIONS" }
+            div { class: "section-heading", style: "margin-top: 24px;", "ATOMIC DIRECTORIES & COLLECTIONS" }
             div {
                 class: "card-stack",
                 style: "margin-top: 16px;",
@@ -1380,12 +1385,16 @@ fn BundleReviewCard(bundle: BundleProposal, signals: SignalBundle) -> Element {
     let decision = approvals.read().get(&bundle.id).copied();
 
     let root = bundle.root.display().to_string();
-    let target_parents: Vec<PathBuf> = bundle
-        .members
-        .iter()
-        .filter_map(|member| member.proposed_path.parent().map(Path::to_path_buf))
-        .collect();
-    let target = common_ancestor(&target_parents).display().to_string();
+    let target = if matches!(&bundle.kind, tidyup_domain::BundleKind::DirectoryEnvelope) {
+        bundle.target_parent.display().to_string()
+    } else {
+        let target_parents: Vec<PathBuf> = bundle
+            .members
+            .iter()
+            .filter_map(|member| member.proposed_path.parent().map(Path::to_path_buf))
+            .collect();
+        common_ancestor(&target_parents).display().to_string()
+    };
     let kind = bundle.kind.as_str();
     let title = match &bundle.kind {
         tidyup_domain::BundleKind::SemanticCollection { label } => label.clone(),
@@ -1398,6 +1407,24 @@ fn BundleReviewCard(bundle: BundleProposal, signals: SignalBundle) -> Element {
     };
     let chip = confidence_chip(bundle.confidence);
     let member_count = bundle.members.len();
+    let envelope_detail = bundle.envelope.as_ref().map(|envelope| {
+        let state = match envelope.boundary {
+            tidyup_domain::DirectoryBoundary::Cohesive => "cohesive",
+            tidyup_domain::DirectoryBoundary::Uncertain => "uncertain — review required",
+        };
+        let provenance = if envelope.provenance.is_empty() {
+            String::new()
+        } else {
+            format!("; provenance: {}", envelope.provenance.join(", "))
+        };
+        format!(
+            "Existing folder preserved as one unit ({state}); {} files, {} directories, {} symlinks; cohesion {:.2}{provenance}",
+            envelope.snapshot.regular_files,
+            envelope.snapshot.directories,
+            envelope.snapshot.symlinks,
+            envelope.cohesion,
+        )
+    });
 
     let card_class = match decision {
         Some(true) => "proposal proposal-approved",
@@ -1438,6 +1465,9 @@ fn BundleReviewCard(bundle: BundleProposal, signals: SignalBundle) -> Element {
                 div { class: "proposal-target", "{title}" }
                 div { class: "proposal-path", "{root} → {target}/ ({member_count} files)" }
                 div { class: "proposal-reason", "{bundle.reasoning}" }
+                if let Some(detail) = envelope_detail {
+                    div { class: "proposal-reason", "{detail}" }
+                }
                 if bundle.kind.allows_member_renames() {
                     div {
                         class: "semantic-members",

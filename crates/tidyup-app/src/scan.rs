@@ -31,8 +31,8 @@ use tidyup_pipeline::scan::{
 use uuid::Uuid;
 
 use crate::executor::{
-    apply_bundles, apply_loose_decisions, select_bundle_decisions, validate_destination_ledger,
-    ApplyReport, ExecutorDeps, DEFAULT_BUNDLE_MIN_CONFIDENCE,
+    apply_bundles, apply_envelope_capacity_limits, apply_loose_decisions, select_bundle_decisions,
+    validate_destination_ledger, ApplyReport, ExecutorDeps, DEFAULT_BUNDLE_MIN_CONFIDENCE,
 };
 use crate::processing::{attach_indexed_identities, record_source_outcomes, report_indexing};
 use crate::ServiceContext;
@@ -279,6 +279,37 @@ impl ScanService {
             progress,
         )
         .await?;
+
+        let capacity = apply_envelope_capacity_limits(
+            &mut outcome.bundles,
+            self.ctx.classifier.directory_envelopes.backup_warn_bytes,
+            self.ctx
+                .classifier
+                .directory_envelopes
+                .backup_hard_limit_bytes,
+        );
+        if capacity.warning_count > 0 {
+            progress
+                .message(
+                    Level::Warn,
+                    &format!(
+                        "{} directory envelope backup(s) exceed the configured size warning; inspect available disk space before applying",
+                        capacity.warning_count,
+                    ),
+                )
+                .await;
+        }
+        if capacity.held_count > 0 {
+            progress
+                .message(
+                    Level::Warn,
+                    &format!(
+                        "{} directory envelope backup(s) exceed the unattended size limit and require explicit approval",
+                        capacity.held_count,
+                    ),
+                )
+                .await;
+        }
 
         attach_indexed_identities(
             &indexed.indexed,

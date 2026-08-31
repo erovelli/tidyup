@@ -52,6 +52,45 @@ pub struct ApplyReport {
     pub bundles_failed: usize,
 }
 
+/// Capacity result used to inform the review surface before backups are made.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EnvelopeCapacityReport {
+    pub warning_count: usize,
+    pub held_count: usize,
+}
+
+/// Mark oversized directory-envelope backups for explicit review.
+///
+/// A zero threshold disables that respective limit. Crossing the warning
+/// threshold only reports the expected backup volume. Crossing the hard
+/// threshold keeps the envelope out of unattended `--yes`; an interactive
+/// reviewer may still approve it after considering available disk space.
+#[must_use]
+pub fn apply_envelope_capacity_limits(
+    bundles: &mut [BundleProposal],
+    warn_bytes: u64,
+    hard_limit_bytes: u64,
+) -> EnvelopeCapacityReport {
+    let mut report = EnvelopeCapacityReport::default();
+    for bundle in bundles {
+        let Some(envelope) = &mut bundle.envelope else {
+            continue;
+        };
+        let bytes = envelope.snapshot.total_bytes;
+        if warn_bytes > 0 && bytes >= warn_bytes {
+            report.warning_count = report.warning_count.saturating_add(1);
+        }
+        if hard_limit_bytes > 0 && bytes >= hard_limit_bytes {
+            report.held_count = report.held_count.saturating_add(1);
+            envelope.requires_review = true;
+            envelope.evidence.push(format!(
+                "estimated backup size {bytes} bytes reaches configured unattended limit {hard_limit_bytes} bytes; explicit approval required",
+            ));
+        }
+    }
+    report
+}
+
 /// Collection of dependencies the executor needs.
 #[allow(missing_debug_implementations)]
 pub struct ExecutorDeps<'a> {
@@ -1159,7 +1198,7 @@ mod tests {
     use tempfile::TempDir;
     use tidyup_core::frontend::Level;
     use tidyup_core::Result as CoreResult;
-    use tidyup_domain::{ChangeStatus, DirectoryBoundary, DirectoryEnvelope};
+    use tidyup_domain::{ChangeStatus, DirectoryBoundary, DirectoryEnvelope, DirectorySnapshot};
 
     #[test]
     fn copy_verify_delete_relocates_file_and_removes_original() {
@@ -1748,6 +1787,34 @@ mod tests {
             select_auto_applied_bundles(&[cohesive, uncertain], true, 0.5).len(),
             1,
         );
+    }
+
+    #[test]
+    fn oversized_envelope_is_held_from_yes_but_remains_reviewable() {
+        let mut bundle = sample_bundle(0.9);
+        bundle.kind = BundleKind::DirectoryEnvelope;
+        bundle.envelope = Some(DirectoryEnvelope {
+            boundary: DirectoryBoundary::Cohesive,
+            cohesion: 0.9,
+            snapshot: DirectorySnapshot {
+                digest: "snapshot".to_string(),
+                regular_files: 1,
+                directories: 0,
+                symlinks: 0,
+                total_bytes: 200,
+                complete: true,
+            },
+            evidence: Vec::new(),
+            provenance: Vec::new(),
+            requires_review: false,
+        });
+
+        let report = apply_envelope_capacity_limits(std::slice::from_mut(&mut bundle), 100, 150);
+
+        assert_eq!(report.warning_count, 1);
+        assert_eq!(report.held_count, 1);
+        assert!(bundle.requires_explicit_review());
+        assert!(select_auto_applied_bundles(&[bundle], true, 0.5).is_empty());
     }
 
     #[test]
