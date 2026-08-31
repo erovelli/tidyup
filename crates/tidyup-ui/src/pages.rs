@@ -1316,6 +1316,18 @@ const PLAN_OVERVIEW_FOCUS_SCRIPT: &str = r#"
                 });
             }, { passive: true });
         });
+        root.addEventListener('wheel', (event) => {
+            if (!event.target.closest('.diff-scroll-pane, .diff-gap-viewport')) return;
+            if (Math.abs(event.deltaY) <= Math.abs(event.deltaX)) return;
+            const canMove = panes.some((pane) => event.deltaY < 0
+                ? pane.scrollTop > 0
+                : pane.scrollTop + pane.clientHeight < pane.scrollHeight - 1);
+            if (!canMove) return;
+            event.preventDefault();
+            panes.forEach((pane) => {
+                pane.scrollTop += event.deltaY;
+            });
+        }, { passive: false });
         new ResizeObserver(updateConnectors).observe(root);
     }
 
