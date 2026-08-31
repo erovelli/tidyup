@@ -2,6 +2,14 @@
   <img src="assets/brand/logo.svg" alt="tidyup" width="440">
 </p>
 
+<p align="center">
+  <a href="https://github.com/erovelli/tidyup/actions/workflows/ci.yml"><img src="https://github.com/erovelli/tidyup/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/erovelli/tidyup/actions/workflows/model-eval.yml"><img src="https://github.com/erovelli/tidyup/actions/workflows/model-eval.yml/badge.svg" alt="Model eval"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License: Apache-2.0"></a>
+  <img src="https://img.shields.io/badge/rustc-1.95.0-orange.svg" alt="MSRV 1.95.0">
+  <img src="https://img.shields.io/badge/status-pre--alpha-red.svg" alt="Status: pre-alpha">
+</p>
+
 > A local-first file organizer that never phones home.
 
 **tidyup** watches a directory, understands what's in your files using compact embedding models running _entirely on your machine_, and proposes a tidier structure. You review every change before anything moves. Nothing is uploaded. Operational state is recorded only in the local SQLite database so runs can be reviewed and rolled back. No account. No cloud. No telemetry.
