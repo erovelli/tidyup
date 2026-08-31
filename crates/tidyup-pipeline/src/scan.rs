@@ -180,6 +180,7 @@ pub async fn run_scan(
                 .as_ref()
                 .map_or(&[], |context| context.concepts),
             cache: &semantic_cache,
+            identities,
         },
     )
     .await;
@@ -281,6 +282,7 @@ pub async fn run_scan(
     for path in &loose_files {
         match classify_file(
             path,
+            identities,
             candidates,
             embeddings,
             multimodal,
@@ -361,6 +363,7 @@ struct ClassifiedFile {
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn classify_file(
     path: &Path,
+    identities: &crate::indexing::SourceIdentities,
     candidates: &[ScanCandidate],
     embeddings: &dyn EmbeddingBackend,
     multimodal: &MultimodalContext<'_>,
@@ -376,7 +379,7 @@ async fn classify_file(
         .to_string();
 
     // Extract early so content can contribute semantic evidence.
-    let mime = tidyup_extract::mime::detect(path).await;
+    let mime = identities.mime_type_or_detect(path).await;
     let extracted = semantic_cache
         .extract(path, mime.as_deref(), extractors)
         .await;
@@ -936,6 +939,7 @@ async fn build_content_bundle_proposal(
     for member in &bundle.members {
         let classified = classify_file(
             member,
+            identities,
             candidates,
             embeddings,
             multimodal,

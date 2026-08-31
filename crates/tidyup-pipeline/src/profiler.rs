@@ -46,6 +46,7 @@ use tidyup_domain::migration::{
     ScanDiff, TargetScan,
 };
 
+use crate::indexing::SourceIdentities;
 use crate::semantic::SemanticRunCache;
 
 /// Optional extra signals for profile building, beyond the always-present
@@ -74,6 +75,9 @@ pub struct MultimodalProfilers<'a> {
     /// Optional persistent semantic-artifact store. Cache failures degrade to
     /// fresh inference and do not fail profiling.
     pub artifact_store: Option<&'a dyn tidyup_core::storage::FileIndex>,
+    /// MIME types indexed from the target tree before profiling.  Supplying
+    /// these avoids reopening each centroid candidate solely to sniff it.
+    pub identities: Option<&'a SourceIdentities>,
 }
 
 /// Maximum number of files per folder sampled to build a content centroid.
@@ -599,9 +603,14 @@ pub async fn build_profile_cache_multimodal(
         let (image_centroid, image_centroid_sample_count) = match multimodal.image {
             Some(backend) => {
                 let cache = &semantic_cache;
-                modality_centroid(&path, "image/", |candidate, mime| async move {
-                    cache.image_embedding(&candidate, &mime, backend).await
-                })
+                modality_centroid(
+                    &path,
+                    "image/",
+                    multimodal.identities,
+                    |candidate, mime| async move {
+                        cache.image_embedding(&candidate, &mime, backend).await
+                    },
+                )
                 .await
             }
             None => (None, 0),
@@ -609,9 +618,14 @@ pub async fn build_profile_cache_multimodal(
         let (audio_centroid, audio_centroid_sample_count) = match multimodal.audio {
             Some(backend) => {
                 let cache = &semantic_cache;
-                modality_centroid(&path, "audio/", |candidate, mime| async move {
-                    cache.audio_embedding(&candidate, &mime, backend).await
-                })
+                modality_centroid(
+                    &path,
+                    "audio/",
+                    multimodal.identities,
+                    |candidate, mime| async move {
+                        cache.audio_embedding(&candidate, &mime, backend).await
+                    },
+                )
                 .await
             }
             None => (None, 0),
@@ -619,7 +633,13 @@ pub async fn build_profile_cache_multimodal(
         let (content_centroid, centroid_sample_count) = if multimodal.extractors.is_empty() {
             (None, 0)
         } else {
-            content_centroid(&path, multimodal.extractors, embeddings).await
+            content_centroid(
+                &path,
+                multimodal.extractors,
+                embeddings,
+                multimodal.identities,
+            )
+            .await
         };
 
         profiles.insert(
@@ -669,6 +689,7 @@ pub async fn build_profile_cache_multimodal(
 async fn modality_centroid<F>(
     dir: &Path,
     mime_prefix: &str,
+    identities: Option<&SourceIdentities>,
     embed: impl Fn(PathBuf, String) -> F,
 ) -> (Option<Vec<f32>>, u32)
 where
@@ -689,7 +710,7 @@ where
         if acc.is_full() {
             break;
         }
-        let Some(mime) = tidyup_extract::mime::detect(path).await else {
+        let Some(mime) = mime_for(identities, path).await else {
             continue;
         };
         if !mime.starts_with(mime_prefix) {
@@ -771,6 +792,7 @@ async fn content_centroid(
     dir: &Path,
     extractors: &[Arc<dyn ContentExtractor>],
     embeddings: &dyn EmbeddingBackend,
+    identities: Option<&SourceIdentities>,
 ) -> (Option<Vec<f32>>, u32) {
     let mut candidates: Vec<PathBuf> = match fs::read_dir(dir) {
         Ok(rd) => rd
@@ -787,7 +809,7 @@ async fn content_centroid(
         if acc.is_full() {
             break;
         }
-        let mime = tidyup_extract::mime::detect(path).await;
+        let mime = mime_for(identities, path).await;
         let Some(extractor) = tidyup_extract::router::pick(extractors, path, mime.as_deref())
         else {
             continue;
@@ -815,6 +837,15 @@ async fn content_centroid(
         }
     }
     acc.finish()
+}
+
+/// Return the indexed MIME where the caller has one, retaining live detection
+/// for standalone profiler callers and files indexing could not read.
+async fn mime_for(identities: Option<&SourceIdentities>, path: &Path) -> Option<String> {
+    match identities {
+        Some(identities) => identities.mime_type_or_detect(path).await,
+        None => tidyup_extract::mime::detect(path).await,
+    }
 }
 
 /// L2-normalize a vector in place. No-op for a zero vector.
@@ -1211,6 +1242,7 @@ mod tests {
                 audio: None,
                 extractors: &[],
                 artifact_store: None,
+                identities: None,
             },
         )
         .await
@@ -1300,6 +1332,7 @@ mod tests {
                 audio: None,
                 extractors: &extractors,
                 artifact_store: None,
+                identities: None,
             },
         )
         .await

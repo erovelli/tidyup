@@ -73,6 +73,26 @@ impl SourceIdentities {
             |file| Some(file.content_hash.0.clone()),
         )
     }
+
+    /// MIME captured while indexing `path`.
+    ///
+    /// Classification is deliberately allowed to process paths that the
+    /// indexer could not read.  Call [`Self::mime_type_or_detect`] for that
+    /// case: it uses this cached value when available and only opens the file
+    /// again when the path was absent from the index.
+    #[must_use]
+    pub fn mime_type(&self, path: &Path) -> Option<&str> {
+        self.by_path.get(path).map(|file| file.mime_type.as_str())
+    }
+
+    /// Return the indexed MIME type, falling back to one live sniff only for
+    /// paths that could not be indexed.
+    pub async fn mime_type_or_detect(&self, path: &Path) -> Option<String> {
+        match self.mime_type(path) {
+            Some(mime) => Some(mime.to_owned()),
+            None => tidyup_extract::mime::detect(path).await,
+        }
+    }
 }
 
 /// Walk `root`, upsert every readable regular file, and persist a run-scoped
@@ -371,6 +391,27 @@ mod tests {
             identities.content_hash(&path),
             Some(blake3::hash(b"payload").to_hex().to_string()),
             "the hash must come from indexing, not a second read"
+        );
+    }
+
+    /// A second unchanged scan already has its MIME from indexing.  Deleting
+    /// the file after constructing the identities makes a live sniff
+    /// impossible, so this pins that classification consumers use the cached
+    /// value rather than reopening the path.
+    #[tokio::test]
+    async fn source_identities_reuse_indexed_mime_without_resniffing() {
+        let dir = TempDir::new().unwrap();
+        let path = write(dir.path(), "stable.png", b"not really an image");
+        let store = SqliteStore::open_in_memory().unwrap();
+        let (_, summary) = run(&store, dir.path()).await;
+        let identities = SourceIdentities::new(&summary.indexed);
+        let indexed_mime = summary.indexed[0].mime_type.clone();
+
+        fs::remove_file(&path).unwrap();
+        assert_eq!(
+            identities.mime_type_or_detect(&path).await,
+            Some(indexed_mime),
+            "cached MIME must satisfy the next classification pass without a second sniff"
         );
     }
 

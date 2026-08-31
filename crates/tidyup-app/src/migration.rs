@@ -211,11 +211,14 @@ impl MigrationService {
             image_concepts: &image_concepts,
             artifact_store: Some(self.ctx.file_index.as_ref()),
         };
+        let target_identities =
+            tidyup_pipeline::indexing::SourceIdentities::new(&target_indexed.indexed);
         let profilers = MultimodalProfilers {
             image: multimodal.image,
             audio: multimodal.audio,
             extractors: &self.ctx.extractors,
             artifact_store: Some(self.ctx.file_index.as_ref()),
+            identities: Some(&target_identities),
         };
         let profile_cache = profiler::build_profile_cache_multimodal(
             &target_scan,
