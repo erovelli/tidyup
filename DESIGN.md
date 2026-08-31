@@ -46,7 +46,7 @@ We employ a dual-font strategy to balance editorial authority with functional cl
 *   **Display & Headlines (Manrope):** Chosen for its modern, geometric construction. Use `display-lg` and `headline-md` for folder names or "Empty State" messaging to create an authoritative, premium feel.
 *   **Body & Labels (Inter):** The workhorse. Inter provides exceptional legibility at small sizes (`body-sm` or `label-md`) required for file metadata and breadcrumbs.
 
-> **Implementation note (not yet wired):** the build does not bundle these webfonts — `theme.css` names `Manrope`/`Inter` but ships no `@font-face` rule or font assets, so the desktop UI currently falls back to the system sans-serif stack (`-apple-system`, `Segoe UI`, …). The Manrope/Inter pairing is the intended design; self-hosting the two families (to keep the desktop build network-silent) is the step that makes it render.
+> **Implementation note:** both families are self-hosted. Latin-subset variable faces (`wght` 400–700, ~50 KB total) are embedded in the binary from `assets/brand/fonts/` and injected as `data:` URLs at startup, so the pairing renders without the webview ever reaching the network. The system sans stack remains as the fallback in `--font-body` / `--font-display` for the case where a face fails to decode. If you introduce a weight outside 400–700, widen the axis clamp in `assets/brand/fonts/subset.py` to match — a weight outside the axis range gets synthesised by the renderer and looks noticeably worse than a real master.
 
 **Visual Hierarchy Tip:** Use `on_surface_variant` (#5b6061) for secondary metadata (date modified, file size) to ensure the primary filename (`on_surface`) remains the focal point.
 

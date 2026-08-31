@@ -39,6 +39,43 @@ use crate::state::SharedState;
 /// produce the design in `DESIGN.md`.
 const THEME_CSS: &str = include_str!("../assets/theme.css");
 
+/// The two typefaces `DESIGN.md` §3 specifies, embedded from the shared brand
+/// assets. Latin-subset variable faces clamped to the 400–700 weight span
+/// `theme.css` actually uses — see `assets/brand/fonts/README.md`.
+///
+/// `theme.css` has always *named* Manrope and Inter, but the build shipped no
+/// font data, so every surface silently fell back to the system sans stack and
+/// the design system never rendered as designed.
+const INTER_WOFF2: &[u8] = include_bytes!("../../../assets/brand/fonts/Inter-Variable-latin.woff2");
+const MANROPE_WOFF2: &[u8] =
+    include_bytes!("../../../assets/brand/fonts/Manrope-Variable-latin.woff2");
+
+/// Build the `@font-face` block, embedding each face as a `data:` URL.
+///
+/// A `@import` from a font CDN would be one line instead of this, and would
+/// also mean an application whose first README line is "never phones home"
+/// opening a socket to render its own text. The desktop UI is not covered by
+/// the CLI's network-silence invariant, but that is a scoping detail, not
+/// permission. Embedding keeps the promise literal.
+///
+/// `font-weight: 400 700` declares the variable axis range to the renderer, so
+/// the 500/600/700 weights in `theme.css` interpolate real masters instead of
+/// being synthesised.
+fn font_face_css() -> String {
+    use base64::Engine as _;
+
+    let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+    let inter = encode(INTER_WOFF2);
+    let manrope = encode(MANROPE_WOFF2);
+
+    format!(
+        "@font-face{{font-family:'Inter';font-style:normal;font-weight:400 700;\
+         font-display:swap;src:url(data:font/woff2;base64,{inter}) format('woff2');}}\
+         @font-face{{font-family:'Manrope';font-style:normal;font-weight:400 700;\
+         font-display:swap;src:url(data:font/woff2;base64,{manrope}) format('woff2');}}"
+    )
+}
+
 /// The window icon, embedded from the workspace-level brand assets.
 ///
 /// `assets/brand/` is the single source of truth for the mark — `README.md`,
@@ -145,6 +182,10 @@ fn App() -> Element {
     // Wrapped in `use_hook` so it runs exactly once per App lifetime; the
     // cached `SharedState` is cloned on every subsequent render. Inner handles
     // (signals, Arc) stay stable.
+    // Encoded once per App lifetime, not on every render: the two faces are
+    // ~50 KB of woff2 and base64 is not free.
+    let fonts = use_hook(font_face_css);
+
     let state = use_hook(SharedState::new_at_root);
     let mut llm_fallback_active = state.signals.llm_fallback_active;
     use_future(move || async move {
@@ -153,6 +194,8 @@ fn App() -> Element {
     provide_context(state);
 
     rsx! {
+        // Faces before the stylesheet that references them.
+        document::Style { {fonts} }
         document::Style { {THEME_CSS} }
         Router::<Route> {}
     }

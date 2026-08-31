@@ -46,3 +46,8 @@ png2icns icon.icns icon-1024.png        # or `iconutil -c icns` from an .iconset
 
 Keep the filenames stable: `icon-256.png` is referenced by `include_bytes!` and
 the rest by `Dioxus.toml` and `packaging/tidyup.desktop`.
+
+## Fonts
+
+`fonts/` holds the two self-hosted webfaces the desktop UI embeds. See
+`fonts/README.md` for the subsetting command and licence terms.
