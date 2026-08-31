@@ -11,6 +11,12 @@ categories.workspace   = true
 rust-version.workspace = true
 readme      = "README.md"
 description = "Headless CLI for tidyup — on-device AI file organizer."
+# Not yet, rather than never. The install story in README.md is GitHub
+# Releases, the crates.io name `tidyup` is unclaimed, and the project is
+# pre-alpha with uncalibrated thresholds — so a `cargo publish --workspace`
+# must not push it today. Flip this to true as a deliberate release decision
+# once the name is claimed and v0.1 ships.
+publish     = false
 
 [[bin]]
 name = "tidyup"

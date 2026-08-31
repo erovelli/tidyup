@@ -129,7 +129,10 @@ tidyup-cli`. Verify the checksum, extract, and put `tidyup` on your `PATH`. The
 binary has no network code path and cannot download anything itself.
 
 > The desktop UI (`tidyup-desktop`) is built from source for now; signed app
-> bundles are tracked in the roadmap.
+> bundles are tracked in the roadmap. `packaging/` carries the freedesktop
+> entry and install steps that give it a proper launcher on Linux, and
+> `Dioxus.toml` carries the bundle identifier and icon set for `dx bundle` on
+> macOS and Windows.
 
 ---
 
@@ -333,7 +336,7 @@ tidyup is being built in phases. Each phase lands an independently compilable sl
 | 6     | Dioxus desktop UI (dashboard, review, runs, settings) on the same service seam              | [x] Complete   |
 | 7     | Multimodal encoders (SigLIP image / CLAP audio) wired into scan and migration | [x] Complete   |
 | 8     | General semantic spine: dynamic modality folder prototypes, grounded visual naming/clustering, versioned artifact cache, durable run accounting, capability manifests, latency harness | [~] Implemented; instrumentation and calibration remain |
-| 9+    | Video keyframe encoder, text-result dedup, code signing, package-manager distribution, UI app bundles | [ ] Backlog    |
+| 9+    | Video keyframe encoder, text-result dedup, code signing, package-manager distribution, UI app bundles | [~] Bundle metadata + freedesktop entry landed; signing/notarization and package managers remain |
 
 **What currently works:**
 
@@ -368,7 +371,7 @@ tidyup is being built in phases. Each phase lands an independently compilable sl
 - **Incremental semantic indexing.** Image/audio embeddings persist by exact content/model/preprocessing/latent-space key, but text extraction/OCR evidence and final decisions are not yet fanned out by content hash. Target profiles are rebuilt in full on every migration; `ScanDiff` is not wired into incremental invalidation.
 - **Dedicated video semantics.** Video files have no keyframe/audio-content encoder; they use available name/context evidence and otherwise remain low-confidence or unclassified. Decoder selection remains unresolved.
 - **Excel/ODS in the shipped frontend stack.** The extractor implementation and tests exist behind `tidyup-extract/excel`, but CLI/UI context construction does not currently register it.
-- **Signed/package-manager distribution.** Tagged releases publish checksummed default CLI archives, but signing, notarized desktop bundles, Homebrew, and winget remain backlog items.
+- **Signed/package-manager distribution.** Tagged releases publish checksummed default CLI archives, and the desktop UI now carries bundle metadata (`Dioxus.toml`) plus a freedesktop entry (`packaging/`), but signing, notarized desktop bundles, Homebrew, and winget remain backlog items. Every workspace crate is `publish = false`; nothing is on crates.io yet.
 
 The invariants the finished tool will uphold — human-in-the-loop review, reversible moves, bundle atomicity, no-network-by-default, and grounded non-generative renames — are now enforced at the code path, not just the design.
 
