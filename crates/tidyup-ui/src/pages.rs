@@ -209,7 +209,9 @@ pub(crate) fn Review() -> Element {
         };
     }
 
-    let model = build_diff_model(&proposals);
+    let source_root = signals.review_source_root.read().clone();
+    let target_root = signals.review_target_root.read().clone();
+    let model = build_diff_model(&proposals, source_root.as_deref(), target_root.as_deref());
     let applied_count = signals.last_report.read().as_ref().map_or(0, |r| match r {
         LastReport::Scan { report, .. } => report.applied,
         LastReport::Migration { report, .. } => report.applied,
@@ -336,7 +338,11 @@ enum CurrentTreeRow {
     },
 }
 
-fn build_diff_model(proposals: &[ChangeProposal]) -> DiffModel {
+fn build_diff_model(
+    proposals: &[ChangeProposal],
+    explicit_source_root: Option<&Path>,
+    explicit_target_root: Option<&Path>,
+) -> DiffModel {
     let parents: Vec<PathBuf> = proposals
         .iter()
         .map(|p| {
@@ -350,28 +356,35 @@ fn build_diff_model(proposals: &[ChangeProposal]) -> DiffModel {
         .iter()
         .filter_map(|proposal| proposal.original_path.parent().map(Path::to_path_buf))
         .collect();
-    let source_root = common_ancestor(&original_parents);
+    let source_root =
+        explicit_source_root.map_or_else(|| common_ancestor(&original_parents), Path::to_path_buf);
     let proposed_root = common_ancestor(&parents);
     // Scan mode reorganizes in place, so the common source root is the most
     // useful anchor: it keeps the complete destination (`Work/Career`) visible.
     // Migration can target an unrelated hierarchy; in that case retain the
     // proposed common ancestor, backing up one level when every item lands in
     // exactly the same directory so the destination never disappears.
-    let root = if !source_root.as_os_str().is_empty()
-        && parents
-            .iter()
-            .all(|parent| parent.starts_with(&source_root))
-    {
-        source_root.clone()
-    } else if !proposed_root.as_os_str().is_empty()
-        && parents.iter().all(|parent| parent == &proposed_root)
-    {
-        proposed_root
-            .parent()
-            .map_or_else(|| proposed_root.clone(), Path::to_path_buf)
-    } else {
-        proposed_root
-    };
+    let root = explicit_target_root.map_or_else(
+        || {
+            if explicit_source_root.is_some()
+                || (!source_root.as_os_str().is_empty()
+                    && parents
+                        .iter()
+                        .all(|parent| parent.starts_with(&source_root)))
+            {
+                source_root.clone()
+            } else if !proposed_root.as_os_str().is_empty()
+                && parents.iter().all(|parent| parent == &proposed_root)
+            {
+                proposed_root
+                    .parent()
+                    .map_or_else(|| proposed_root.clone(), Path::to_path_buf)
+            } else {
+                proposed_root
+            }
+        },
+        Path::to_path_buf,
+    );
     // Build tree keyed by relative path components.
     let mut tree = TreeBuilder::default();
     for (idx, p) in proposals.iter().enumerate() {
@@ -390,9 +403,14 @@ fn build_diff_model(proposals: &[ChangeProposal]) -> DiffModel {
         tree.insert(&rel, filename, idx);
     }
 
-    let mut left_rows = Vec::new();
+    let root_label = path_display_name(&root);
+    let mut left_rows = vec![TreeRow::Folder {
+        name: root_label,
+        depth: 0,
+        file_count: proposals.len(),
+    }];
     let mut file_row_by_id = HashMap::new();
-    tree.flatten(0, proposals, &mut left_rows, &mut file_row_by_id);
+    tree.flatten(1, proposals, &mut left_rows, &mut file_row_by_id);
 
     let connector_entries: Vec<RightEntry> = proposals
         .iter()
@@ -415,7 +433,7 @@ fn build_diff_model(proposals: &[ChangeProposal]) -> DiffModel {
         .collect();
 
     let (right_rows, current_file_row_by_id) =
-        build_current_tree(proposals, &source_root, &connector_entries);
+        build_current_tree(proposals, &source_root, &connector_entries, &file_row_by_id);
 
     DiffModel {
         left_rows,
@@ -433,6 +451,7 @@ fn build_current_tree(
     proposals: &[ChangeProposal],
     source_root: &Path,
     entries: &[RightEntry],
+    destination_row_by_id: &HashMap<Uuid, usize>,
 ) -> (Vec<CurrentTreeRow>, HashMap<Uuid, usize>) {
     let mut current_tree = TreeBuilder::default();
     for (idx, proposal) in proposals.iter().enumerate() {
@@ -456,18 +475,27 @@ fn build_current_tree(
             );
         current_tree.insert(&rel, filename, idx);
     }
-    let source_root_label = source_root
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map_or_else(|| source_root.display().to_string(), ToString::to_string);
+    let source_root_label = path_display_name(source_root);
     let mut right_rows = vec![CurrentTreeRow::Folder {
         name: source_root_label,
         depth: 0,
         file_count: proposals.len(),
     }];
     let mut current_file_row_by_id = HashMap::new();
-    current_tree.flatten_current(1, entries, &mut right_rows, &mut current_file_row_by_id);
+    current_tree.flatten_current(
+        1,
+        entries,
+        destination_row_by_id,
+        &mut right_rows,
+        &mut current_file_row_by_id,
+    );
     (right_rows, current_file_row_by_id)
+}
+
+fn path_display_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map_or_else(|| path.display().to_string(), ToString::to_string)
 }
 
 fn common_ancestor(paths: &[PathBuf]) -> PathBuf {
@@ -499,6 +527,11 @@ fn common_ancestor(paths: &[PathBuf]) -> PathBuf {
 struct TreeBuilder {
     folders: BTreeMap<String, Self>,
     files: Vec<(String, usize)>, // (filename, proposal index)
+}
+
+enum CurrentChild<'a> {
+    Folder(&'a str, &'a TreeBuilder),
+    File(&'a str, usize),
 }
 
 impl TreeBuilder {
@@ -555,25 +588,93 @@ impl TreeBuilder {
         &self,
         depth: usize,
         entries: &[RightEntry],
+        destination_row_by_id: &HashMap<Uuid, usize>,
         rows: &mut Vec<CurrentTreeRow>,
         file_row_by_id: &mut HashMap<Uuid, usize>,
     ) {
-        for (name, child) in &self.folders {
-            rows.push(CurrentTreeRow::Folder {
-                name: name.clone(),
-                depth,
-                file_count: child.file_count(),
-            });
-            child.flatten_current(depth.saturating_add(1), entries, rows, file_row_by_id);
+        let mut children: Vec<CurrentChild<'_>> = self
+            .folders
+            .iter()
+            .map(|(name, child)| CurrentChild::Folder(name, child))
+            .chain(
+                self.files
+                    .iter()
+                    .map(|(name, idx)| CurrentChild::File(name, *idx)),
+            )
+            .collect();
+        children.sort_by(|a, b| {
+            a.destination_rank(entries, destination_row_by_id)
+                .cmp(&b.destination_rank(entries, destination_row_by_id))
+                .then_with(|| a.name().cmp(b.name()))
+        });
+
+        for child in children {
+            match child {
+                CurrentChild::Folder(name, child) => {
+                    rows.push(CurrentTreeRow::Folder {
+                        name: name.to_string(),
+                        depth,
+                        file_count: child.file_count(),
+                    });
+                    child.flatten_current(
+                        depth.saturating_add(1),
+                        entries,
+                        destination_row_by_id,
+                        rows,
+                        file_row_by_id,
+                    );
+                }
+                CurrentChild::File(_, idx) => {
+                    let Some(entry) = entries.get(idx).cloned() else {
+                        continue;
+                    };
+                    file_row_by_id.insert(entry.proposal_id, rows.len());
+                    rows.push(CurrentTreeRow::File { entry, depth });
+                }
+            }
         }
-        let mut files = self.files.clone();
-        files.sort_by(|a, b| a.0.cmp(&b.0));
-        for (_, idx) in files {
-            let Some(entry) = entries.get(idx).cloned() else {
-                continue;
-            };
-            file_row_by_id.insert(entry.proposal_id, rows.len());
-            rows.push(CurrentTreeRow::File { entry, depth });
+    }
+
+    fn minimum_destination_rank(
+        &self,
+        entries: &[RightEntry],
+        destination_row_by_id: &HashMap<Uuid, usize>,
+    ) -> usize {
+        self.files
+            .iter()
+            .filter_map(|(_, idx)| entries.get(*idx))
+            .filter_map(|entry| destination_row_by_id.get(&entry.proposal_id).copied())
+            .chain(
+                self.folders
+                    .values()
+                    .map(|folder| folder.minimum_destination_rank(entries, destination_row_by_id)),
+            )
+            .min()
+            .unwrap_or(usize::MAX)
+    }
+}
+
+impl CurrentChild<'_> {
+    const fn name(&self) -> &str {
+        match self {
+            Self::Folder(name, _) | Self::File(name, _) => name,
+        }
+    }
+
+    fn destination_rank(
+        &self,
+        entries: &[RightEntry],
+        destination_row_by_id: &HashMap<Uuid, usize>,
+    ) -> usize {
+        match self {
+            Self::Folder(_, folder) => {
+                folder.minimum_destination_rank(entries, destination_row_by_id)
+            }
+            Self::File(_, idx) => entries
+                .get(*idx)
+                .and_then(|entry| destination_row_by_id.get(&entry.proposal_id))
+                .copied()
+                .unwrap_or(usize::MAX),
         }
     }
 }
@@ -1574,7 +1675,13 @@ fn CombinedReview(state: SharedState) -> Element {
             .iter()
             .flat_map(|bundle| bundle.members.iter().cloned()),
     );
-    let model = build_diff_model(&plan_changes);
+    let source_root = signals.review_source_root.read().clone();
+    let target_root = signals.review_target_root.read().clone();
+    let model = build_diff_model(
+        &plan_changes,
+        source_root.as_deref(),
+        target_root.as_deref(),
+    );
     let hovered = use_signal(|| Option::<Uuid>::None);
     let selected = use_signal(|| Option::<Uuid>::None);
 
@@ -2570,6 +2677,10 @@ fn launch_scan(state: &SharedState, source: PathBuf, dry_run: bool) {
     let activation = current_activation(signals);
 
     reset_run_state(signals);
+    let mut review_source_root = signals.review_source_root;
+    review_source_root.set(Some(source.clone()));
+    let mut review_target_root = signals.review_target_root;
+    review_target_root.set(None);
     set_busy(signals, Busy::Scanning);
     // Config and model loading happen below, before any service call and so
     // before any phase event. Without this the banner renders nothing at all
@@ -2639,6 +2750,10 @@ fn launch_migrate(state: &SharedState, source: PathBuf, target: PathBuf, dry_run
     let activation = current_activation(signals);
 
     reset_run_state(signals);
+    let mut review_source_root = signals.review_source_root;
+    review_source_root.set(Some(source.clone()));
+    let mut review_target_root = signals.review_target_root;
+    review_target_root.set(Some(target.clone()));
     set_busy(signals, Busy::Migrating);
     set_phase(signals, tidyup_domain::Phase::Preparing);
 
@@ -2936,14 +3051,17 @@ mod tests {
             move_proposal("Resume_Evan_Rovelli.pdf"),
             move_proposal("Resume_Evan_Rovelli_Audible.pdf"),
         ];
-        let model = build_diff_model(&proposals);
+        let model = build_diff_model(&proposals, Some(Path::new("/Users/example/Desktop")), None);
         assert!(model.left_rows.iter().any(|row| {
-            matches!(row, TreeRow::Folder { name, depth: 0, .. } if name == "Work")
+            matches!(row, TreeRow::Folder { name, depth: 0, .. } if name == "Desktop")
         }));
         assert!(model.left_rows.iter().any(|row| {
-            matches!(row, TreeRow::Folder { name, depth: 1, .. } if name == "Career")
+            matches!(row, TreeRow::Folder { name, depth: 1, .. } if name == "Work")
         }));
-        assert_eq!(count_folders(&model.left_rows), 2);
+        assert!(model.left_rows.iter().any(|row| {
+            matches!(row, TreeRow::Folder { name, depth: 2, .. } if name == "Career")
+        }));
+        assert_eq!(count_folders(&model.left_rows), 3);
     }
 
     #[test]
@@ -2954,7 +3072,11 @@ mod tests {
         nested_file.original_path = PathBuf::from("/Users/example/Desktop/zprint/Back Piece.stl");
         let nested_file_id = nested_file.id;
 
-        let model = build_diff_model(&[root_file, nested_file]);
+        let model = build_diff_model(
+            &[root_file, nested_file],
+            Some(Path::new("/Users/example/Desktop")),
+            None,
+        );
 
         assert!(matches!(
             model.right_rows.first(),
@@ -2988,6 +3110,46 @@ mod tests {
                     if entry.proposal_id == nested_file_id
             )
         }));
+    }
+
+    #[test]
+    fn diff_model_pins_migration_roots_on_both_sides() {
+        let mut proposal = move_proposal("resume.pdf");
+        proposal.original_path = PathBuf::from("/Users/example/Incoming/resume.pdf");
+        proposal.proposed_path = PathBuf::from("/Users/example/Documents/Career/resume.pdf");
+
+        let model = build_diff_model(
+            &[proposal],
+            Some(Path::new("/Users/example/Incoming")),
+            Some(Path::new("/Users/example/Documents")),
+        );
+
+        assert!(matches!(
+            model.left_rows.first(),
+            Some(TreeRow::Folder { name, depth: 0, .. }) if name == "Documents"
+        ));
+        assert!(matches!(
+            model.right_rows.first(),
+            Some(CurrentTreeRow::Folder { name, depth: 0, .. }) if name == "Incoming"
+        ));
+    }
+
+    #[test]
+    fn current_siblings_follow_destination_order_to_avoid_crossings() {
+        let mut first_source_alphabetically = move_proposal("a.txt");
+        first_source_alphabetically.proposed_path = PathBuf::from("/Users/example/Desktop/Z/a.txt");
+        let first_id = first_source_alphabetically.id;
+        let mut last_source_alphabetically = move_proposal("z.txt");
+        last_source_alphabetically.proposed_path = PathBuf::from("/Users/example/Desktop/A/z.txt");
+        let last_id = last_source_alphabetically.id;
+
+        let model = build_diff_model(
+            &[first_source_alphabetically, last_source_alphabetically],
+            Some(Path::new("/Users/example/Desktop")),
+            None,
+        );
+
+        assert!(model.current_file_row_by_id[&last_id] < model.current_file_row_by_id[&first_id]);
     }
 
     #[test]
