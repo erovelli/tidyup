@@ -3,15 +3,14 @@
 Single source of truth for tidyup's visual identity. Both the desktop UI and the
 project README read from here, so there is exactly one copy of the mark.
 
-> **These are placeholders.** Every file in this directory is a stand-in that
-> follows the `DESIGN.md` palette so the wiring can be verified end to end. They
-> are meant to be replaced wholesale, not iterated on.
+The supplied `mark.svg` is the canonical 24px-grid vector source. All platform
+icons are rendered from it; do not edit a raster asset independently.
 
 ## Files
 
 | File | Purpose |
 | ---- | ------- |
-| `mark.svg` | Source of truth. Square mark, 256×256 viewBox. |
+| `mark.svg` | Source of truth. Square mark on a 24px grid. |
 | `logo.svg` | Horizontal lockup (mark + wordmark) for the README header. |
 | `icon-256.png` | **Embedded into the desktop binary** as the window icon (`crates/tidyup-ui/src/main.rs`). |
 | `icon-512.png` | HiDPI window icon; freedesktop `hicolor` install size. |
@@ -23,13 +22,10 @@ project README read from here, so there is exactly one copy of the mark.
 
 1. **Legible at 16px.** It appears in Linux taskbars and Windows title bars at
    that size. Check the 16×16 frame inside `icon.ico` before calling it done.
-2. **Survives dark OS chrome.** macOS ignores `Config::with_icon` entirely and
-   reads the icon from the `.app` bundle, but on Linux and Windows the mark is
-   composited against whatever the user's panel colour is. The current
-   placeholder solves this with a filled `primary` container shape; a mark drawn
-   as bare `primary` strokes on transparency would vanish on a dark panel.
-3. **Sits on `--surface` (`#f9f9f9`) in-app.** That is also the window
-   background colour set at launch, so the two should not fight.
+2. **Survives dark OS chrome.** The warm, opaque rounded tile deliberately
+   preserves contrast when Linux and Windows composite it on a dark panel.
+3. **Preserve the tile and its padding.** They are part of the mark, not a
+   surrounding UI treatment.
 
 ## Regenerating the rasters
 

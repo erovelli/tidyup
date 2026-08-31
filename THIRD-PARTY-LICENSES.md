@@ -45,7 +45,9 @@ by accident:
 
 1. **The licence must ship with the font.** Keeping `OFL-*.txt` next to the
    `.woff2` files satisfies this. Don't prune them as "unused files".
-2. **Reserved Font Names may not be used on modified versions.** Subsetting and
-   axis-clamping are not modifications under the licence's definition, so the
-   original family names are retained. If someone ever edits the glyph outlines
-   or metrics, the family must be renamed at that point.
+2. **The subsets are Modified Versions.** Removing glyphs/axes and converting
+   the upstream fonts to WOFF2 are modifications under OFL-1.1. The vendored
+   Inter and Manrope headers declare no Reserved Font Names, so their family
+   names may be retained. Recheck that fact before updating either upstream
+   font; any Reserved Font Name in a future source must not be used for its
+   modified subset.

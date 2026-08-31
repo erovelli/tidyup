@@ -1,20 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 256" width="880" height="256" role="img" aria-label="tidyup">
-  <!-- PLACEHOLDER LOCKUP — not the final identity. Mark + wordmark for the
-       README header. The wordmark is set in the system sans stack rather than
-       Manrope so this file renders identically on GitHub, which does not load
-       the self-hosted webfont. Replace with outlined text once the real
-       typeface treatment is drawn. -->
-  <rect x="16" y="16" width="224" height="224" rx="56.32" fill="#48664c"/>
-  <g fill="#c8ebca">
-    <rect x="61.44" y="79.04"  width="133.12" height="21.76" rx="10.88"/>
-    <rect x="61.44" y="117.12" width="95.85"  height="21.76" rx="10.88"/>
-    <rect x="61.44" y="155.20" width="58.57"  height="21.76" rx="10.88"/>
-  </g>
-  <text x="296" y="152" fill="#2f3334" font-size="128" font-weight="700"
-        font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"
-        letter-spacing="-4">tidyup</text>
-  <text x="300" y="196" fill="#5b6061" font-size="34" font-weight="500"
-        font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif">
-    a local-first file organizer
-  </text>
+<svg xmlns="http://www.w3.org/2000/svg" width="164" height="24" viewBox="0 0 164 24" role="img" aria-labelledby="title desc">
+  <title id="title">TidyUp</title>
+  <desc id="desc">TidyUp horizontal logo, with the project mark and wordmark.</desc>
+  <image href="mark.svg" x="0" y="0" width="24" height="24"/>
+  <text x="31" y="17.4" fill="#153A29" font-family="Avenir Next, Avenir, Helvetica Neue, Arial, sans-serif" font-size="17" font-weight="700" letter-spacing="-0.55">TidyUp</text>
 </svg>
