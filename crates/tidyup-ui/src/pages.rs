@@ -333,11 +333,21 @@ enum OverviewBundleKind {
 #[derive(Clone)]
 struct OverviewEntry {
     id: Uuid,
-    original_path: PathBuf,
     proposed_path: PathBuf,
     proposed_name: String,
     confidence: f32,
     change_type: ChangeType,
+    bundle_kind: Option<OverviewBundleKind>,
+    file_count: usize,
+    sources: Vec<OverviewSource>,
+}
+
+#[derive(Clone)]
+struct OverviewSource {
+    id: Uuid,
+    original_path: PathBuf,
+    confidence: f32,
+    rename: bool,
     bundle_kind: Option<OverviewBundleKind>,
     file_count: usize,
 }
@@ -345,6 +355,7 @@ struct OverviewEntry {
 #[derive(Clone, PartialEq)]
 struct RightEntry {
     proposal_id: Uuid,
+    original_path: PathBuf,
     display_name: String,
     confidence: f32,
     rename: bool,
@@ -383,7 +394,8 @@ fn build_diff_model(
         .collect();
     let original_parents: Vec<PathBuf> = entries
         .iter()
-        .filter_map(|proposal| proposal.original_path.parent().map(Path::to_path_buf))
+        .flat_map(|entry| entry.sources.iter())
+        .filter_map(|source| source.original_path.parent().map(Path::to_path_buf))
         .collect();
     let source_root =
         explicit_source_root.map_or_else(|| common_ancestor(&original_parents), Path::to_path_buf);
@@ -441,31 +453,10 @@ fn build_diff_model(
     }];
     let mut file_row_by_id = HashMap::new();
     tree.flatten(1, &entries, &mut left_rows, &mut file_row_by_id);
-
-    let connector_entries: Vec<RightEntry> = entries
-        .iter()
-        .map(|p| RightEntry {
-            proposal_id: p.id,
-            display_name: p
-                .original_path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .map_or_else(
-                    || p.original_path.display().to_string(),
-                    ToString::to_string,
-                ),
-            confidence: p.confidence,
-            rename: matches!(
-                p.change_type,
-                ChangeType::Rename | ChangeType::RenameAndMove
-            ),
-            bundle_kind: p.bundle_kind,
-            file_count: p.file_count,
-        })
-        .collect();
+    map_source_rows_to_targets(&entries, &mut file_row_by_id);
+    let connector_entries = build_connector_entries(&entries);
 
     let (right_rows, current_file_row_by_id) = build_current_tree(
-        &entries,
         &source_root,
         &connector_entries,
         &file_row_by_id,
@@ -481,19 +472,55 @@ fn build_diff_model(
     }
 }
 
+fn map_source_rows_to_targets(
+    entries: &[OverviewEntry],
+    destination_row_by_id: &mut HashMap<Uuid, usize>,
+) {
+    for entry in entries {
+        let Some(&target_row) = destination_row_by_id.get(&entry.id) else {
+            continue;
+        };
+        for source in &entry.sources {
+            destination_row_by_id.insert(source.id, target_row);
+        }
+    }
+}
+
+fn build_connector_entries(entries: &[OverviewEntry]) -> Vec<RightEntry> {
+    entries
+        .iter()
+        .flat_map(|entry| entry.sources.iter())
+        .map(|source| RightEntry {
+            proposal_id: source.id,
+            original_path: source.original_path.clone(),
+            display_name: source
+                .original_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map_or_else(
+                    || source.original_path.display().to_string(),
+                    ToString::to_string,
+                ),
+            confidence: source.confidence,
+            rename: source.rename,
+            bundle_kind: source.bundle_kind,
+            file_count: source.file_count,
+        })
+        .collect()
+}
+
 /// Preserve the original source hierarchy instead of flattening every file
 /// into a filename-only list. The explicit root row makes it clear which files
 /// sit directly in the scan root and which live inside containers.
 fn build_current_tree(
-    proposals: &[OverviewEntry],
     source_root: &Path,
     entries: &[RightEntry],
     destination_row_by_id: &HashMap<Uuid, usize>,
     total_file_count: usize,
 ) -> (Vec<CurrentTreeRow>, HashMap<Uuid, usize>) {
     let mut current_tree = TreeBuilder::default();
-    for (idx, proposal) in proposals.iter().enumerate() {
-        let parent = proposal
+    for (idx, entry) in entries.iter().enumerate() {
+        let parent = entry
             .original_path
             .parent()
             .unwrap_or_else(|| Path::new(""));
@@ -503,15 +530,15 @@ fn build_current_tree(
             .components()
             .filter_map(|component| component.as_os_str().to_str().map(ToString::to_string))
             .collect();
-        let filename = proposal
+        let filename = entry
             .original_path
             .file_name()
             .and_then(|name| name.to_str())
             .map_or_else(
-                || proposal.original_path.display().to_string(),
+                || entry.original_path.display().to_string(),
                 ToString::to_string,
             );
-        current_tree.insert(&rel, filename, idx, proposal.file_count);
+        current_tree.insert(&rel, filename, idx, entry.file_count);
     }
     let source_root_label = path_display_name(source_root);
     let mut right_rows = vec![CurrentTreeRow::Folder {
@@ -538,13 +565,23 @@ fn overview_entries(
         .iter()
         .map(|proposal| OverviewEntry {
             id: proposal.id,
-            original_path: proposal.original_path.clone(),
             proposed_path: proposal.proposed_path.clone(),
             proposed_name: proposal.proposed_name.clone(),
             confidence: proposal.confidence,
             change_type: proposal.change_type.clone(),
             bundle_kind: None,
             file_count: 1,
+            sources: vec![OverviewSource {
+                id: proposal.id,
+                original_path: proposal.original_path.clone(),
+                confidence: proposal.confidence,
+                rename: matches!(
+                    proposal.change_type,
+                    ChangeType::Rename | ChangeType::RenameAndMove
+                ),
+                bundle_kind: None,
+                file_count: 1,
+            }],
         })
         .collect::<Vec<_>>();
     entries.extend(bundles.iter().filter_map(collapsed_bundle_entry));
@@ -557,22 +594,17 @@ fn collapsed_bundle_entry(bundle: &BundleProposal) -> Option<OverviewEntry> {
         tidyup_domain::BundleKind::SemanticCollection { label } => label.clone(),
         _ => path_display_name(&bundle.root),
     };
-    let (original_path, proposed_path, bundle_kind) = if bundle.kind.moves_as_file_set() {
+    let (proposed_path, bundle_kind) = if bundle.kind.moves_as_file_set() {
         let proposed_parents = bundle
             .members
             .iter()
             .filter_map(|member| member.proposed_path.parent().map(Path::to_path_buf))
             .collect::<Vec<_>>();
         let proposed_path = common_ancestor(&proposed_parents);
-        (
-            bundle.root.join(&label),
-            proposed_path,
-            OverviewBundleKind::Collection,
-        )
+        (proposed_path, OverviewBundleKind::Collection)
     } else {
         let leaf = bundle.root.file_name()?;
         (
-            bundle.root.clone(),
             bundle.target_parent.join(leaf),
             OverviewBundleKind::Directory,
         )
@@ -584,17 +616,43 @@ fn collapsed_bundle_entry(bundle: &BundleProposal) -> Option<OverviewEntry> {
             .iter()
             .any(|member| member.original_path != member.proposed_path)
     } else {
-        original_path != proposed_path
+        bundle.root != proposed_path
+    };
+    let sources = if bundle.kind.moves_as_file_set() {
+        bundle
+            .members
+            .iter()
+            .map(|member| OverviewSource {
+                id: member.id,
+                original_path: member.original_path.clone(),
+                confidence: member.confidence,
+                rename: matches!(
+                    member.change_type,
+                    ChangeType::Rename | ChangeType::RenameAndMove
+                ),
+                bundle_kind: None,
+                file_count: 1,
+            })
+            .collect()
+    } else {
+        vec![OverviewSource {
+            id: bundle.id,
+            original_path: bundle.root.clone(),
+            confidence: bundle.confidence,
+            rename: false,
+            bundle_kind: Some(OverviewBundleKind::Directory),
+            file_count,
+        }]
     };
     moves.then_some(OverviewEntry {
         id: bundle.id,
-        original_path,
         proposed_path,
         proposed_name: label,
         confidence: bundle.confidence,
         change_type: ChangeType::Move,
         bundle_kind: Some(bundle_kind),
         file_count,
+        sources,
     })
 }
 
@@ -602,6 +660,23 @@ fn overview_file_count(proposals: &[ChangeProposal], bundles: &[BundleProposal])
     bundles.iter().fold(proposals.len(), |count, bundle| {
         count.saturating_add(bundle.members.len())
     })
+}
+
+fn overview_locked_ids(bundles: &[BundleProposal]) -> Vec<Uuid> {
+    bundles
+        .iter()
+        .flat_map(|bundle| {
+            if bundle.kind.moves_as_file_set() {
+                bundle
+                    .members
+                    .iter()
+                    .map(|member| member.id)
+                    .collect::<Vec<_>>()
+            } else {
+                vec![bundle.id]
+            }
+        })
+        .collect()
 }
 
 fn path_display_name(path: &Path) -> String {
@@ -1816,7 +1891,7 @@ fn CombinedReview(state: SharedState) -> Element {
     let total_files = loose_count.saturating_add(collection_files);
     let indexed_count = usize::try_from(*signals.indexed_count.read()).unwrap_or(usize::MAX);
     let approved_n = approvals.values().filter(|v| **v).count();
-    let locked_ids: Vec<Uuid> = bundles.iter().map(|bundle| bundle.id).collect();
+    let locked_ids = overview_locked_ids(&bundles);
     let source_root = signals.review_source_root.read().clone();
     let target_root = signals.review_target_root.read().clone();
     let model = build_diff_model(
@@ -3366,6 +3441,62 @@ mod tests {
                 } if *proposal_id == moved_id
             )
         }));
+    }
+
+    #[test]
+    fn virtual_collections_keep_raw_source_files_visible() {
+        let mut first = move_proposal("first.txt");
+        first.proposed_path = PathBuf::from("/Users/example/Desktop/project/first.txt");
+        let first_id = first.id;
+        let mut second = move_proposal("second.txt");
+        second.proposed_path = PathBuf::from("/Users/example/Desktop/project/second.txt");
+        let second_id = second.id;
+        let bundle = BundleProposal::new(
+            PathBuf::from("/Users/example/Desktop"),
+            tidyup_domain::BundleKind::SemanticCollection {
+                label: "project".to_string(),
+            },
+            PathBuf::from("/Users/example/Desktop"),
+            vec![first, second],
+            0.8,
+            "related loose files".to_string(),
+        )
+        .unwrap();
+        let bundle_id = bundle.id;
+
+        let model = build_diff_model(
+            &[],
+            std::slice::from_ref(&bundle),
+            Some(Path::new("/Users/example/Desktop")),
+            None,
+        );
+
+        assert_eq!(model.connector_entries.len(), 2);
+        assert!(model
+            .connector_entries
+            .iter()
+            .all(|entry| entry.bundle_kind.is_none() && entry.file_count == 1));
+        assert_eq!(
+            model.file_row_by_id[&first_id],
+            model.file_row_by_id[&second_id]
+        );
+        assert_eq!(
+            model.file_row_by_id[&first_id],
+            model.file_row_by_id[&bundle_id]
+        );
+        assert!(model.right_rows.iter().all(|row| {
+            !matches!(
+                row,
+                CurrentTreeRow::File {
+                    entry: RightEntry {
+                        bundle_kind: Some(_),
+                        ..
+                    },
+                    ..
+                }
+            )
+        }));
+        assert_eq!(overview_locked_ids(&[bundle]), vec![first_id, second_id]);
     }
 
     #[test]
