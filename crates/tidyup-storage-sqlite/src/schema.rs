@@ -77,6 +77,7 @@ CREATE TABLE IF NOT EXISTS bundles (
     status         TEXT NOT NULL,
     reasoning      TEXT NOT NULL,
     confidence     REAL NOT NULL,
+    envelope_json  TEXT,
     created_at     TEXT NOT NULL,
     applied_at     TEXT,
     run_id         TEXT REFERENCES runs(id)
@@ -183,5 +184,6 @@ pub(super) fn apply(conn: &mut Connection) -> rusqlite::Result<()> {
         "TEXT NOT NULL DEFAULT '{\"schema_version\":1,\"entries\":[]}'",
     )?;
     add_column_if_missing(&tx, "semantic_artifacts", "embedding_blob", "BLOB")?;
+    add_column_if_missing(&tx, "bundles", "envelope_json", "TEXT")?;
     tx.commit()
 }

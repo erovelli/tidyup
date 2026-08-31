@@ -124,7 +124,7 @@ pub async fn run_migration(
 ) -> Result<MigrationOutcome> {
     let semantic_cache = SemanticRunCache::new(multimodal.artifact_store);
     progress.phase_started(Phase::Clustering, None).await;
-    let tree = scanner::scan(source_root);
+    let tree = scanner::scan_with_policy(source_root, &config.directory_envelopes);
     let clustered = crate::clustering::cluster_loose_semantic(
         &tree.loose_files,
         extractors,
@@ -164,7 +164,16 @@ pub async fn run_migration(
     // Bundles first: they bypass per-file routing, while the aggregate still
     // targets the best-matching leaf folder.
     for bundle in &tree.bundles {
-        match build_bundle_proposal(bundle, identities, profiles, embeddings).await {
+        match build_bundle_proposal(
+            bundle,
+            identities,
+            profiles,
+            embeddings,
+            extractors,
+            config.directory_envelopes.sample_cap,
+        )
+        .await
+        {
             Ok(bp) => outcome.bundles.push(bp),
             Err(e) => {
                 outcome.unclassified.extend(bundle.members.iter().cloned());
@@ -1068,6 +1077,8 @@ async fn build_bundle_proposal(
     identities: &crate::indexing::SourceIdentities,
     profiles: &ProfileCache,
     embeddings: &dyn EmbeddingBackend,
+    extractors: &[Arc<dyn ContentExtractor>],
+    evidence_sample_cap: usize,
 ) -> Result<BundleProposal> {
     let leaf_name = bundle
         .root
@@ -1079,9 +1090,16 @@ async fn build_bundle_proposal(
     let (target_parent, confidence, fallback) = if profiles.last_scan.leaf_folders.is_empty() {
         (profiles.target_root.clone(), 0.0, true)
     } else {
-        let (target, score) = pick_bundle_target(bundle, profiles, embeddings, &leaf_name)
-            .await
-            .ok_or_else(|| anyhow::anyhow!("no semantic destination for bundle {leaf_name}"))?;
+        let (target, score) = pick_bundle_target(
+            bundle,
+            profiles,
+            embeddings,
+            &leaf_name,
+            extractors,
+            evidence_sample_cap,
+        )
+        .await
+        .ok_or_else(|| anyhow::anyhow!("no semantic destination for bundle {leaf_name}"))?;
         (target, score, false)
     };
 
@@ -1105,7 +1123,10 @@ async fn build_bundle_proposal(
             proposed_name: name,
             confidence,
             reasoning: bundle.reasoning.clone(),
-            needs_review: false,
+            needs_review: bundle
+                .envelope
+                .as_ref()
+                .is_some_and(|envelope| envelope.requires_review),
             status: ChangeStatus::Pending,
             created_at: Utc::now(),
             applied_at: None,
@@ -1116,7 +1137,7 @@ async fn build_bundle_proposal(
         });
     }
 
-    Ok(BundleProposal::new(
+    let proposal = BundleProposal::new(
         bundle.root.clone(),
         bundle.kind.clone(),
         target_parent,
@@ -1130,7 +1151,20 @@ async fn build_bundle_proposal(
         } else {
             format!("{}; semantic bundle routing", bundle.reasoning)
         },
-    )?)
+    )?;
+    let mut envelope = bundle.envelope.clone();
+    if fallback {
+        if let Some(metadata) = &mut envelope {
+            metadata.requires_review = true;
+            metadata.evidence.push(
+                "no learned destination exists; target-root fallback requires review".to_string(),
+            );
+        }
+    }
+    match envelope {
+        Some(metadata) => proposal.with_envelope(metadata).map_err(Into::into),
+        None => Ok(proposal),
+    }
 }
 
 async fn pick_bundle_target(
@@ -1138,6 +1172,8 @@ async fn pick_bundle_target(
     profiles: &ProfileCache,
     embeddings: &dyn EmbeddingBackend,
     leaf_name: &str,
+    extractors: &[Arc<dyn ContentExtractor>],
+    evidence_sample_cap: usize,
 ) -> Option<(PathBuf, f32)> {
     // Bundle kind controls atomicity, not placement. Placement is ranked from
     // the kind label, collection name, and member names against the learned
@@ -1149,11 +1185,18 @@ async fn pick_bundle_target(
         .filter_map(|member| member.file_name().and_then(|name| name.to_str()))
         .collect::<Vec<_>>()
         .join(" ");
+    let extracted_evidence = crate::envelopes::aggregate_semantic_evidence(
+        &bundle.members,
+        extractors,
+        evidence_sample_cap,
+    )
+    .await;
     let query = format!(
-        "atomic collection kind {} name {} members {}",
+        "atomic collection kind {} name {} members {} extracted evidence {}",
         bundle.kind.as_str(),
         leaf_name,
-        members
+        members,
+        extracted_evidence
     );
     let query_embedding = embeddings.embed_text(&query).await.ok()?;
     let mut best: Option<(PathBuf, f32)> = None;
@@ -1521,7 +1564,11 @@ mod tests {
         .unwrap();
         assert_eq!(out.bundles.len(), 1);
         let b = &out.bundles[0];
-        assert_eq!(b.kind, BundleKind::RustCrate);
+        assert_eq!(b.kind, BundleKind::DirectoryEnvelope);
+        assert!(b
+            .envelope
+            .as_ref()
+            .is_some_and(|metadata| !metadata.provenance.is_empty()));
         // target_parent is one of the registered leaves.
         assert!(profiles
             .last_scan

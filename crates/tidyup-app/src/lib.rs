@@ -249,6 +249,15 @@ pub fn classifier_config_for(
             min_grounding_confidence: cfg.rename.min_grounding_confidence,
             min_grounding_gap: cfg.rename.min_grounding_gap,
         },
+        directory_envelopes: tidyup_domain::DirectoryEnvelopeConfig {
+            enabled: cfg.directory_envelopes.enabled,
+            cohesive_threshold: cfg.directory_envelopes.cohesive_threshold,
+            container_threshold: cfg.directory_envelopes.container_threshold,
+            sample_cap: cfg.directory_envelopes.sample_cap,
+            min_move_improvement: cfg.directory_envelopes.min_move_improvement,
+            backup_warn_bytes: cfg.directory_envelopes.backup_warn_bytes,
+            backup_hard_limit_bytes: cfg.directory_envelopes.backup_hard_limit_bytes,
+        },
         ..tidyup_domain::ClassifierConfig::default()
     }
 }

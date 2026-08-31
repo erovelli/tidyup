@@ -105,15 +105,9 @@ fn hash_file(path: &Path) -> Result<String> {
 /// (both hashed relative to their own root), so a bundle whose destination was
 /// edited after apply produces a different digest.
 ///
-/// Entry semantics mirror how [`copy_dir_recursive`] materialises a shelf copy:
-/// - Anything that resolves to a file (`Path::is_file`, which **follows
-///   symlinks** — just like the `std::fs::copy` used at shelve time) hashes as
-///   `F:<blake3 of followed content>`. A symlink-to-file at the destination
-///   therefore matches the regular file the shelf stored for it.
-/// - Directories (including symlinks to directories) contribute a `D` token,
-///   so a user-added empty directory changes the digest.
-/// - Anything else (e.g. a broken symlink) contributes an `L` token, so its
-///   appearance or disappearance is also detected.
+/// Entry semantics preserve the exact directory topology: regular files hash
+/// as `F`, directories as `D`, and symlinks as `L:<link target>`. This makes
+/// the shelf an honest rollback image rather than a dereferenced copy.
 fn tree_hash(root: &Path) -> Result<String> {
     let mut entries: Vec<(String, String)> = Vec::new();
     for entry in WalkDir::new(root).min_depth(1).sort_by_file_name() {
@@ -128,12 +122,19 @@ fn tree_hash(root: &Path) -> Result<String> {
             .map(|c| c.as_os_str().to_string_lossy())
             .collect::<Vec<_>>()
             .join("/");
-        let token = if path.is_file() {
+        let token = if entry.file_type().is_file() {
             format!("F:{}", hash_file(path)?)
-        } else if path.is_dir() {
+        } else if entry.file_type().is_dir() {
             "D".to_string()
+        } else if entry.file_type().is_symlink() {
+            format!(
+                "L:{}",
+                std::fs::read_link(path)
+                    .with_context(|| format!("read symlink {}", path.display()))?
+                    .display()
+            )
         } else {
-            "L".to_string()
+            "O".to_string()
         };
         entries.push((rel, token));
     }
@@ -171,6 +172,12 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
         if entry.file_type().is_dir() {
             std::fs::create_dir_all(&target)
                 .with_context(|| format!("mkdir {}", target.display()))?;
+        } else if entry.file_type().is_symlink() {
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("mkdir {}", parent.display()))?;
+            }
+            copy_symlink(entry.path(), &target)?;
         } else {
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)
@@ -182,6 +189,40 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn copy_symlink(source: &Path, target: &Path) -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let link_target =
+        std::fs::read_link(source).with_context(|| format!("read symlink {}", source.display()))?;
+    symlink(&link_target, target)
+        .with_context(|| format!("recreate symlink {}", target.display()))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn copy_symlink(source: &Path, target: &Path) -> Result<()> {
+    use std::os::windows::fs::{symlink_dir, symlink_file};
+
+    let link_target =
+        std::fs::read_link(source).with_context(|| format!("read symlink {}", source.display()))?;
+    let result = if source.is_dir() {
+        symlink_dir(&link_target, target)
+    } else {
+        symlink_file(&link_target, target)
+    };
+    result.with_context(|| format!("recreate symlink {}", target.display()))?;
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn copy_symlink(source: &Path, _target: &Path) -> Result<()> {
+    Err(anyhow!(
+        "cannot safely preserve symlink on this platform: {}",
+        source.display(),
+    ))
 }
 
 fn shelf_dir(backup_root: &Path, shelved_at: DateTime<Utc>, id: Uuid) -> PathBuf {
@@ -836,26 +877,19 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn precheck_ready_for_pristine_bundle_containing_symlink() {
-        // shelve_bundle materialises a symlink-to-file as a regular file
-        // (fs::copy follows links); the destination keeps the symlink after a
-        // same-volume rename. tree_hash follows links the same way fs::copy
-        // does, so a pristine destination must precheck Ready, not
-        // DestinationModified-forever.
+        // The shelf preserves a relative symlink exactly, and a same-volume
+        // rename leaves that self-contained link valid and unchanged.
         let dir = TempDir::new().unwrap();
         let store = store_with_backup_root(&dir);
         let root = dir.path().join("proj");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("real.txt"), b"linked content").unwrap();
-        std::os::unix::fs::symlink(root.join("real.txt"), root.join("link.txt")).unwrap();
+        std::os::unix::fs::symlink("real.txt", root.join("link.txt")).unwrap();
 
         let record = store.shelve_bundle(&root, Uuid::new_v4()).await.unwrap();
-        // Simulate the same-volume rename apply: the destination subtree keeps
-        // the symlink exactly as the source had it.
+        // Simulate the same-volume rename apply.
         let dest = dir.path().join("moved");
         std::fs::rename(&root, &dest).unwrap();
-        // Repair the link target (it pointed into the old root).
-        std::fs::remove_file(dest.join("link.txt")).unwrap();
-        std::os::unix::fs::symlink(dest.join("real.txt"), dest.join("link.txt")).unwrap();
 
         assert_eq!(
             store.precheck_restore(&record, &dest).await.unwrap(),

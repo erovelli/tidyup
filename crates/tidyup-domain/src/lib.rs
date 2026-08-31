@@ -16,16 +16,19 @@ pub mod migration;
 pub mod run;
 
 pub use backup::{BackupRecord, BackupStatus, RestorePrecheck};
-pub use bundle::{BundleError, BundleKind, BundleProposal};
+pub use bundle::{
+    BundleError, BundleKind, BundleProposal, DirectoryBoundary, DirectoryEnvelope,
+    DirectorySnapshot,
+};
 pub use change::{ChangeProposal, ChangeStatus, ChangeType, ParseError};
 pub use file::{
     ContentHash, FileId, FileProcessingRecord, FileProcessingRole, FileProcessingStage,
     FileProcessingState, IndexedFile, SemanticArtifact,
 };
 pub use migration::{
-    Calibration, Candidate, ClassificationResult, ClassifierConfig, DatePattern, FolderMetadata,
-    FolderNode, FolderProfile, OrganizationType, ProfileCache, RenameConfig, ScanDiff,
-    ScoreBreakdown, ScoreWeights, TargetScan, Tier,
+    Calibration, Candidate, ClassificationResult, ClassifierConfig, DatePattern,
+    DirectoryEnvelopeConfig, FolderMetadata, FolderNode, FolderProfile, OrganizationType,
+    ProfileCache, RenameConfig, ScanDiff, ScoreBreakdown, ScoreWeights, TargetScan, Tier,
 };
 pub use run::{
     CapabilityEntry, CapabilityKind, CapabilityManifest, CapabilityStatus, RunMode, RunRecord,

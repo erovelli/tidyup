@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{anyhow, Context};
+use chrono::Utc as ChronoUtc;
 use tidyup_core::frontend::{Level, ProgressItem, ProgressReporter, ReviewHandler};
 use tidyup_core::storage::{BackupStore, ChangeLog};
 use tidyup_core::Result;
@@ -50,6 +51,86 @@ pub struct ApplyReport {
     pub bundles_applied: usize,
     pub bundles_skipped: usize,
     pub bundles_failed: usize,
+}
+
+/// Capacity result used to inform the review surface before backups are made.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EnvelopeCapacityReport {
+    pub warning_count: usize,
+    pub held_count: usize,
+}
+
+/// Mark oversized directory-envelope backups for explicit review.
+///
+/// A zero threshold disables that respective limit. Crossing the warning
+/// threshold only reports the expected backup volume. Crossing the hard
+/// threshold keeps the envelope out of unattended `--yes`; an interactive
+/// reviewer may still approve it after considering available disk space.
+#[must_use]
+pub fn apply_envelope_capacity_limits(
+    bundles: &mut [BundleProposal],
+    warn_bytes: u64,
+    hard_limit_bytes: u64,
+) -> EnvelopeCapacityReport {
+    let mut report = EnvelopeCapacityReport::default();
+    for bundle in bundles {
+        let Some(envelope) = &mut bundle.envelope else {
+            continue;
+        };
+        let bytes = envelope.snapshot.total_bytes;
+        if warn_bytes > 0 && bytes >= warn_bytes {
+            report.warning_count = report.warning_count.saturating_add(1);
+        }
+        if hard_limit_bytes > 0 && bytes >= hard_limit_bytes {
+            report.held_count = report.held_count.saturating_add(1);
+            envelope.requires_review = true;
+            envelope.evidence.push(format!(
+                "estimated backup size {bytes} bytes reaches configured unattended limit {hard_limit_bytes} bytes; explicit approval required",
+            ));
+        }
+    }
+    report
+}
+
+/// Avoid an unsafe overlay when an envelope's final directory already exists.
+///
+/// Directory merges are not a rename and cannot offer the same atomicity as an
+/// envelope move. Instead, select a unique temporal import parent and hold the
+/// redirected proposal for explicit review. This preserves both directory
+/// trees intact and leaves a future user-directed merge as a separate action.
+#[must_use]
+pub fn redirect_conflicting_directory_envelopes(bundles: &mut [BundleProposal]) -> usize {
+    let mut redirected = 0_usize;
+    let period = ChronoUtc::now().format("%Y-%m").to_string();
+    for bundle in bundles {
+        if !matches!(&bundle.kind, BundleKind::DirectoryEnvelope) {
+            continue;
+        }
+        let Some(leaf) = bundle.root.file_name() else {
+            continue;
+        };
+        if !bundle.target_parent.join(leaf).exists() {
+            continue;
+        }
+        let imports = bundle.target_parent.join("Tidyup Imports").join(&period);
+        let mut index = 1_u32;
+        let fallback = loop {
+            let candidate = imports.join(format!("batch-{index}"));
+            if !candidate.join(leaf).exists() {
+                break candidate;
+            }
+            index = index.saturating_add(1);
+        };
+        bundle.target_parent = fallback;
+        if let Some(envelope) = &mut bundle.envelope {
+            envelope.requires_review = true;
+            envelope.evidence.push(
+                "destination directory already exists; redirected to a temporal import parent instead of merging trees".to_string(),
+            );
+        }
+        redirected = redirected.saturating_add(1);
+    }
+    redirected
 }
 
 /// Collection of dependencies the executor needs.
@@ -478,6 +559,14 @@ async fn apply_bundle_atomic(
     if !source.exists() {
         return Err(anyhow!("bundle root missing: {}", source.display()));
     }
+    if target == source || target.starts_with(&source) {
+        return Err(anyhow!(
+            "refusing bundle destination inside its source envelope: {} -> {}",
+            source.display(),
+            target.display(),
+        ));
+    }
+    verify_directory_envelope(bundle)?;
     if dry_run {
         return Ok(());
     }
@@ -497,6 +586,29 @@ async fn apply_bundle_atomic(
     move_path(&source, &target)
         .with_context(|| format!("moving bundle {} -> {}", source.display(), target.display()))?;
 
+    Ok(())
+}
+
+/// Revalidate a directory envelope as a tree, rather than trusting the
+/// per-file proposal list. This protects empty directories, dotfiles, and
+/// symlinks, all of which may have no corresponding regular-file member.
+fn verify_directory_envelope(bundle: &BundleProposal) -> Result<()> {
+    let Some(envelope) = &bundle.envelope else {
+        return Ok(());
+    };
+    if !bundle.root.is_dir() {
+        return Err(anyhow!(
+            "directory envelope root is no longer a directory: {}",
+            bundle.root.display(),
+        ));
+    }
+    let actual = tidyup_pipeline::envelopes::snapshot_directory(&bundle.root);
+    if actual != envelope.snapshot {
+        return Err(anyhow!(
+            "directory envelope changed since it was reviewed: {} — re-scan before applying",
+            bundle.root.display(),
+        ));
+    }
     Ok(())
 }
 
@@ -687,6 +799,12 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> anyhow::Result<()> {
         if entry.file_type().is_dir() {
             std::fs::create_dir_all(&target)
                 .with_context(|| format!("mkdir {}", target.display()))?;
+        } else if entry.file_type().is_symlink() {
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("mkdir {}", parent.display()))?;
+            }
+            copy_symlink(entry.path(), &target)?;
         } else {
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)
@@ -698,6 +816,44 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn copy_symlink(source: &Path, target: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let link_target =
+        std::fs::read_link(source).with_context(|| format!("read symlink {}", source.display()))?;
+    symlink(&link_target, target).with_context(|| {
+        format!(
+            "recreate symlink {} -> {}",
+            target.display(),
+            link_target.display()
+        )
+    })
+}
+
+#[cfg(windows)]
+fn copy_symlink(source: &Path, target: &Path) -> anyhow::Result<()> {
+    use std::os::windows::fs::{symlink_dir, symlink_file};
+
+    let link_target =
+        std::fs::read_link(source).with_context(|| format!("read symlink {}", source.display()))?;
+    let target_is_dir = source.is_dir();
+    let result = if target_is_dir {
+        symlink_dir(&link_target, target)
+    } else {
+        symlink_file(&link_target, target)
+    };
+    result.with_context(|| format!("recreate symlink {}", target.display()))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn copy_symlink(source: &Path, _target: &Path) -> anyhow::Result<()> {
+    Err(anyhow!(
+        "cannot safely preserve symlink on this platform: {}",
+        source.display(),
+    ))
 }
 
 /// Verify that every file in `src` has an identical BLAKE3 hash at the same
@@ -718,6 +874,17 @@ fn verify_tree(src: &Path, dst: &Path) -> anyhow::Result<()> {
     for entry in WalkDir::new(src).min_depth(1) {
         let entry = entry.with_context(|| format!("walking {}", src.display()))?;
         if !entry.file_type().is_file() {
+            if entry.file_type().is_symlink() {
+                let relative = entry.path().strip_prefix(src).context("strip_prefix")?;
+                let copied = dst.join(relative);
+                let source_target = std::fs::read_link(entry.path())
+                    .with_context(|| format!("read symlink {}", entry.path().display()))?;
+                let copied_target = std::fs::read_link(&copied)
+                    .with_context(|| format!("read symlink {}", copied.display()))?;
+                if source_target != copied_target {
+                    return Err(anyhow!("symlink mismatch after copy: {}", copied.display()));
+                }
+            }
             continue;
         }
         let relative = entry.path().strip_prefix(src).context("strip_prefix")?;
@@ -871,10 +1038,10 @@ fn indexed_stub(source: &Path, file_id: Option<FileId>) -> anyhow::Result<Indexe
 
 /// Threshold-only bundle selection used on the `--yes` path.
 ///
-/// - `auto_approve_all = true` (i.e. `--yes`): approve recognized opaque
-///   structural bundles with confidence ≥ `min_confidence`; skip soft/file-set
-///   collections and the rest. This precision-first policy remains until
-///   action-specific calibration establishes a safe collection threshold.
+/// - `auto_approve_all = true` (i.e. `--yes`): approve complete, cohesive
+///   structural bundles (including hierarchy-selected directory envelopes)
+///   with confidence ≥ `min_confidence`; skip soft/file-set collections and
+///   uncertain envelopes.
 /// - `auto_approve_all = false`: approve nothing. Callers that want interactive
 ///   per-bundle review go through [`select_bundle_decisions`] instead.
 ///
@@ -884,7 +1051,7 @@ fn indexed_stub(source: &Path, file_id: Option<FileId>) -> anyhow::Result<Indexe
 /// require interactive review and are excluded from this path. Soft/file-set
 /// collections are held because their raw semantic confidence is not calibrated
 /// for unattended application. The legacy `Generic` kind is also held if read
-/// from persisted data; current scans do not create generic directory envelopes.
+/// from persisted data.
 #[must_use]
 pub fn select_auto_applied_bundles(
     bundles: &[BundleProposal],
@@ -899,6 +1066,7 @@ pub fn select_auto_applied_bundles(
         .filter(|b| {
             !b.kind.moves_as_file_set()
                 && !matches!(&b.kind, BundleKind::Generic)
+                && !b.requires_explicit_review()
                 && b.confidence >= min_confidence
                 && !b.members.iter().any(|member| {
                     matches!(
@@ -1072,7 +1240,7 @@ mod tests {
     use tempfile::TempDir;
     use tidyup_core::frontend::Level;
     use tidyup_core::Result as CoreResult;
-    use tidyup_domain::ChangeStatus;
+    use tidyup_domain::{ChangeStatus, DirectoryBoundary, DirectoryEnvelope, DirectorySnapshot};
 
     #[test]
     fn copy_verify_delete_relocates_file_and_removes_original() {
@@ -1092,6 +1260,36 @@ mod tests {
     }
 
     #[test]
+    fn directory_envelope_snapshot_detects_hidden_and_empty_tree_changes() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("world");
+        std::fs::create_dir_all(root.join("region/empty")).unwrap();
+        std::fs::write(root.join(".level-lock"), b"before").unwrap();
+        let snapshot = tidyup_pipeline::envelopes::snapshot_directory(&root);
+        let bundle = BundleProposal::new(
+            root.clone(),
+            BundleKind::DirectoryEnvelope,
+            dir.path().join("games"),
+            vec![],
+            0.9,
+            "directory envelope".to_string(),
+        )
+        .unwrap()
+        .with_envelope(DirectoryEnvelope {
+            boundary: DirectoryBoundary::Cohesive,
+            cohesion: 0.9,
+            snapshot,
+            evidence: Vec::new(),
+            provenance: Vec::new(),
+            requires_review: false,
+        })
+        .unwrap();
+        assert!(verify_directory_envelope(&bundle).is_ok());
+        std::fs::write(root.join("region/added.dat"), b"changed").unwrap();
+        assert!(verify_directory_envelope(&bundle).is_err());
+    }
+
+    #[test]
     fn copy_verify_delete_relocates_subtree() {
         let dir = TempDir::new().unwrap();
         let src = dir.path().join("bundle");
@@ -1108,6 +1306,27 @@ mod tests {
             std::fs::read(dst.join("two.txt")).unwrap().len(),
             130 * 1024
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_verify_delete_preserves_symlinks_in_directory_envelopes() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("world");
+        std::fs::create_dir_all(src.join("region")).unwrap();
+        std::fs::write(src.join("region/level.dat"), b"world").unwrap();
+        symlink("region/level.dat", src.join("level-link")).unwrap();
+        let dst = dir.path().join("target/world");
+
+        copy_verify_delete(&src, &dst).unwrap();
+
+        assert_eq!(
+            std::fs::read_link(dst.join("level-link")).unwrap(),
+            PathBuf::from("region/level.dat")
+        );
+        assert!(!src.exists());
     }
 
     #[test]
@@ -1564,6 +1783,122 @@ mod tests {
     }
 
     #[test]
+    fn cohesive_directory_envelope_is_eligible_for_yes_but_uncertain_is_held() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("minecraft-world");
+        std::fs::create_dir_all(&root).unwrap();
+        let snapshot = tidyup_pipeline::envelopes::snapshot_directory(&root);
+        let cohesive = BundleProposal::new(
+            root,
+            BundleKind::DirectoryEnvelope,
+            dir.path().join("games"),
+            vec![],
+            0.9,
+            "cohesive envelope".to_string(),
+        )
+        .unwrap()
+        .with_envelope(DirectoryEnvelope {
+            boundary: DirectoryBoundary::Cohesive,
+            cohesion: 0.9,
+            snapshot: snapshot.clone(),
+            evidence: Vec::new(),
+            provenance: Vec::new(),
+            requires_review: false,
+        })
+        .unwrap();
+        let uncertain = BundleProposal::new(
+            dir.path().join("misc"),
+            BundleKind::DirectoryEnvelope,
+            dir.path().join("target"),
+            vec![],
+            0.9,
+            "uncertain envelope".to_string(),
+        )
+        .unwrap()
+        .with_envelope(DirectoryEnvelope {
+            boundary: DirectoryBoundary::Uncertain,
+            cohesion: 0.3,
+            snapshot,
+            evidence: Vec::new(),
+            provenance: Vec::new(),
+            requires_review: true,
+        })
+        .unwrap();
+
+        assert_eq!(
+            select_auto_applied_bundles(&[cohesive, uncertain], true, 0.5).len(),
+            1,
+        );
+    }
+
+    #[test]
+    fn oversized_envelope_is_held_from_yes_but_remains_reviewable() {
+        let mut bundle = sample_bundle(0.9);
+        bundle.kind = BundleKind::DirectoryEnvelope;
+        bundle.envelope = Some(DirectoryEnvelope {
+            boundary: DirectoryBoundary::Cohesive,
+            cohesion: 0.9,
+            snapshot: DirectorySnapshot {
+                digest: "snapshot".to_string(),
+                regular_files: 1,
+                directories: 0,
+                symlinks: 0,
+                total_bytes: 200,
+                complete: true,
+            },
+            evidence: Vec::new(),
+            provenance: Vec::new(),
+            requires_review: false,
+        });
+
+        let report = apply_envelope_capacity_limits(std::slice::from_mut(&mut bundle), 100, 150);
+
+        assert_eq!(report.warning_count, 1);
+        assert_eq!(report.held_count, 1);
+        assert!(bundle.requires_explicit_review());
+        assert!(select_auto_applied_bundles(&[bundle], true, 0.5).is_empty());
+    }
+
+    #[test]
+    fn existing_envelope_destination_redirects_to_temporal_import_parent() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("source/world");
+        std::fs::create_dir_all(&source).unwrap();
+        let target_parent = dir.path().join("Games");
+        std::fs::create_dir_all(target_parent.join("world")).unwrap();
+        let snapshot = tidyup_pipeline::envelopes::snapshot_directory(&source);
+        let mut bundle = BundleProposal::new(
+            source,
+            BundleKind::DirectoryEnvelope,
+            target_parent.clone(),
+            vec![],
+            0.9,
+            "envelope".to_string(),
+        )
+        .unwrap()
+        .with_envelope(DirectoryEnvelope {
+            boundary: DirectoryBoundary::Cohesive,
+            cohesion: 0.9,
+            snapshot,
+            evidence: Vec::new(),
+            provenance: Vec::new(),
+            requires_review: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            redirect_conflicting_directory_envelopes(std::slice::from_mut(&mut bundle)),
+            1,
+        );
+        assert_ne!(bundle.target_parent, target_parent);
+        assert!(bundle
+            .target_parent
+            .components()
+            .any(|part| part.as_os_str() == "Tidyup Imports"));
+        assert!(bundle.requires_explicit_review());
+    }
+
+    #[test]
     fn select_auto_applied_bundles_holds_member_renames() {
         let mut renamed = sample_bundle(0.95);
         let mut member = sample_proposal(
@@ -1590,6 +1925,7 @@ mod tests {
             status: ChangeStatus::Pending,
             created_at: chrono::Utc::now(),
             applied_at: None,
+            envelope: None,
         }
     }
 

@@ -164,7 +164,7 @@ pub async fn run_scan(
 ) -> Result<ScanOutcome> {
     let semantic_cache = SemanticRunCache::new(multimodal.artifact_store);
     progress.phase_started(Phase::Clustering, None).await;
-    let tree = scanner::scan(source_root);
+    let tree = scanner::scan_with_policy(source_root, &config.directory_envelopes);
     // Content clustering: group loose siblings into photo bursts / music albums
     // / document series. Runs after the structural scanner; these move as
     // file-sets (each member individually, atomically) — see
@@ -211,7 +211,17 @@ pub async fn run_scan(
 
     // Structural bundles preserve their internal layout and names.
     for bundle in &tree.bundles {
-        match build_bundle_proposal(bundle, identities, output_root, candidates, embeddings).await {
+        match build_bundle_proposal(
+            bundle,
+            identities,
+            output_root,
+            candidates,
+            embeddings,
+            extractors,
+            config.directory_envelopes.sample_cap,
+        )
+        .await
+        {
             Ok(bp) => outcome.bundles.push(bp),
             Err(e) => {
                 outcome.unclassified.extend(bundle.members.iter().cloned());
@@ -826,6 +836,8 @@ async fn build_bundle_proposal(
     output_root: &Path,
     candidates: &[ScanCandidate],
     embeddings: &dyn EmbeddingBackend,
+    extractors: &[Arc<dyn ContentExtractor>],
+    evidence_sample_cap: usize,
 ) -> Result<BundleProposal> {
     let leaf = bundle
         .root
@@ -839,11 +851,18 @@ async fn build_bundle_proposal(
         .filter_map(|member| member.file_name().and_then(|name| name.to_str()))
         .collect::<Vec<_>>()
         .join(" ");
+    let extracted_evidence = crate::envelopes::aggregate_semantic_evidence(
+        &bundle.members,
+        extractors,
+        evidence_sample_cap,
+    )
+    .await;
     let query = format!(
-        "atomic collection kind {} name {} members {}",
+        "atomic collection kind {} name {} members {} extracted evidence {}",
         bundle.kind.as_str(),
         normalize_semantic_text(leaf),
-        normalize_semantic_text(&member_names)
+        normalize_semantic_text(&member_names),
+        normalize_semantic_text(&extracted_evidence),
     );
     let embedding = embeddings.embed_text(&query).await?;
     let (candidate_index, confidence, _) = best_match(&embedding, candidates);
@@ -889,7 +908,10 @@ async fn build_bundle_proposal(
             proposed_name: name,
             confidence,
             reasoning: bundle.reasoning.clone(),
-            needs_review: false,
+            needs_review: bundle
+                .envelope
+                .as_ref()
+                .is_some_and(|envelope| envelope.requires_review),
             status: ChangeStatus::Pending,
             created_at: Utc::now(),
             applied_at: None,
@@ -900,14 +922,18 @@ async fn build_bundle_proposal(
         });
     }
 
-    Ok(BundleProposal::new(
+    let proposal = BundleProposal::new(
         bundle.root.clone(),
         bundle.kind.clone(),
         target_parent,
         members,
         confidence,
         format!("{}; semantic bundle routing", bundle.reasoning),
-    )?)
+    )?;
+    match &bundle.envelope {
+        Some(envelope) => proposal.with_envelope(envelope.clone()).map_err(Into::into),
+        None => Ok(proposal),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1515,7 +1541,11 @@ mod tests {
         .unwrap();
         assert_eq!(out.bundles.len(), 1);
         let bundle = &out.bundles[0];
-        assert_eq!(bundle.kind, BundleKind::RustCrate);
+        assert_eq!(bundle.kind, BundleKind::DirectoryEnvelope);
+        assert!(bundle
+            .envelope
+            .as_ref()
+            .is_some_and(|metadata| !metadata.provenance.is_empty()));
         assert_eq!(bundle.members.len(), 2);
         assert!(bundle.members.iter().any(|member| {
             member.original_path.ends_with("myproj/src/main.rs")
