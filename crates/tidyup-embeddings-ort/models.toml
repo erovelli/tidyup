@@ -1,0 +1,107 @@
+schema_version = 1
+
+# Runtime and installer model metadata lives here so model revisions can be
+# audited and updated without editing Rust source. Remote artifacts are pinned
+# to immutable Hugging Face revisions; the release binaries remain network-silent.
+
+[[bundle]]
+key = "text"
+name = "bge-small-en-v1.5"
+cache_dir = "bge-small-en-v1.5"
+model_id = "BAAI/bge-small-en-v1.5"
+dimensions = 384
+max_sequence_length = 512
+pad_token_id = 0
+pad_token = "[PAD]"
+pad_to_max_length = false
+source = "https://huggingface.co/BAAI/bge-small-en-v1.5"
+revision = "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a"
+precision = "fp32"
+
+[[bundle.artifact]]
+role = "model"
+filename = "model.onnx"
+url = "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/5c38ec7c405ec4b44b94cc5a9bb96e735b38267a/onnx/model.onnx"
+size_bytes = 133093490
+blake3 = "a85e4bee6a35baf214890310353795aa2bd220484d6237db953e841d7b10cb20"
+
+[[bundle.artifact]]
+role = "tokenizer"
+filename = "tokenizer.json"
+url = "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/5c38ec7c405ec4b44b94cc5a9bb96e735b38267a/tokenizer.json"
+size_bytes = 711396
+blake3 = "6e933bf59db40b8b2a0de480fe5006662770757e1e1671eb7e48ff6a5f00b0b4"
+
+[[bundle]]
+key = "siglip"
+name = "siglip-base-patch16-224-int8"
+cache_dir = "siglip-base-patch16-224"
+model_id = "google/siglip-base-patch16-224"
+dimensions = 768
+max_sequence_length = 64
+image_size = 224
+pad_token_id = 1
+pad_token = "</s>"
+pad_to_max_length = true
+source = "https://huggingface.co/Xenova/siglip-base-patch16-224"
+revision = "4649052661e53c7000355844105f8a1792088239"
+precision = "int8"
+
+# INT8 split towers retain the reference model's ranking quality while cutting
+# the installed footprint to ~205 MB. Local cross-modal quality and latency
+# validation is required before a manifest update is accepted.
+[[bundle.artifact]]
+role = "vision"
+filename = "vision_model.onnx"
+url = "https://huggingface.co/Xenova/siglip-base-patch16-224/resolve/4649052661e53c7000355844105f8a1792088239/onnx/vision_model_int8.onnx"
+size_bytes = 94098316
+blake3 = "92d83f04dd971f909c89d83ebf4e2b7d52b376bce751735d09269772f31c2d9d"
+
+[[bundle.artifact]]
+role = "text"
+filename = "text_model.onnx"
+url = "https://huggingface.co/Xenova/siglip-base-patch16-224/resolve/4649052661e53c7000355844105f8a1792088239/onnx/text_model_int8.onnx"
+size_bytes = 110982746
+blake3 = "badc41c440c1ca1590be668951b4dfa482c84eb436b04ddfe7b265ba3ef4e43e"
+
+[[bundle.artifact]]
+role = "tokenizer"
+filename = "tokenizer.json"
+url = "https://huggingface.co/Xenova/siglip-base-patch16-224/resolve/4649052661e53c7000355844105f8a1792088239/tokenizer.json"
+size_bytes = 2398744
+blake3 = "cf171f3552992f467891b9d59be5bde1256ffe1344c62030d4bf0f87df583906"
+
+[[bundle]]
+key = "clap"
+name = "clap-htsat-unfused"
+cache_dir = "clap-htsat-unfused"
+model_id = "laion/clap-htsat-unfused"
+dimensions = 512
+max_sequence_length = 77
+pad_token_id = 0
+pad_token = "<|endoftext|>"
+pad_to_max_length = false
+source = "https://huggingface.co/Xenova/clap-htsat-unfused"
+revision = "9dcb1c1c44eaadc06be08ed5618fcf765671ccdf"
+precision = "fp32"
+
+[[bundle.artifact]]
+role = "audio"
+filename = "audio_model.onnx"
+url = "https://huggingface.co/Xenova/clap-htsat-unfused/resolve/9dcb1c1c44eaadc06be08ed5618fcf765671ccdf/onnx/audio_model.onnx"
+size_bytes = 0
+blake3 = ""
+
+[[bundle.artifact]]
+role = "text"
+filename = "text_model.onnx"
+url = "https://huggingface.co/Xenova/clap-htsat-unfused/resolve/9dcb1c1c44eaadc06be08ed5618fcf765671ccdf/onnx/text_model.onnx"
+size_bytes = 0
+blake3 = ""
+
+[[bundle.artifact]]
+role = "tokenizer"
+filename = "tokenizer.json"
+url = "https://huggingface.co/Xenova/clap-htsat-unfused/resolve/9dcb1c1c44eaadc06be08ed5618fcf765671ccdf/tokenizer.json"
+size_bytes = 0
+blake3 = ""

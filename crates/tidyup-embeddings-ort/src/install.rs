@@ -12,22 +12,36 @@
 //! download over HTTP is feature-gated and lives outside this module — the
 //! default build never links an HTTP client.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
+use serde::Deserialize;
+
+const MODEL_MANIFEST_SOURCE: &str = include_str!("../models.toml");
+
+/// Stable manifest keys used by runtime and installer callers.
+pub const DEFAULT_BUNDLE_KEY: &str = "text";
+pub const SIGLIP_BUNDLE_KEY: &str = "siglip";
+pub const CLAP_BUNDLE_KEY: &str = "clap";
 
 /// Metadata for one model artifact that tidyup needs on disk.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArtifactSpec {
+    /// Semantic role within the bundle (`model`, `vision`, `text`, ...).
+    pub role: String,
     /// File basename written under the model directory.
-    pub filename: &'static str,
+    pub filename: String,
     /// HTTPS download URL (used only by opt-in installer tooling).
-    pub url: &'static str,
+    pub url: String,
     /// Expected file size in bytes — cheap sanity check before hashing.
     pub size_bytes: u64,
     /// BLAKE3 hex digest of the expected file contents. Computed at packaging
     /// time; regenerate on model version bump.
-    pub blake3_hex: &'static str,
+    #[serde(rename = "blake3")]
+    pub blake3_hex: String,
 }
 
 /// A named bundle of model artifacts that install + verify operate on as a unit.
@@ -36,58 +50,107 @@ pub struct ArtifactSpec {
 /// and what they should hash to — shared by the runtime verifier and the
 /// `cargo xtask download-models` / `verify-models` tooling so the two cannot
 /// drift.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BundleSpec {
+    /// Stable internal lookup key.
+    pub key: String,
     /// Human-readable bundle name, for logs and instructions.
-    pub name: &'static str,
+    pub name: String,
     /// Subdirectory under the model cache that holds the bundle's files.
-    pub dir: &'static str,
+    #[serde(rename = "cache_dir")]
+    pub dir: String,
     /// The artifacts that make up the bundle.
-    pub artifacts: &'static [ArtifactSpec],
+    #[serde(rename = "artifact")]
+    pub artifacts: Vec<ArtifactSpec>,
+    /// Upstream model identity represented by the local bundle.
+    pub model_id: String,
+    /// Shared latent dimensionality.
+    pub dimensions: usize,
+    /// Maximum tokenizer sequence length where applicable.
+    pub max_sequence_length: usize,
+    /// Token id used when padding text-tower inputs.
+    pub pad_token_id: u32,
+    /// Token string corresponding to `pad_token_id`.
+    pub pad_token: String,
+    /// Whether inputs must always be padded to `max_sequence_length`.
+    pub pad_to_max_length: bool,
+    /// Required square image side for vision bundles.
+    #[serde(default)]
+    pub image_size: Option<u32>,
+    /// Auditable upstream repository.
+    pub source: String,
+    /// Immutable upstream revision.
+    pub revision: String,
+    /// Stored-weight precision/quantization.
+    pub precision: String,
 }
 
-/// The default embedding model bundle: `bge-small-en-v1.5` ONNX + its
-/// tokenizer.
-///
-/// URLs point at the canonical Hugging Face artifacts. The `size_bytes` /
-/// `blake3_hex` fields are unpinned (`0` / empty) by default; [`verify_artifact`]
-/// skips those checks when unset, so unpinned specs never break installs. To
-/// pin: run `cargo xtask download-models`, which prints each file's BLAKE3 + size,
-/// then paste them here — ideally after switching the URL to an immutable
-/// `resolve/<commit-sha>/` revision so the pin stays valid.
-pub const DEFAULT_MODEL_DIR: &str = "bge-small-en-v1.5";
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelManifest {
+    schema_version: u32,
+    #[serde(rename = "bundle")]
+    bundles: Vec<BundleSpec>,
+}
 
-/// ONNX encoder weights.
-pub const DEFAULT_MODEL_ARTIFACT: ArtifactSpec = ArtifactSpec {
-    filename: "model.onnx",
-    url: "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/onnx/model.onnx",
-    size_bytes: 0,
-    blake3_hex: "",
-};
+static MODEL_MANIFEST: OnceLock<std::result::Result<ModelManifest, String>> = OnceLock::new();
 
-/// `WordPiece` tokenizer in `tokenizers`-crate JSON format.
-pub const DEFAULT_TOKENIZER_ARTIFACT: ArtifactSpec = ArtifactSpec {
-    filename: "tokenizer.json",
-    url: "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/tokenizer.json",
-    size_bytes: 0,
-    blake3_hex: "",
-};
+fn manifest() -> Result<&'static ModelManifest> {
+    MODEL_MANIFEST
+        .get_or_init(|| {
+            let parsed: ModelManifest = toml::from_str(MODEL_MANIFEST_SOURCE)
+                .map_err(|error| format!("invalid embedded model manifest: {error}"))?;
+            if parsed.schema_version != 1 {
+                return Err(format!(
+                    "unsupported model manifest schema {}",
+                    parsed.schema_version
+                ));
+            }
+            for bundle in &parsed.bundles {
+                if bundle.revision.len() < 12 || bundle.artifacts.is_empty() {
+                    return Err(format!("incomplete model bundle {}", bundle.key));
+                }
+                for artifact in &bundle.artifacts {
+                    if !artifact
+                        .url
+                        .contains(&format!("/resolve/{}/", bundle.revision))
+                    {
+                        return Err(format!(
+                            "artifact {} in {} is not pinned to revision {}",
+                            artifact.role, bundle.key, bundle.revision
+                        ));
+                    }
+                }
+            }
+            Ok(parsed)
+        })
+        .as_ref()
+        .map_err(|error| anyhow::anyhow!(error.clone()))
+}
 
-/// Every artifact in the default embedding bundle, in install order.
-pub const DEFAULT_ARTIFACTS: &[ArtifactSpec] =
-    &[DEFAULT_MODEL_ARTIFACT, DEFAULT_TOKENIZER_ARTIFACT];
+/// Look up a checked-in model bundle by stable key.
+pub fn model_bundle(key: &str) -> Result<&'static BundleSpec> {
+    manifest()?
+        .bundles
+        .iter()
+        .find(|bundle| bundle.key == key)
+        .ok_or_else(|| anyhow::anyhow!("model manifest has no bundle keyed {key}"))
+}
 
-/// The default embedding bundle (`bge-small-en-v1.5`).
-pub const DEFAULT_BUNDLE: BundleSpec = BundleSpec {
-    name: "bge-small-en-v1.5",
-    dir: DEFAULT_MODEL_DIR,
-    artifacts: DEFAULT_ARTIFACTS,
-};
+impl BundleSpec {
+    /// Find an artifact by its semantic role.
+    #[must_use]
+    pub fn artifact(&self, role: &str) -> Option<&ArtifactSpec> {
+        self.artifacts.iter().find(|artifact| artifact.role == role)
+    }
+}
 
 /// The model subdirectory inside the platform cache.
 #[must_use]
 pub fn default_model_directory() -> Option<PathBuf> {
-    crate::paths::model_cache_dir().map(|d| d.join(DEFAULT_MODEL_DIR))
+    let bundle = model_bundle(DEFAULT_BUNDLE_KEY).ok()?;
+    crate::paths::model_cache_dir().map(|d| d.join(&bundle.dir))
 }
 
 /// Verify one artifact on disk.
@@ -112,8 +175,7 @@ pub fn verify_artifact(path: &Path, spec: &ArtifactSpec) -> Result<()> {
         ));
     }
     if !spec.blake3_hex.is_empty() {
-        let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-        let actual = blake3::hash(&bytes).to_hex().to_string();
+        let (actual, _) = artifact_digest(path)?;
         if actual != spec.blake3_hex {
             return Err(anyhow::anyhow!(
                 "{} checksum mismatch: expected {}, got {}",
@@ -140,9 +202,22 @@ pub fn artifact_digest(path: &Path) -> Result<(String, u64)> {
     let size = std::fs::metadata(path)
         .with_context(|| format!("stat {}", path.display()))?
         .len();
-    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    let hash = blake3::hash(&bytes).to_hex().to_string();
-    Ok((hash, size))
+    let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("read {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        let chunk = buffer
+            .get(..read)
+            .ok_or_else(|| anyhow::anyhow!("invalid read length for {}", path.display()))?;
+        hasher.update(chunk);
+    }
+    Ok((hasher.finalize().to_hex().to_string(), size))
 }
 
 /// Verify every artifact in `bundle` against its on-disk file under the model
@@ -157,9 +232,9 @@ pub fn verify_bundle(bundle: &BundleSpec) -> Result<PathBuf> {
         .ok_or_else(|| {
             anyhow::anyhow!("platform cache directory unavailable; set TIDYUP_MODEL_CACHE")
         })?
-        .join(bundle.dir);
-    for spec in bundle.artifacts {
-        verify_artifact(&dir.join(spec.filename), spec)?;
+        .join(&bundle.dir);
+    for spec in &bundle.artifacts {
+        verify_artifact(&dir.join(&spec.filename), spec)?;
     }
     Ok(dir)
 }
@@ -170,13 +245,23 @@ pub fn verify_bundle(bundle: &BundleSpec) -> Result<PathBuf> {
 /// # Errors
 /// See [`verify_bundle`].
 pub fn verify_default_model() -> Result<PathBuf> {
-    verify_bundle(&DEFAULT_BUNDLE)
+    verify_bundle(model_bundle(DEFAULT_BUNDLE_KEY)?)
 }
 
 /// Human-readable instructions for installing the default model bundle by
 /// hand, for builds of tidyup that don't ship an auto-installer.
 #[must_use]
 pub fn installation_instructions() -> String {
+    let Ok(bundle) = model_bundle(DEFAULT_BUNDLE_KEY) else {
+        return "Invalid embedded model manifest; rebuild tidyup from a valid checkout."
+            .to_string();
+    };
+    let Some(model) = bundle.artifact("model") else {
+        return "Default model manifest is missing its model artifact.".to_string();
+    };
+    let Some(tokenizer) = bundle.artifact("tokenizer") else {
+        return "Default model manifest is missing its tokenizer artifact.".to_string();
+    };
     let dir = default_model_directory().map_or_else(
         || "<platform cache>/tidyup/models/bge-small-en-v1.5/".to_string(),
         |d| format!("{}/", d.display()),
@@ -186,53 +271,10 @@ pub fn installation_instructions() -> String {
          - model.onnx     from {model}\n  \
          - tokenizer.json from {tok}\n\n\
          From a local checkout you can also run `cargo xtask download-models`.",
-        model = DEFAULT_MODEL_ARTIFACT.url,
-        tok = DEFAULT_TOKENIZER_ARTIFACT.url,
+        model = model.url,
+        tok = tokenizer.url,
     )
 }
-
-// ---------------------------------------------------------------------------
-// SigLIP (image / text) — local multimodal image routing and concept grounding.
-// ---------------------------------------------------------------------------
-
-/// Vision tower ONNX. Source: HF `nielsr/siglip-base-patch16-224` ONNX export.
-pub const SIGLIP_VISION_ARTIFACT: ArtifactSpec = ArtifactSpec {
-    filename: "vision_model.onnx",
-    url:
-        "https://huggingface.co/nielsr/siglip-base-patch16-224/resolve/main/onnx/vision_model.onnx",
-    size_bytes: 0,
-    blake3_hex: "",
-};
-
-/// Text tower ONNX (sentencepiece-style, but exported with WordPiece-shaped IO).
-pub const SIGLIP_TEXT_ARTIFACT: ArtifactSpec = ArtifactSpec {
-    filename: "text_model.onnx",
-    url: "https://huggingface.co/nielsr/siglip-base-patch16-224/resolve/main/onnx/text_model.onnx",
-    size_bytes: 0,
-    blake3_hex: "",
-};
-
-/// Tokenizer JSON for the text tower.
-pub const SIGLIP_TOKENIZER_ARTIFACT: ArtifactSpec = ArtifactSpec {
-    filename: "tokenizer.json",
-    url: "https://huggingface.co/nielsr/siglip-base-patch16-224/resolve/main/tokenizer.json",
-    size_bytes: 0,
-    blake3_hex: "",
-};
-
-/// Every artifact in the `SigLIP` image bundle, in install order.
-pub const SIGLIP_ARTIFACTS: &[ArtifactSpec] = &[
-    SIGLIP_VISION_ARTIFACT,
-    SIGLIP_TEXT_ARTIFACT,
-    SIGLIP_TOKENIZER_ARTIFACT,
-];
-
-/// The optional `SigLIP` image bundle.
-pub const SIGLIP_BUNDLE: BundleSpec = BundleSpec {
-    name: "siglip-base-patch16-224",
-    dir: crate::paths::SIGLIP_DIR,
-    artifacts: SIGLIP_ARTIFACTS,
-};
 
 /// Verify the `SigLIP` bundle is present. Returns the bundle directory on
 /// success.
@@ -240,31 +282,30 @@ pub const SIGLIP_BUNDLE: BundleSpec = BundleSpec {
 /// # Errors
 /// Surfaces missing-artifact errors via [`verify_bundle`].
 pub fn verify_siglip_model() -> Result<PathBuf> {
-    verify_bundle(&SIGLIP_BUNDLE)
+    verify_bundle(model_bundle(SIGLIP_BUNDLE_KEY)?)
 }
 
 /// User-facing instructions for installing the `SigLIP` bundle by hand.
 #[must_use]
 pub fn siglip_installation_instructions() -> String {
+    let Ok(bundle) = model_bundle(SIGLIP_BUNDLE_KEY) else {
+        return "Invalid embedded SigLIP model manifest; rebuild tidyup from a valid checkout."
+            .to_string();
+    };
     let dir = crate::paths::model_cache_dir().map_or_else(
-        || {
-            format!(
-                "<platform cache>/tidyup/models/{}/",
-                crate::paths::SIGLIP_DIR
-            )
-        },
-        |d| format!("{}/", d.join(crate::paths::SIGLIP_DIR).display()),
+        || format!("<platform cache>/tidyup/models/{}/", bundle.dir),
+        |d| format!("{}/", d.join(&bundle.dir).display()),
     );
+    let source_lines = bundle
+        .artifacts
+        .iter()
+        .map(|artifact| format!("         - {} from {}", artifact.filename, artifact.url))
+        .collect::<Vec<_>>()
+        .join("\n");
     format!(
         "Missing SigLIP image encoder (Phase 7 multimodal — optional).\n\
-         Place these three files under\n  {dir}\n\n  \
-         - vision_model.onnx from {vision}\n  \
-         - text_model.onnx   from {text}\n  \
-         - tokenizer.json    from {tok}\n\n\
-         From a local checkout you can also run `cargo xtask download-models --siglip`.",
-        vision = SIGLIP_VISION_ARTIFACT.url,
-        text = SIGLIP_TEXT_ARTIFACT.url,
-        tok = SIGLIP_TOKENIZER_ARTIFACT.url,
+         Place these files under\n  {dir}\n\n{source_lines}\n\n\
+         From a local checkout you can also run `cargo xtask download-models --siglip`."
     )
 }
 
@@ -272,69 +313,35 @@ pub fn siglip_installation_instructions() -> String {
 // CLAP (audio / text) — local multimodal audio routing.
 // ---------------------------------------------------------------------------
 
-/// Audio tower ONNX. Source: HF `laion/clap-htsat-unfused` ONNX export.
-pub const CLAP_AUDIO_ARTIFACT: ArtifactSpec = ArtifactSpec {
-    filename: "audio_model.onnx",
-    url: "https://huggingface.co/Xenova/clap-htsat-unfused/resolve/main/onnx/audio_model.onnx",
-    size_bytes: 0,
-    blake3_hex: "",
-};
-
-/// Text tower ONNX.
-pub const CLAP_TEXT_ARTIFACT: ArtifactSpec = ArtifactSpec {
-    filename: "text_model.onnx",
-    url: "https://huggingface.co/Xenova/clap-htsat-unfused/resolve/main/onnx/text_model.onnx",
-    size_bytes: 0,
-    blake3_hex: "",
-};
-
-/// Tokenizer JSON for the text tower.
-pub const CLAP_TOKENIZER_ARTIFACT: ArtifactSpec = ArtifactSpec {
-    filename: "tokenizer.json",
-    url: "https://huggingface.co/Xenova/clap-htsat-unfused/resolve/main/tokenizer.json",
-    size_bytes: 0,
-    blake3_hex: "",
-};
-
-/// Every artifact in the `CLAP` audio bundle, in install order.
-pub const CLAP_ARTIFACTS: &[ArtifactSpec] = &[
-    CLAP_AUDIO_ARTIFACT,
-    CLAP_TEXT_ARTIFACT,
-    CLAP_TOKENIZER_ARTIFACT,
-];
-
-/// The optional `CLAP` audio bundle.
-pub const CLAP_BUNDLE: BundleSpec = BundleSpec {
-    name: "clap-htsat-unfused",
-    dir: crate::paths::CLAP_DIR,
-    artifacts: CLAP_ARTIFACTS,
-};
-
 /// Verify the `CLAP` bundle is present. Returns the bundle directory on success.
 ///
 /// # Errors
 /// Surfaces missing-artifact errors via [`verify_bundle`].
 pub fn verify_clap_model() -> Result<PathBuf> {
-    verify_bundle(&CLAP_BUNDLE)
+    verify_bundle(model_bundle(CLAP_BUNDLE_KEY)?)
 }
 
 /// User-facing instructions for installing the `CLAP` bundle by hand.
 #[must_use]
 pub fn clap_installation_instructions() -> String {
+    let Ok(bundle) = model_bundle(CLAP_BUNDLE_KEY) else {
+        return "Invalid embedded CLAP model manifest; rebuild tidyup from a valid checkout."
+            .to_string();
+    };
     let dir = crate::paths::model_cache_dir().map_or_else(
-        || format!("<platform cache>/tidyup/models/{}/", crate::paths::CLAP_DIR),
-        |d| format!("{}/", d.join(crate::paths::CLAP_DIR).display()),
+        || format!("<platform cache>/tidyup/models/{}/", bundle.dir),
+        |d| format!("{}/", d.join(&bundle.dir).display()),
     );
+    let source_lines = bundle
+        .artifacts
+        .iter()
+        .map(|artifact| format!("         - {} from {}", artifact.filename, artifact.url))
+        .collect::<Vec<_>>()
+        .join("\n");
     format!(
         "Missing CLAP audio encoder (Phase 7 multimodal — optional).\n\
-         Place these three files under\n  {dir}\n\n  \
-         - audio_model.onnx from {audio}\n  \
-         - text_model.onnx  from {text}\n  \
-         - tokenizer.json   from {tok}\n\n\
-         From a local checkout you can also run `cargo xtask download-models --clap`.",
-        audio = CLAP_AUDIO_ARTIFACT.url,
-        text = CLAP_TEXT_ARTIFACT.url,
-        tok = CLAP_TOKENIZER_ARTIFACT.url,
+         Place these files under\n  {dir}\n\n{source_lines}\n\n\
+         From a local checkout you can also run `cargo xtask download-models --clap`."
     )
 }
 
@@ -346,10 +353,11 @@ mod tests {
     #[test]
     fn missing_artifact_errors() {
         let spec = ArtifactSpec {
-            filename: "model.onnx",
-            url: "https://example.com",
+            role: "model".to_string(),
+            filename: "model.onnx".to_string(),
+            url: "https://example.com".to_string(),
             size_bytes: 0,
-            blake3_hex: "",
+            blake3_hex: String::new(),
         };
         let err = verify_artifact(Path::new("/no/such/path"), &spec).unwrap_err();
         assert!(format!("{err}").contains("missing artifact"));
@@ -361,10 +369,11 @@ mod tests {
         let path = dir.path().join("file");
         std::fs::write(&path, b"hello").unwrap();
         let spec = ArtifactSpec {
-            filename: "file",
-            url: "https://example.com",
+            role: "model".to_string(),
+            filename: "file".to_string(),
+            url: "https://example.com".to_string(),
             size_bytes: 42,
-            blake3_hex: "",
+            blake3_hex: String::new(),
         };
         let err = verify_artifact(&path, &spec).unwrap_err();
         assert!(format!("{err}").contains("size mismatch"));
@@ -376,10 +385,12 @@ mod tests {
         let path = dir.path().join("file");
         std::fs::write(&path, b"hello").unwrap();
         let spec = ArtifactSpec {
-            filename: "file",
-            url: "https://example.com",
+            role: "model".to_string(),
+            filename: "file".to_string(),
+            url: "https://example.com".to_string(),
             size_bytes: 0,
-            blake3_hex: "0000000000000000000000000000000000000000000000000000000000000000",
+            blake3_hex: "0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string(),
         };
         let err = verify_artifact(&path, &spec).unwrap_err();
         assert!(format!("{err}").contains("checksum mismatch"));
@@ -391,10 +402,11 @@ mod tests {
         let path = dir.path().join("file");
         std::fs::write(&path, b"hello").unwrap();
         let spec = ArtifactSpec {
-            filename: "file",
-            url: "https://example.com",
+            role: "model".to_string(),
+            filename: "file".to_string(),
+            url: "https://example.com".to_string(),
             size_bytes: 0,
-            blake3_hex: "",
+            blake3_hex: String::new(),
         };
         verify_artifact(&path, &spec).unwrap();
     }
@@ -419,12 +431,13 @@ mod tests {
 
     #[test]
     fn default_bundle_is_consistent() {
-        assert_eq!(DEFAULT_BUNDLE.dir, DEFAULT_MODEL_DIR);
-        assert_eq!(DEFAULT_BUNDLE.artifacts.len(), 2);
-        let names: Vec<_> = DEFAULT_BUNDLE
+        let bundle = model_bundle(DEFAULT_BUNDLE_KEY).unwrap();
+        assert_eq!(bundle.dir, "bge-small-en-v1.5");
+        assert_eq!(bundle.artifacts.len(), 2);
+        let names: Vec<_> = bundle
             .artifacts
             .iter()
-            .map(|a| a.filename)
+            .map(|a| a.filename.as_str())
             .collect();
         assert!(names.contains(&"model.onnx"));
         assert!(names.contains(&"tokenizer.json"));
@@ -432,17 +445,34 @@ mod tests {
 
     #[test]
     fn every_bundle_artifact_is_a_huggingface_url() {
-        assert_eq!(SIGLIP_BUNDLE.artifacts.len(), 3);
-        assert_eq!(CLAP_BUNDLE.artifacts.len(), 3);
-        for bundle in [DEFAULT_BUNDLE, SIGLIP_BUNDLE, CLAP_BUNDLE] {
+        for key in [DEFAULT_BUNDLE_KEY, SIGLIP_BUNDLE_KEY, CLAP_BUNDLE_KEY] {
+            let bundle = model_bundle(key).unwrap();
             assert!(!bundle.dir.is_empty());
-            for spec in bundle.artifacts {
+            assert!(!bundle.artifacts.is_empty());
+            for spec in &bundle.artifacts {
                 assert!(
                     spec.url.starts_with("https://huggingface.co/"),
                     "non-HF url: {}",
                     spec.url,
                 );
                 assert!(!spec.filename.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn manifest_references_are_immutable_and_runtime_metadata_is_present() {
+        for key in [DEFAULT_BUNDLE_KEY, SIGLIP_BUNDLE_KEY, CLAP_BUNDLE_KEY] {
+            let bundle = model_bundle(key).unwrap();
+            assert!(!bundle.model_id.is_empty());
+            assert!(bundle.dimensions > 0);
+            assert!(bundle.max_sequence_length > 0);
+            assert!(!bundle.source.is_empty());
+            assert!(!bundle.precision.is_empty());
+            for artifact in &bundle.artifacts {
+                assert!(artifact
+                    .url
+                    .contains(&format!("/resolve/{}/", bundle.revision)));
             }
         }
     }

@@ -38,16 +38,6 @@ use tidyup_core::inference::EmbeddingBackend;
 
 use crate::util::l2_normalize;
 
-/// Default maximum sequence length for BGE-small. The model's positional
-/// embeddings are capped at 512.
-pub const DEFAULT_MAX_SEQ_LEN: usize = 512;
-
-/// Default output dimensionality for `bge-small-en-v1.5`.
-pub const DEFAULT_EMBEDDING_DIMS: usize = 384;
-
-/// Default model identifier, used as a cache key.
-pub const DEFAULT_MODEL_ID: &str = "BAAI/bge-small-en-v1.5";
-
 /// Upper bound on texts fed to one ONNX inference from [`EmbeddingBackend::embed_texts`].
 /// Each call builds a `[batch, seq_len, hidden]` tensor, so an unbounded batch
 /// (e.g. a whole corpus) allocates gigabytes; chunking keeps peak memory flat.
@@ -78,14 +68,15 @@ impl Config {
     /// Returns [`None`] if the platform cache directory is unavailable.
     #[must_use]
     pub fn default_bge_small() -> Option<Self> {
+        let bundle = crate::install::model_bundle(crate::install::DEFAULT_BUNDLE_KEY).ok()?;
         let model_path = crate::paths::default_model_path()?;
         let tokenizer_path = crate::paths::default_tokenizer_path()?;
         Some(Self {
             model_path,
             tokenizer_path,
-            model_id: DEFAULT_MODEL_ID.to_string(),
-            dims: DEFAULT_EMBEDDING_DIMS,
-            max_seq_len: DEFAULT_MAX_SEQ_LEN,
+            model_id: bundle.model_id.clone(),
+            dims: bundle.dimensions,
+            max_seq_len: bundle.max_sequence_length,
             intra_threads: None,
         })
     }
@@ -498,9 +489,10 @@ mod tests {
         // Cannot assume a platform cache exists in all CI environments,
         // but we can at least sanity-check the shape when it is present.
         if let Some(cfg) = Config::default_bge_small() {
-            assert_eq!(cfg.model_id, DEFAULT_MODEL_ID);
-            assert_eq!(cfg.dims, DEFAULT_EMBEDDING_DIMS);
-            assert_eq!(cfg.max_seq_len, DEFAULT_MAX_SEQ_LEN);
+            let bundle = crate::install::model_bundle(crate::install::DEFAULT_BUNDLE_KEY).unwrap();
+            assert_eq!(cfg.model_id, bundle.model_id);
+            assert_eq!(cfg.dims, bundle.dimensions);
+            assert_eq!(cfg.max_seq_len, bundle.max_sequence_length);
             assert!(cfg.model_path.ends_with("model.onnx"));
             assert!(cfg.tokenizer_path.ends_with("tokenizer.json"));
         }

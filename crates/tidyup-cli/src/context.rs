@@ -218,8 +218,8 @@ fn build_remote_backend(_config: &TidyupConfig) -> Result<Arc<dyn TextBackend>> 
 /// bundle is missing or fails to load — the caller surfaces the absence as
 /// a soft fallback to general text classification, not an error.
 fn try_load_siglip() -> Option<Arc<dyn ImageEmbeddingBackend>> {
-    if verify_siglip_model().is_err() {
-        tracing::debug!("SigLIP bundle not present; visual semantic routing disabled");
+    if let Err(error) = verify_siglip_model() {
+        tracing::warn!(%error, "SigLIP bundle unavailable; visual semantic routing disabled");
         return None;
     }
     match SigLipEmbeddings::load_default() {
