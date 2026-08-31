@@ -1,0 +1,40 @@
+[application]
+# Display name, not the binary name. `dx` reads this into
+# `dioxus_cli_config::app_title()`.
+#
+# NOTE: this does NOT replace the title set in `crates/tidyup-ui/src/main.rs`.
+# `app_title()` is only populated when the app is built through the `dx` CLI;
+# under the plain `cargo run` that README.md documents it is unset and
+# dioxus-desktop falls back to the literal "Dioxus App". Both are needed —
+# don't delete the in-code title as a "duplicate".
+name = "Tidyup"
+
+[web.app]
+title = "Tidyup"
+
+[bundle]
+identifier = "com.github.erovelli.tidyup"
+publisher = "Tidyup Contributors"
+# Keep this in step with `[workspace.package] version` in Cargo.toml.
+version = "0.1.0"
+copyright = "Copyright (c) Tidyup Contributors"
+category = "Utility"
+short_description = "A local-first file organizer that never phones home."
+long_description = """
+tidyup sorts a source directory into a target hierarchy by classifying files on
+their contents, using compact embedding models that run entirely on-device. It
+proposes every rename and move for review; nothing is applied without explicit
+approval, and every applied move is reversible.
+"""
+
+# One canonical mark, shared with the README and the freedesktop entry. See
+# assets/brand/README.md.
+icon = [
+    "assets/brand/icon-256.png",
+    "assets/brand/icon-512.png",
+    "assets/brand/icon.ico",
+    "assets/brand/icon.icns",
+]
+
+[bundle.macos]
+minimum_system_version = "11.0"

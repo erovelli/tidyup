@@ -11,6 +11,11 @@ categories.workspace   = true
 rust-version.workspace = true
 readme      = "README.md"
 description = "Local inference backend via mistralrs. Runtime-detected accelerator."
+# Internal to the tidyup workspace: no external consumers, and the layering
+# rules in CLAUDE.md are the only contract it upholds. Marked explicitly so a
+# `cargo publish --workspace` cannot push it to crates.io as a side effect of
+# releasing something that is meant to be published.
+publish     = false
 
 # Default = CPU via mistralrs defaults. Metal/CUDA forwarding is a post-v0.1
 # polish step — for now, users wanting a GPU build can pass

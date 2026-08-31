@@ -136,6 +136,11 @@ dioxus       = { version = "0.7.5", features = ["desktop", "router"] }
 # NSOpenPanel (macOS), the XDG portal (Linux), and IFileDialog (Windows). No
 # network code path.
 rfd          = "0.17"
+# Encodes the two embedded webfonts as `data:` URLs at startup so the webview
+# never reaches the network to render the design system's own typefaces. Already
+# present in the lockfile transitively, so promoting it to a direct dependency
+# adds no new compilation unit.
+base64       = "0.22"
 
 # Storage
 rusqlite     = { version = "0.40", features = ["bundled", "chrono"] }

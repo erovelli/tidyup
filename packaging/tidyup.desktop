@@ -1,0 +1,22 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Tidyup
+GenericName=File Organizer
+Comment=A local-first file organizer that never phones home
+Categories=Utility;FileTools;
+Keywords=files;organize;sort;tidy;local;offline;
+Terminal=false
+
+# The installed binary keeps its `tidyup-desktop` name so it does not collide
+# with the `tidyup` CLI on PATH. Only the Name= above is user-facing.
+Exec=tidyup-desktop %U
+Icon=tidyup
+
+# Must match the WM_CLASS the toolkit actually sets, which GTK derives from the
+# binary name — verified with `xwininfo -root -tree` against a running build:
+#   0x200003 "Tidyup": ("tidyup-desktop" "Tidyup-desktop")
+# Without this, the shell shows a generic icon for the running window instead of
+# associating it with this entry.
+StartupWMClass=tidyup-desktop
+StartupNotify=true

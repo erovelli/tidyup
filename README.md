@@ -1,4 +1,14 @@
-# tidyup
+<p align="center">
+  <img src="assets/brand/logo.svg" alt="tidyup" width="440">
+</p>
+
+<p align="center">
+  <a href="https://github.com/erovelli/tidyup/actions/workflows/ci.yml"><img src="https://github.com/erovelli/tidyup/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/erovelli/tidyup/actions/workflows/model-eval.yml"><img src="https://github.com/erovelli/tidyup/actions/workflows/model-eval.yml/badge.svg" alt="Model eval"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License: Apache-2.0"></a>
+  <img src="https://img.shields.io/badge/rustc-1.95.0-orange.svg" alt="MSRV 1.95.0">
+  <img src="https://img.shields.io/badge/status-pre--alpha-red.svg" alt="Status: pre-alpha">
+</p>
 
 > A local-first file organizer that never phones home.
 
@@ -127,7 +137,10 @@ tidyup-cli`. Verify the checksum, extract, and put `tidyup` on your `PATH`. The
 binary has no network code path and cannot download anything itself.
 
 > The desktop UI (`tidyup-desktop`) is built from source for now; signed app
-> bundles are tracked in the roadmap.
+> bundles are tracked in the roadmap. `packaging/` carries the freedesktop
+> entry and install steps that give it a proper launcher on Linux, and
+> `Dioxus.toml` carries the bundle identifier and icon set for `dx bundle` on
+> macOS and Windows.
 
 ---
 
@@ -331,7 +344,7 @@ tidyup is being built in phases. Each phase lands an independently compilable sl
 | 6     | Dioxus desktop UI (dashboard, review, runs, settings) on the same service seam              | [x] Complete   |
 | 7     | Multimodal encoders (SigLIP image / CLAP audio) wired into scan and migration | [x] Complete   |
 | 8     | General semantic spine: dynamic modality folder prototypes, grounded visual naming/clustering, versioned artifact cache, durable run accounting, capability manifests, latency harness | [~] Implemented; instrumentation and calibration remain |
-| 9+    | Video keyframe encoder, text-result dedup, code signing, package-manager distribution, UI app bundles | [ ] Backlog    |
+| 9+    | Video keyframe encoder, text-result dedup, code signing, package-manager distribution, UI app bundles | [~] Bundle metadata + freedesktop entry landed; signing/notarization and package managers remain |
 
 **What currently works:**
 
@@ -352,7 +365,7 @@ tidyup is being built in phases. Each phase lands an independently compilable sl
 - **Optional LLM fallback (off-by-default)**: when embedding routing lands in the review zone, a `TextBackend` can re-classify the content; `summary + category + tags` is re-embedded and re-ranked against the same candidates, and adopted only if its score improves. Activation is triple-gated by cargo feature, config, and invocation flag. The LLM's `suggested_name` is ignored.
 - `tidyup-app`: `ScanService`, `MigrationService`, and `RollbackService` driving the pipeline end-to-end — shelve → write-ahead `Applied` journal mark → move → per-run rollback via the `RunLog`. Interactive frontends receive the complete plan through `ReviewHandler::review_all`; `--yes` separately auto-applies loose move-only proposals above `[classifier] min_confidence` and recognized opaque structural bundles above their internal `0.50` raw-cosine floor. Soft/file-set collections and all renames remain explicit-review only. All bundle moves remain all-or-nothing. Frontend-edited semantic labels/filenames are reconciled against the original immutable member ids, source paths, hashes, and destination parent before any shelf or move operation.
 - First-run model check: scan/migrate surface `cargo xtask download-models` (or a manual placement hint) when the embedding bundle is missing, without linking an HTTP client
-- `tidyup-ui`: Dioxus 0.7 desktop binary (`cargo run --release -p tidyup-ui --bin tidyup-desktop` — the stylesheet is compiled into the binary, so no `dx` CLI or asset bundling step is needed; `--release` matters because debug-profile inference is unusably slow) with Dashboard / Review / Runs / Settings pages, signal-backed `ProgressReporter` and oneshot-channel `ReviewHandler`. Dashboard Scan and Migrate default to **Preview only (dry run)**, reporting what would apply without changing files, shelves, or proposal state; execution requires explicitly turning preview off. Raw routing evidence is displayed as a similarity score, not a percentage, until a fitted calibrator compatible with the run’s capability manifest ships. It uses the same services, extractor registry, and embedding models as the CLI. **Review is a complete-plan surface** through `ReviewHandler::review_all`: loose changes and atomic bundles are shown together; semantic collection labels/member basenames can be edited, while duplicate sibling names are rejected inline and immutable bundle identity is revalidated by the executor. Styled per `DESIGN.md` ("The Verdant Archive")
+- `tidyup-ui`: Dioxus 0.7 desktop binary (`cargo run --release -p tidyup-ui --bin tidyup-desktop` — the stylesheet is compiled into the binary, so no `dx` CLI or asset bundling step is needed; `--release` matters because debug-profile inference is unusably slow) with Dashboard / Review / Runs / Settings pages, signal-backed `ProgressReporter` and oneshot-channel `ReviewHandler`. Settings opens with an **About** card reporting the version, the git revision the binary was built from (with a `-dirty` marker for uncommitted trees), whether the embedding model is actually present on disk, and whether the optional LLM reranker was compiled in — the four facts a pre-alpha bug report needs. It renders even when config loading fails. Dashboard Scan and Migrate default to **Preview only (dry run)**, reporting what would apply without changing files, shelves, or proposal state; execution requires explicitly turning preview off. Raw routing evidence is displayed as a similarity score, not a percentage, until a fitted calibrator compatible with the run’s capability manifest ships. It uses the same services, extractor registry, and embedding models as the CLI. **Review is a complete-plan surface** through `ReviewHandler::review_all`: loose changes and atomic bundles are shown together; semantic collection labels/member basenames can be edited, while duplicate sibling names are rejected inline and immutable bundle identity is revalidated by the executor. Styled per `DESIGN.md` ("The Verdant Archive") with the Manrope/Inter pairing self-hosted — Latin-subset variable faces are embedded in the binary and injected as `data:` URLs, so the design renders without the webview reaching a font CDN. It launches as **Tidyup** with the project mark as its window icon (the `tidyup-desktop` binary name stays a developer-facing handle that disambiguates it from the `tidyup` CLI)
 - **Multimodal embeddings (optional, off-by-default)**: SigLIP-base for cross-modal image semantics and CLAP-htsat-unfused for audio. Both load only when their model bundles exist. Scan ranks per-modality taxonomies; migration combines matching-space folder-label prototypes with optional content centroids, so empty named folders remain candidates. SigLIP also grounds visible concepts used for rename suggestions and conservative visual collections. Embeddings persist in SQLite under exact content/model/preprocessing/latent-space keys.
 - **Semantic latency harness** (`cargo xtask bench-semantic <image>`): reports cold model load separately from warm read+hash+SigLIP+concept-ranking+grounded-name p50/p95/worst latency and enforces a configurable one-second p95 gate.
 - **Model-integrity verification**: `cargo xtask download-models` and the runtime loader share one `BundleSpec` source of truth (`tidyup-embeddings-ort::install`); downloads are checksum-verified (pinned BLAKE3 enforced and a corrupt file deleted; unpinned digests reported so they can be pinned), and `cargo xtask verify-models` checks an install against those specs on demand
@@ -366,7 +379,7 @@ tidyup is being built in phases. Each phase lands an independently compilable sl
 - **Incremental semantic indexing.** Image/audio embeddings persist by exact content/model/preprocessing/latent-space key, but text extraction/OCR evidence and final decisions are not yet fanned out by content hash. Target profiles are rebuilt in full on every migration; `ScanDiff` is not wired into incremental invalidation.
 - **Dedicated video semantics.** Video files have no keyframe/audio-content encoder; they use available name/context evidence and otherwise remain low-confidence or unclassified. Decoder selection remains unresolved.
 - **Excel/ODS in the shipped frontend stack.** The extractor implementation and tests exist behind `tidyup-extract/excel`, but CLI/UI context construction does not currently register it.
-- **Signed/package-manager distribution.** Tagged releases publish checksummed default CLI archives, but signing, notarized desktop bundles, Homebrew, and winget remain backlog items.
+- **Signed/package-manager distribution.** Tagged releases publish checksummed default CLI archives, and the desktop UI now carries bundle metadata (`Dioxus.toml`) plus a freedesktop entry (`packaging/`), but signing, notarized desktop bundles, Homebrew, and winget remain backlog items. Every workspace crate is `publish = false`; nothing is on crates.io yet.
 
 The invariants the finished tool will uphold — human-in-the-loop review, reversible moves, bundle atomicity, no-network-by-default, and grounded non-generative renames — are now enforced at the code path, not just the design.
 

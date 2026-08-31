@@ -30,7 +30,30 @@ use clap::{Parser, Subcommand};
 // clippy's bool-count lint targets domain types, not arg parsers.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Parser, Debug)]
-#[command(name = "tidyup", version, about = "On-device AI file organizer")]
+#[command(
+    name = "tidyup",
+    version,
+    about = "On-device AI file organizer",
+    long_about = "\
+tidyup classifies files by their contents — not their extensions — using compact \
+embedding models that run entirely on your machine, and proposes a tidier structure.
+
+Nothing moves without your approval, and every applied move is reversible: originals \
+are shelved rather than deleted, and `tidyup rollback` restores them. The default build \
+links no HTTP client and no LLM inference at all.",
+    after_help = "\
+EXAMPLES:
+  # Propose an in-place tidy of a messy folder. Changes nothing.
+  tidyup scan ~/Downloads --dry-run
+
+  # Sort a source folder into an existing hierarchy whose structure tidyup learns.
+  tidyup migrate ~/Inbox ~/Documents
+
+  # Reverse a run. Run ids are printed in each run summary and by `rollback --list`.
+  tidyup rollback --list
+
+Start with --dry-run. The loop is dry-run -> review -> apply -> reversible."
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,

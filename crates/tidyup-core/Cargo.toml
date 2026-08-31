@@ -11,6 +11,11 @@ categories.workspace   = true
 rust-version.workspace = true
 readme      = "README.md"
 description = "Port traits (hexagonal architecture). All implementations depend on this crate."
+# Internal to the tidyup workspace: no external consumers, and the layering
+# rules in CLAUDE.md are the only contract it upholds. Marked explicitly so a
+# `cargo publish --workspace` cannot push it to crates.io as a side effect of
+# releasing something that is meant to be published.
+publish     = false
 
 [dependencies]
 tidyup-domain = { workspace = true }

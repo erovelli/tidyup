@@ -11,6 +11,11 @@ categories.workspace   = true
 rust-version.workspace = true
 readme      = "README.md"
 description = "Content extractors (PDF, Excel, images, audio, plain text). Feature-gated per format."
+# Internal to the tidyup workspace: no external consumers, and the layering
+# rules in CLAUDE.md are the only contract it upholds. Marked explicitly so a
+# `cargo publish --workspace` cannot push it to crates.io as a side effect of
+# releasing something that is meant to be published.
+publish     = false
 
 [features]
 default = ["text", "pdf", "image"]
