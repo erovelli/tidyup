@@ -54,23 +54,11 @@ use tidyup_core::inference::ImageEmbeddingBackend;
 
 use crate::util::l2_normalize;
 
-/// Default model identifier (SigLIP base, patch 16, 224×224).
-pub const DEFAULT_MODEL_ID: &str = "google/siglip-base-patch16-224";
-
-/// Default output dimensionality.
-pub const DEFAULT_EMBEDDING_DIMS: usize = 768;
-
-/// Image side length the vision tower expects.
-pub const IMAGE_SIZE: u32 = 224;
-
 /// Per-channel normalization mean (SigLIP convention).
 const NORM_MEAN: [f32; 3] = [0.5, 0.5, 0.5];
 
 /// Per-channel normalization standard deviation.
 const NORM_STD: [f32; 3] = [0.5, 0.5, 0.5];
-
-/// Default text-tower max sequence length. SigLIP base caps at 64.
-pub const DEFAULT_MAX_SEQ_LEN: usize = 64;
 
 /// Configuration for [`SigLipEmbeddings::load`].
 #[derive(Debug, Clone)]
@@ -81,6 +69,11 @@ pub struct Config {
     pub model_id: String,
     pub dims: usize,
     pub max_seq_len: usize,
+    pub image_size: u32,
+    pub pad_token_id: u32,
+    pub pad_token: String,
+    pub pad_to_max_length: bool,
+    pub preprocessing_version: String,
     pub intra_threads: Option<usize>,
 }
 
@@ -88,13 +81,19 @@ impl Config {
     /// Defaults pointing at the conventional platform cache paths.
     #[must_use]
     pub fn default_siglip_base() -> Option<Self> {
+        let bundle = crate::install::model_bundle(crate::install::SIGLIP_BUNDLE_KEY).ok()?;
         Some(Self {
             vision_path: crate::paths::siglip_vision_path()?,
             text_path: crate::paths::siglip_text_path()?,
             tokenizer_path: crate::paths::siglip_tokenizer_path()?,
-            model_id: DEFAULT_MODEL_ID.to_string(),
-            dims: DEFAULT_EMBEDDING_DIMS,
-            max_seq_len: DEFAULT_MAX_SEQ_LEN,
+            model_id: bundle.model_id.clone(),
+            dims: bundle.dimensions,
+            max_seq_len: bundle.max_sequence_length,
+            image_size: bundle.image_size?,
+            pad_token_id: bundle.pad_token_id,
+            pad_token: bundle.pad_token.clone(),
+            pad_to_max_length: bundle.pad_to_max_length,
+            preprocessing_version: bundle.preprocessing_version.clone(),
             intra_threads: None,
         })
     }
@@ -106,7 +105,10 @@ pub struct SigLipEmbeddings {
     text: Arc<Mutex<Session>>,
     tokenizer: Arc<Tokenizer>,
     dims: usize,
+    image_size: u32,
+    pad_token_id: u32,
     model_id: String,
+    preprocessing_version: String,
 }
 
 impl std::fmt::Debug for SigLipEmbeddings {
@@ -151,12 +153,18 @@ impl SigLipEmbeddings {
 
         let mut tokenizer = Tokenizer::from_file(&config.tokenizer_path)
             .map_err(|e| anyhow::anyhow!("failed to load SigLIP tokenizer: {e}"))?;
-        configure_tokenizer(&mut tokenizer, config.max_seq_len);
+        configure_tokenizer(
+            &mut tokenizer,
+            config.max_seq_len,
+            config.pad_token_id,
+            &config.pad_token,
+            config.pad_to_max_length,
+        );
 
         tracing::info!(
             model = %config.model_id,
             dims = config.dims,
-            image_size = IMAGE_SIZE,
+            image_size = config.image_size,
             "SigLIP encoder loaded",
         );
 
@@ -165,7 +173,10 @@ impl SigLipEmbeddings {
             text: Arc::new(Mutex::new(text)),
             tokenizer: Arc::new(tokenizer),
             dims: config.dims,
+            image_size: config.image_size,
+            pad_token_id: config.pad_token_id,
             model_id: config.model_id,
+            preprocessing_version: config.preprocessing_version,
         })
     }
 
@@ -188,20 +199,24 @@ impl ImageEmbeddingBackend for SigLipEmbeddings {
     async fn embed_image(&self, image_bytes: &[u8], mime: &str) -> Result<Vec<f32>> {
         let session = self.vision.clone();
         let dims = self.dims;
+        let image_size = self.image_size;
         let bytes = image_bytes.to_vec();
         let mime = mime.to_string();
-        tokio::task::spawn_blocking(move || embed_image_sync(&session, &bytes, &mime, dims))
-            .await
-            .context("embed_image join")?
+        tokio::task::spawn_blocking(move || {
+            embed_image_sync(&session, &bytes, &mime, dims, image_size)
+        })
+        .await
+        .context("embed_image join")?
     }
 
     async fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
         let session = self.text.clone();
         let tokenizer = self.tokenizer.clone();
         let dims = self.dims;
+        let pad_token_id = self.pad_token_id;
         let text = text.to_string();
         tokio::task::spawn_blocking(move || {
-            embed_text_sync(&session, &tokenizer, &[&text], dims)
+            embed_text_sync(&session, &tokenizer, &[&text], dims, pad_token_id)
                 .map(|mut v| v.pop().unwrap_or_default())
         })
         .await
@@ -215,10 +230,11 @@ impl ImageEmbeddingBackend for SigLipEmbeddings {
         let session = self.text.clone();
         let tokenizer = self.tokenizer.clone();
         let dims = self.dims;
+        let pad_token_id = self.pad_token_id;
         let owned: Vec<String> = texts.iter().map(|s| (*s).to_string()).collect();
         tokio::task::spawn_blocking(move || {
             let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
-            embed_text_sync(&session, &tokenizer, &refs, dims)
+            embed_text_sync(&session, &tokenizer, &refs, dims, pad_token_id)
         })
         .await
         .context("embed_texts join")?
@@ -231,6 +247,10 @@ impl ImageEmbeddingBackend for SigLipEmbeddings {
     fn model_id(&self) -> &str {
         &self.model_id
     }
+
+    fn preprocessing_version(&self) -> &str {
+        &self.preprocessing_version
+    }
 }
 
 /// Decode → resize → normalize → run vision tower → L2-normalize.
@@ -240,21 +260,22 @@ fn embed_image_sync(
     image_bytes: &[u8],
     _mime: &str,
     dims: usize,
+    image_size: u32,
 ) -> Result<Vec<f32>> {
     let img = image::load_from_memory(image_bytes).context("decoding image bytes")?;
     let resized = img
         .resize_exact(
-            IMAGE_SIZE,
-            IMAGE_SIZE,
+            image_size,
+            image_size,
             image::imageops::FilterType::Triangle,
         )
         .to_rgb8();
 
-    let mut buf = vec![0.0_f32; 3 * (IMAGE_SIZE as usize) * (IMAGE_SIZE as usize)];
-    let h = IMAGE_SIZE as usize;
-    let w = IMAGE_SIZE as usize;
-    for y in 0..IMAGE_SIZE {
-        for x in 0..IMAGE_SIZE {
+    let mut buf = vec![0.0_f32; 3 * (image_size as usize) * (image_size as usize)];
+    let h = image_size as usize;
+    let w = image_size as usize;
+    for y in 0..image_size {
+        for x in 0..image_size {
             let pixel = resized.get_pixel(x, y);
             let yi = y as usize;
             let xi = x as usize;
@@ -289,6 +310,7 @@ fn embed_text_sync(
     tokenizer: &Tokenizer,
     texts: &[&str],
     dims: usize,
+    pad_token_id: u32,
 ) -> Result<Vec<Vec<f32>>> {
     if texts.is_empty() {
         return Ok(Vec::new());
@@ -319,7 +341,7 @@ fn embed_text_sync(
             ids.push(i64::from(v));
         }
         let pad_count = seq_len.saturating_sub(raw.len().min(seq_len));
-        ids.extend(std::iter::repeat_n(0_i64, pad_count));
+        ids.extend(std::iter::repeat_n(i64::from(pad_token_id), pad_count));
     }
 
     let ids_arr =
@@ -440,7 +462,13 @@ fn build_session(path: &std::path::Path, intra_threads: Option<usize>) -> Result
         .map_err(|e| anyhow::anyhow!("loading ONNX model at {}: {e}", path.display()))
 }
 
-fn configure_tokenizer(tokenizer: &mut Tokenizer, max_seq_len: usize) {
+fn configure_tokenizer(
+    tokenizer: &mut Tokenizer,
+    max_seq_len: usize,
+    pad_token_id: u32,
+    pad_token: &str,
+    pad_to_max_length: bool,
+) {
     let _ = tokenizer.with_truncation(Some(TruncationParams {
         direction: TruncationDirection::Right,
         max_length: max_seq_len,
@@ -448,12 +476,16 @@ fn configure_tokenizer(tokenizer: &mut Tokenizer, max_seq_len: usize) {
         stride: 0,
     }));
     tokenizer.with_padding(Some(PaddingParams {
-        strategy: PaddingStrategy::BatchLongest,
+        strategy: if pad_to_max_length {
+            PaddingStrategy::Fixed(max_seq_len)
+        } else {
+            PaddingStrategy::BatchLongest
+        },
         direction: PaddingDirection::Right,
         pad_to_multiple_of: None,
-        pad_id: 0,
+        pad_id: pad_token_id,
         pad_type_id: 0,
-        pad_token: "[PAD]".to_string(),
+        pad_token: pad_token.to_string(),
     }));
 }
 
@@ -465,9 +497,11 @@ mod tests {
     #[test]
     fn config_default_siglip_base_shape() {
         if let Some(cfg) = Config::default_siglip_base() {
-            assert_eq!(cfg.model_id, DEFAULT_MODEL_ID);
-            assert_eq!(cfg.dims, DEFAULT_EMBEDDING_DIMS);
-            assert_eq!(cfg.max_seq_len, DEFAULT_MAX_SEQ_LEN);
+            let bundle = crate::install::model_bundle(crate::install::SIGLIP_BUNDLE_KEY).unwrap();
+            assert_eq!(cfg.model_id, bundle.model_id);
+            assert_eq!(cfg.dims, bundle.dimensions);
+            assert_eq!(cfg.max_seq_len, bundle.max_sequence_length);
+            assert_eq!(Some(cfg.image_size), bundle.image_size);
             assert!(cfg.vision_path.ends_with("vision_model.onnx"));
             assert!(cfg.text_path.ends_with("text_model.onnx"));
         }
@@ -482,6 +516,11 @@ mod tests {
             model_id: "test".into(),
             dims: 768,
             max_seq_len: 64,
+            image_size: 224,
+            pad_token_id: 1,
+            pad_token: "</s>".to_string(),
+            pad_to_max_length: true,
+            preprocessing_version: "test-v1".to_string(),
             intra_threads: None,
         };
         let err = SigLipEmbeddings::load(cfg).unwrap_err();

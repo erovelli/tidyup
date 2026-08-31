@@ -32,6 +32,9 @@ pub(super) fn run(image: &Path, iterations: usize, fail_over_ms: u64) -> Result<
         .context("warm SigLIP image tower")?;
 
     let mut samples = Vec::with_capacity(iterations);
+    let mut last_ranked = Vec::new();
+    let mut last_rename = tidyup_pipeline::naming::RenameProposal::Keep;
+    let mut last_embedding = Vec::new();
     for _ in 0..iterations {
         let started = Instant::now();
         let bytes = std::fs::read(image)
@@ -43,8 +46,11 @@ pub(super) fn run(image: &Path, iterations: usize, fail_over_ms: u64) -> Result<
         let ranked = tidyup_pipeline::semantic::rank_concepts(&embedding, &concepts);
         let naming_concepts = ranked.get(..2).unwrap_or(ranked.as_slice());
         let rename = tidyup_pipeline::naming::propose_grounded_rename(image, naming_concepts);
-        std::hint::black_box(ranked);
-        std::hint::black_box(rename);
+        std::hint::black_box(&ranked);
+        std::hint::black_box(&rename);
+        last_ranked = ranked;
+        last_rename = rename;
+        last_embedding = embedding;
         samples.push(started.elapsed());
     }
     samples.sort_unstable();
@@ -59,6 +65,36 @@ pub(super) fn run(image: &Path, iterations: usize, fail_over_ms: u64) -> Result<
     println!("  p95:               {}", format_duration(p95));
     println!("  worst:             {}", format_duration(worst));
     println!("  gate:              {fail_over_ms} ms");
+    let top_concepts = last_ranked
+        .iter()
+        .take(5)
+        .map(|concept| format!("{}:{:.3}", concept.label, concept.score))
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("  top concepts:      {top_concepts}");
+    println!("  rename candidate:  {last_rename:?}");
+    let mut raw_concepts = concepts
+        .iter()
+        .map(|concept| {
+            (
+                concept.label.as_str(),
+                tidyup_embeddings_ort::cosine_similarity(&last_embedding, &concept.embedding),
+            )
+        })
+        .collect::<Vec<_>>();
+    raw_concepts.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let raw_top = raw_concepts
+        .iter()
+        .take(5)
+        .map(|(label, score)| format!("{label}:{score:.4}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("  raw cosine top:    {raw_top}");
 
     if p95 > Duration::from_millis(fail_over_ms) {
         bail!(

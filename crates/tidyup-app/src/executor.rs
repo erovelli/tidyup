@@ -523,9 +523,10 @@ async fn apply_single(
 
     // Order matters for crash consistency:
     //   1. shelve (safety net — the original is preserved before anything moves)
-    //   2. mark_applied (write-ahead journal — records intent BEFORE the move)
-    //   3. move
-    // A crash between 2 and 3 leaves the proposal marked applied but not yet
+    //   2. persist the reviewed target (so rollback follows an override)
+    //   3. mark_applied (write-ahead journal — records intent BEFORE the move)
+    //   4. move
+    // A crash between 3 and 4 leaves the proposal marked applied but not yet
     // moved; rollback's precheck sees the destination absent and the original
     // still in place and treats the restore as a safe no-op. The reverse order
     // (move then mark) would strand a moved-but-unjournaled file that rollback
@@ -536,6 +537,19 @@ async fn apply_single(
         .await
         .with_context(|| format!("shelving {}", source.display()))?;
 
+    let proposed_name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            anyhow!(
+                "reviewed target has no valid filename: {}",
+                target.display()
+            )
+        })?;
+    let change_type = change_type_for_target(&proposal.original_path, target);
+    deps.change_log
+        .update_proposed_target(proposal.id, target, proposed_name, change_type)
+        .await?;
     deps.change_log.mark_applied(proposal.id).await?;
 
     ensure_parent(target)?;
@@ -543,6 +557,16 @@ async fn apply_single(
         .with_context(|| format!("moving {} -> {}", source.display(), target.display()))?;
 
     Ok(())
+}
+
+fn change_type_for_target(original: &Path, target: &Path) -> ChangeType {
+    let renamed = original.file_name() != target.file_name();
+    let moved = original.parent() != target.parent();
+    match (renamed, moved) {
+        (true, true) => ChangeType::RenameAndMove,
+        (true, false) => ChangeType::Rename,
+        _ => ChangeType::Move,
+    }
 }
 
 async fn apply_bundle_atomic(
@@ -1364,6 +1388,7 @@ mod tests {
         applied: Mutex<Vec<Uuid>>,
         applied_bundles: Mutex<Vec<Uuid>>,
         rejected: Mutex<Vec<Uuid>>,
+        reviewed_targets: Mutex<Vec<PathBuf>>,
     }
 
     impl RecordingLog {
@@ -1372,6 +1397,7 @@ mod tests {
                 applied: Mutex::new(Vec::new()),
                 applied_bundles: Mutex::new(Vec::new()),
                 rejected: Mutex::new(Vec::new()),
+                reviewed_targets: Mutex::new(Vec::new()),
             }
         }
     }
@@ -1379,6 +1405,19 @@ mod tests {
     #[async_trait]
     impl ChangeLog for RecordingLog {
         async fn record_proposal(&self, _p: &ChangeProposal, _run: Option<Uuid>) -> CoreResult<()> {
+            Ok(())
+        }
+        async fn update_proposed_target(
+            &self,
+            _id: Uuid,
+            path: &Path,
+            _name: &str,
+            _change_type: ChangeType,
+        ) -> CoreResult<()> {
+            self.reviewed_targets
+                .lock()
+                .unwrap()
+                .push(path.to_path_buf());
             Ok(())
         }
         async fn mark_applied(&self, id: Uuid) -> CoreResult<()> {
@@ -1549,8 +1588,9 @@ mod tests {
         let override_dst = dir.path().join("chosen/b.txt");
 
         let proposal = sample_proposal(src.clone(), &default_dst);
+        let log = RecordingLog::new();
         let deps = ExecutorDeps {
-            change_log: &RecordingLog::new(),
+            change_log: &log,
             backup_store: &NoopBackup::new(),
             progress: &NullProgress,
         };
@@ -1563,6 +1603,11 @@ mod tests {
             .unwrap();
         assert_eq!(report.applied, 1);
         assert!(override_dst.exists());
+        assert_eq!(
+            *log.reviewed_targets.lock().unwrap(),
+            vec![override_dst],
+            "rollback journal must follow the reviewed override target",
+        );
     }
 
     #[tokio::test]

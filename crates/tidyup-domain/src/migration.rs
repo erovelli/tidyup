@@ -242,6 +242,15 @@ pub struct ClassifierConfig {
     pub embedding_threshold: f32,
     /// Semantic ambiguity gap threshold.
     pub ambiguity_gap: f32,
+    /// Raw cross-modal similarity floor for image routing. `SigLIP` cosine
+    /// values are not on the same scale as `BGE` text similarities.
+    pub image_embedding_threshold: f32,
+    /// Minimum top-two separation for image routing.
+    pub image_ambiguity_gap: f32,
+    /// Minimum semantic score for routing an atomic bundle.
+    pub bundle_embedding_threshold: f32,
+    /// Minimum top-two separation for atomic bundle routing.
+    pub bundle_ambiguity_gap: f32,
     /// Whether to invoke an optional LLM reranker for ambiguous files. Defaults to `false`
     /// (privacy-preserving): activation is materialised from the layered config
     /// only under the three-gate model (cargo feature + config bool +
@@ -258,6 +267,17 @@ pub struct ClassifierConfig {
     /// thresholds because a directory may be cohesive even when its destination
     /// is uncertain.
     pub directory_envelopes: DirectoryEnvelopeConfig,
+    /// Filesystem discovery policy applied before indexing and planning.
+    pub discovery: DiscoveryConfig,
+}
+
+/// Filesystem entries excluded from loose-file organization.
+#[derive(Debug, Clone)]
+pub struct DiscoveryConfig {
+    /// Include dot-prefixed files and directories when true.
+    pub include_hidden: bool,
+    /// Exact basenames ignored even when hidden files are enabled.
+    pub ignore_names: Vec<String>,
 }
 
 /// Configuration for generalized directory envelopes.
@@ -300,6 +320,9 @@ pub struct ScoreWeights {
 pub struct RenameConfig {
     pub min_classification_confidence: f32,
     pub min_mismatch_score: f32,
+    /// Filename/content mismatch floor for local OCR renames. OCR is exact
+    /// extracted evidence, so it uses a lower floor than free text keywords.
+    pub min_ocr_mismatch_score: f32,
     /// Minimum fraction of selected non-textual concept labels not already
     /// present as literal filename tokens. This intentionally has a separate
     /// scale from the continuous text-embedding mismatch score.
@@ -317,6 +340,10 @@ impl Default for ClassifierConfig {
         Self {
             embedding_threshold: 0.35,
             ambiguity_gap: 0.05,
+            image_embedding_threshold: 0.04,
+            image_ambiguity_gap: 0.01,
+            bundle_embedding_threshold: 0.35,
+            bundle_ambiguity_gap: 0.03,
             // Privacy default: the optional reranker stays off unless the layered config +
             // three-gate activation explicitly turns it on. A dead
             // `enable_llm_renaming` field used to default true here — it was
@@ -326,6 +353,21 @@ impl Default for ClassifierConfig {
             rename: RenameConfig::default(),
             calibration: Calibration::default(),
             directory_envelopes: DirectoryEnvelopeConfig::default(),
+            discovery: DiscoveryConfig::default(),
+        }
+    }
+}
+
+impl Default for DiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            include_hidden: false,
+            ignore_names: vec![
+                ".DS_Store".to_string(),
+                ".localized".to_string(),
+                "Thumbs.db".to_string(),
+                "desktop.ini".to_string(),
+            ],
         }
     }
 }
@@ -360,9 +402,10 @@ impl Default for RenameConfig {
         Self {
             min_classification_confidence: 0.85,
             min_mismatch_score: 0.60,
+            min_ocr_mismatch_score: 0.30,
             min_grounded_mismatch: 0.60,
-            min_grounding_confidence: 0.30,
-            min_grounding_gap: 0.02,
+            min_grounding_confidence: 0.05,
+            min_grounding_gap: 0.01,
         }
     }
 }

@@ -24,6 +24,7 @@
 //! clonable trait object where a one-shot channel fits naturally.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use dioxus::prelude::*;
@@ -80,6 +81,10 @@ pub(crate) struct SignalBundle {
     pub(crate) messages: SyncSignal<Vec<LogMessage>>,
     pub(crate) proposals: SyncSignal<Vec<ChangeProposal>>,
     pub(crate) bundles: SyncSignal<Vec<BundleProposal>>,
+    /// Roots for the plan currently awaiting review. Scan uses only source;
+    /// migration uses both so the two overview trees can pin exact roots.
+    pub(crate) review_source_root: SyncSignal<Option<PathBuf>>,
+    pub(crate) review_target_root: SyncSignal<Option<PathBuf>>,
     pub(crate) decisions: SyncSignal<HashMap<Uuid, ReviewDecision>>,
     /// Per-bundle approve (`true`) / reject (`false`) decisions during the
     /// atomic bundle-review pass. Absent = undecided (defaults to reject at
@@ -158,6 +163,8 @@ impl SharedState {
             messages: Signal::new_maybe_sync_in_scope(Vec::new(), ScopeId::ROOT),
             proposals: Signal::new_maybe_sync_in_scope(Vec::new(), ScopeId::ROOT),
             bundles: Signal::new_maybe_sync_in_scope(Vec::new(), ScopeId::ROOT),
+            review_source_root: Signal::new_maybe_sync_in_scope(None, ScopeId::ROOT),
+            review_target_root: Signal::new_maybe_sync_in_scope(None, ScopeId::ROOT),
             decisions: Signal::new_maybe_sync_in_scope(HashMap::new(), ScopeId::ROOT),
             bundle_approvals: Signal::new_maybe_sync_in_scope(HashMap::new(), ScopeId::ROOT),
             review_pending: Signal::new_maybe_sync_in_scope(false, ScopeId::ROOT),

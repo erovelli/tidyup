@@ -21,20 +21,20 @@ use anyhow::{bail, Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use tidyup_embeddings_ort::install::{
-    artifact_digest, verify_artifact, ArtifactSpec, BundleSpec, CLAP_BUNDLE, DEFAULT_BUNDLE,
-    SIGLIP_BUNDLE,
+    artifact_digest, model_bundle, verify_artifact, ArtifactSpec, BundleSpec, CLAP_BUNDLE_KEY,
+    DEFAULT_BUNDLE_KEY, SIGLIP_BUNDLE_KEY,
 };
 use tidyup_embeddings_ort::{verify_clap_model, verify_default_model, verify_siglip_model};
 
 #[allow(unreachable_pub)]
 pub fn download(force: bool, siglip: bool, clap: bool) -> Result<()> {
     let cache = resolve_cache_dir()?;
-    let mut bundles: Vec<&BundleSpec> = vec![&DEFAULT_BUNDLE];
+    let mut bundles: Vec<&BundleSpec> = vec![model_bundle(DEFAULT_BUNDLE_KEY)?];
     if siglip {
-        bundles.push(&SIGLIP_BUNDLE);
+        bundles.push(model_bundle(SIGLIP_BUNDLE_KEY)?);
     }
     if clap {
-        bundles.push(&CLAP_BUNDLE);
+        bundles.push(model_bundle(CLAP_BUNDLE_KEY)?);
     }
 
     let mut unpinned = 0usize;
@@ -46,9 +46,9 @@ pub fn download(force: bool, siglip: bool, clap: bool) -> Result<()> {
         println!();
         println!(
             "{unpinned} artifact(s) are unpinned (no checksum enforced). To pin them, copy the\n\
-             printed blake3/size into the matching ArtifactSpec in\n\
-             crates/tidyup-embeddings-ort/src/install.rs — ideally after switching the URL from\n\
-             `resolve/main/` to an immutable `resolve/<commit-sha>/` revision so the pin is stable."
+             printed blake3/size into the matching artifact in\n\
+             crates/tidyup-embeddings-ort/models.toml. URLs must already use an immutable\n\
+             `resolve/<commit-sha>/` revision before an artifact is accepted."
         );
     }
     Ok(())
@@ -65,7 +65,7 @@ enum Verdict {
 /// Download one bundle. Returns the count of unpinned artifacts seen, so the
 /// caller can print a single pin-me hint at the end.
 fn download_bundle(cache: &Path, bundle: &BundleSpec, force: bool) -> Result<usize> {
-    let target_dir = cache.join(bundle.dir);
+    let target_dir = cache.join(&bundle.dir);
     std::fs::create_dir_all(&target_dir)
         .with_context(|| format!("create cache dir {}", target_dir.display()))?;
 
@@ -76,8 +76,8 @@ fn download_bundle(cache: &Path, bundle: &BundleSpec, force: bool) -> Result<usi
     );
 
     let mut unpinned = 0usize;
-    for spec in bundle.artifacts {
-        let dest = target_dir.join(spec.filename);
+    for spec in &bundle.artifacts {
+        let dest = target_dir.join(&spec.filename);
         if dest.exists() && !force {
             // Skip the download, but still verify what's already on disk.
             match report_or_verify(&dest, spec)? {
@@ -176,12 +176,12 @@ fn resolve_cache_dir() -> Result<PathBuf> {
 
 fn fetch(dest: &Path, spec: &ArtifactSpec) -> Result<()> {
     let mut response =
-        reqwest::blocking::get(spec.url).with_context(|| format!("GET {}", spec.url))?;
+        reqwest::blocking::get(&spec.url).with_context(|| format!("GET {}", spec.url))?;
     if !response.status().is_success() {
         bail!("GET {} returned {}", spec.url, response.status());
     }
     let total = response.content_length().unwrap_or(0);
-    let bar = make_bar(total, spec.filename);
+    let bar = make_bar(total, &spec.filename);
 
     let tmp = dest.with_extension("partial");
     {
@@ -227,12 +227,13 @@ fn make_bar(total: u64, name: &str) -> ProgressBar {
 mod tests {
     use super::*;
 
-    fn spec(blake3_hex: &'static str) -> ArtifactSpec {
+    fn spec(blake3_hex: &str) -> ArtifactSpec {
         ArtifactSpec {
-            filename: "blob.bin",
-            url: "https://huggingface.co/example/resolve/main/blob.bin",
+            role: "model".to_string(),
+            filename: "blob.bin".to_string(),
+            url: "https://huggingface.co/example/resolve/revision/blob.bin".to_string(),
             size_bytes: 0,
-            blake3_hex,
+            blake3_hex: blake3_hex.to_string(),
         }
     }
 
@@ -257,10 +258,8 @@ mod tests {
         let path = dir.path().join("blob.bin");
         std::fs::write(&path, b"hello tidyup").unwrap();
         let hex = blake3::hash(b"hello tidyup").to_hex().to_string();
-        // `spec` takes a &'static str; leak the computed hex for the test only.
-        let pinned = Box::leak(hex.into_boxed_str());
         assert!(matches!(
-            report_or_verify(&path, &spec(pinned)).unwrap(),
+            report_or_verify(&path, &spec(&hex)).unwrap(),
             Verdict::Pinned
         ));
         assert!(path.exists());

@@ -252,6 +252,14 @@ pub trait ImageEmbeddingBackend: Send + Sync {
 
     /// Stable identifier. Cache key for image-taxonomy embeddings.
     fn model_id(&self) -> &str;
+
+    /// Version of decoding and preprocessing semantics used in persistent
+    /// artifact keys. Implementations must change this when preprocessing
+    /// changes even if the upstream model id does not.
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn preprocessing_version(&self) -> &str {
+        "image-v1"
+    }
 }
 
 /// Cross-modal audio embedding backend — produces L2-normalized vectors in a
@@ -278,6 +286,13 @@ pub trait AudioEmbeddingBackend: Send + Sync {
 
     /// Stable identifier.
     fn model_id(&self) -> &str;
+
+    /// Version of decoding and preprocessing semantics used in persistent
+    /// artifact keys.
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn preprocessing_version(&self) -> &str {
+        "audio-v1"
+    }
 }
 
 // ---------------------------------------------------------------------------

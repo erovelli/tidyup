@@ -209,7 +209,14 @@ pub(crate) fn Review() -> Element {
         };
     }
 
-    let model = build_diff_model(&proposals);
+    let source_root = signals.review_source_root.read().clone();
+    let target_root = signals.review_target_root.read().clone();
+    let model = build_diff_model(
+        &proposals,
+        &[],
+        source_root.as_deref(),
+        target_root.as_deref(),
+    );
     let applied_count = signals.last_report.read().as_ref().map_or(0, |r| match r {
         LastReport::Scan { report, .. } => report.applied,
         LastReport::Migration { report, .. } => report.applied,
@@ -291,10 +298,12 @@ struct DiffModel {
     left_rows: Vec<TreeRow>,
     /// Proposal id → row index in `left_rows`.
     file_row_by_id: HashMap<Uuid, usize>,
-    /// Entries for the right column, pre-ordered to minimise curve crossings.
-    right_entries: Vec<RightEntry>,
-    /// Displayed label for the root (derived from the common parent of all proposed paths).
-    root_label: String,
+    /// Source hierarchy shown in the right column.
+    right_rows: Vec<CurrentTreeRow>,
+    /// Proposal id → row index in `right_rows`.
+    current_file_row_by_id: HashMap<Uuid, usize>,
+    /// Per-file metadata used to draw connectors between both trees.
+    connector_entries: Vec<RightEntry>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -310,19 +319,71 @@ enum TreeRow {
         confidence: f32,
         change_type: ChangeType,
         proposal_id: Uuid,
+        bundle_kind: Option<OverviewBundleKind>,
+        file_count: usize,
     },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OverviewBundleKind {
+    Directory,
+    Collection,
+}
+
+#[derive(Clone)]
+struct OverviewEntry {
+    id: Uuid,
+    proposed_path: PathBuf,
+    proposed_name: String,
+    confidence: f32,
+    change_type: ChangeType,
+    bundle_kind: Option<OverviewBundleKind>,
+    file_count: usize,
+    sources: Vec<OverviewSource>,
+}
+
+#[derive(Clone)]
+struct OverviewSource {
+    id: Uuid,
+    original_path: PathBuf,
+    confidence: f32,
+    rename: bool,
+    bundle_kind: Option<OverviewBundleKind>,
+    file_count: usize,
 }
 
 #[derive(Clone, PartialEq)]
 struct RightEntry {
     proposal_id: Uuid,
+    original_path: PathBuf,
     display_name: String,
     confidence: f32,
     rename: bool,
+    bundle_kind: Option<OverviewBundleKind>,
+    file_count: usize,
 }
 
-fn build_diff_model(proposals: &[ChangeProposal]) -> DiffModel {
-    let parents: Vec<PathBuf> = proposals
+#[derive(Clone, PartialEq)]
+enum CurrentTreeRow {
+    Folder {
+        name: String,
+        depth: usize,
+        file_count: usize,
+    },
+    File {
+        entry: RightEntry,
+        depth: usize,
+    },
+}
+
+fn build_diff_model(
+    proposals: &[ChangeProposal],
+    bundles: &[BundleProposal],
+    explicit_source_root: Option<&Path>,
+    explicit_target_root: Option<&Path>,
+) -> DiffModel {
+    let entries = overview_entries(proposals, bundles);
+    let parents: Vec<PathBuf> = entries
         .iter()
         .map(|p| {
             p.proposed_path
@@ -331,40 +392,43 @@ fn build_diff_model(proposals: &[ChangeProposal]) -> DiffModel {
                 .unwrap_or_default()
         })
         .collect();
-    let original_parents: Vec<PathBuf> = proposals
+    let original_parents: Vec<PathBuf> = entries
         .iter()
-        .filter_map(|proposal| proposal.original_path.parent().map(Path::to_path_buf))
+        .flat_map(|entry| entry.sources.iter())
+        .filter_map(|source| source.original_path.parent().map(Path::to_path_buf))
         .collect();
-    let source_root = common_ancestor(&original_parents);
+    let source_root =
+        explicit_source_root.map_or_else(|| common_ancestor(&original_parents), Path::to_path_buf);
     let proposed_root = common_ancestor(&parents);
     // Scan mode reorganizes in place, so the common source root is the most
     // useful anchor: it keeps the complete destination (`Work/Career`) visible.
     // Migration can target an unrelated hierarchy; in that case retain the
     // proposed common ancestor, backing up one level when every item lands in
     // exactly the same directory so the destination never disappears.
-    let root = if !source_root.as_os_str().is_empty()
-        && parents
-            .iter()
-            .all(|parent| parent.starts_with(&source_root))
-    {
-        source_root
-    } else if !proposed_root.as_os_str().is_empty()
-        && parents.iter().all(|parent| parent == &proposed_root)
-    {
-        proposed_root
-            .parent()
-            .map_or_else(|| proposed_root.clone(), Path::to_path_buf)
-    } else {
-        proposed_root
-    };
-    let root_label = root
-        .file_name()
-        .and_then(|s| s.to_str())
-        .map_or_else(|| root.display().to_string(), ToString::to_string);
-
+    let root = explicit_target_root.map_or_else(
+        || {
+            if explicit_source_root.is_some()
+                || (!source_root.as_os_str().is_empty()
+                    && parents
+                        .iter()
+                        .all(|parent| parent.starts_with(&source_root)))
+            {
+                source_root.clone()
+            } else if !proposed_root.as_os_str().is_empty()
+                && parents.iter().all(|parent| parent == &proposed_root)
+            {
+                proposed_root
+                    .parent()
+                    .map_or_else(|| proposed_root.clone(), Path::to_path_buf)
+            } else {
+                proposed_root
+            }
+        },
+        Path::to_path_buf,
+    );
     // Build tree keyed by relative path components.
     let mut tree = TreeBuilder::default();
-    for (idx, p) in proposals.iter().enumerate() {
+    for (idx, p) in entries.iter().enumerate() {
         let parent = p.proposed_path.parent().unwrap_or_else(|| Path::new(""));
         let rel: Vec<String> = parent
             .strip_prefix(&root)
@@ -377,47 +441,248 @@ fn build_diff_model(proposals: &[ChangeProposal]) -> DiffModel {
             .file_name()
             .and_then(|s| s.to_str())
             .map_or_else(|| p.proposed_name.clone(), ToString::to_string);
-        tree.insert(&rel, filename, idx);
+        tree.insert(&rel, filename, idx, p.file_count);
     }
 
-    let mut left_rows = Vec::new();
+    let total_file_count = overview_file_count(proposals, bundles);
+    let root_label = path_display_name(&root);
+    let mut left_rows = vec![TreeRow::Folder {
+        name: root_label,
+        depth: 0,
+        file_count: total_file_count,
+    }];
     let mut file_row_by_id = HashMap::new();
-    tree.flatten(0, proposals, &mut left_rows, &mut file_row_by_id);
+    tree.flatten(1, &entries, &mut left_rows, &mut file_row_by_id);
+    map_source_rows_to_targets(&entries, &mut file_row_by_id);
+    let connector_entries = build_connector_entries(&entries);
 
-    // Order right entries by corresponding left row index — the key to keeping
-    // bezier curves from spaghetti-ing across each other.
-    let mut right_entries: Vec<RightEntry> = proposals
-        .iter()
-        .map(|p| RightEntry {
-            proposal_id: p.id,
-            display_name: p
-                .original_path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .map_or_else(
-                    || p.original_path.display().to_string(),
-                    ToString::to_string,
-                ),
-            confidence: p.confidence,
-            rename: matches!(
-                p.change_type,
-                ChangeType::Rename | ChangeType::RenameAndMove
-            ),
-        })
-        .collect();
-    right_entries.sort_by_key(|e| {
-        file_row_by_id
-            .get(&e.proposal_id)
-            .copied()
-            .unwrap_or(usize::MAX)
-    });
+    let (right_rows, current_file_row_by_id) = build_current_tree(
+        &source_root,
+        &connector_entries,
+        &file_row_by_id,
+        total_file_count,
+    );
 
     DiffModel {
         left_rows,
         file_row_by_id,
-        right_entries,
-        root_label,
+        right_rows,
+        current_file_row_by_id,
+        connector_entries,
     }
+}
+
+fn map_source_rows_to_targets(
+    entries: &[OverviewEntry],
+    destination_row_by_id: &mut HashMap<Uuid, usize>,
+) {
+    for entry in entries {
+        let Some(&target_row) = destination_row_by_id.get(&entry.id) else {
+            continue;
+        };
+        for source in &entry.sources {
+            destination_row_by_id.insert(source.id, target_row);
+        }
+    }
+}
+
+fn build_connector_entries(entries: &[OverviewEntry]) -> Vec<RightEntry> {
+    entries
+        .iter()
+        .flat_map(|entry| entry.sources.iter())
+        .map(|source| RightEntry {
+            proposal_id: source.id,
+            original_path: source.original_path.clone(),
+            display_name: source
+                .original_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map_or_else(
+                    || source.original_path.display().to_string(),
+                    ToString::to_string,
+                ),
+            confidence: source.confidence,
+            rename: source.rename,
+            bundle_kind: source.bundle_kind,
+            file_count: source.file_count,
+        })
+        .collect()
+}
+
+/// Preserve the original source hierarchy instead of flattening every file
+/// into a filename-only list. The explicit root row makes it clear which files
+/// sit directly in the scan root and which live inside containers.
+fn build_current_tree(
+    source_root: &Path,
+    entries: &[RightEntry],
+    destination_row_by_id: &HashMap<Uuid, usize>,
+    total_file_count: usize,
+) -> (Vec<CurrentTreeRow>, HashMap<Uuid, usize>) {
+    let mut current_tree = TreeBuilder::default();
+    for (idx, entry) in entries.iter().enumerate() {
+        let parent = entry
+            .original_path
+            .parent()
+            .unwrap_or_else(|| Path::new(""));
+        let rel: Vec<String> = parent
+            .strip_prefix(source_root)
+            .unwrap_or(parent)
+            .components()
+            .filter_map(|component| component.as_os_str().to_str().map(ToString::to_string))
+            .collect();
+        let filename = entry
+            .original_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map_or_else(
+                || entry.original_path.display().to_string(),
+                ToString::to_string,
+            );
+        current_tree.insert(&rel, filename, idx, entry.file_count);
+    }
+    let source_root_label = path_display_name(source_root);
+    let mut right_rows = vec![CurrentTreeRow::Folder {
+        name: source_root_label,
+        depth: 0,
+        file_count: total_file_count,
+    }];
+    let mut current_file_row_by_id = HashMap::new();
+    current_tree.flatten_current(
+        1,
+        entries,
+        destination_row_by_id,
+        &mut right_rows,
+        &mut current_file_row_by_id,
+    );
+    (right_rows, current_file_row_by_id)
+}
+
+fn overview_entries(
+    proposals: &[ChangeProposal],
+    bundles: &[BundleProposal],
+) -> Vec<OverviewEntry> {
+    let mut entries = proposals
+        .iter()
+        .map(|proposal| OverviewEntry {
+            id: proposal.id,
+            proposed_path: proposal.proposed_path.clone(),
+            proposed_name: proposal.proposed_name.clone(),
+            confidence: proposal.confidence,
+            change_type: proposal.change_type.clone(),
+            bundle_kind: None,
+            file_count: 1,
+            sources: vec![OverviewSource {
+                id: proposal.id,
+                original_path: proposal.original_path.clone(),
+                confidence: proposal.confidence,
+                rename: matches!(
+                    proposal.change_type,
+                    ChangeType::Rename | ChangeType::RenameAndMove
+                ),
+                bundle_kind: None,
+                file_count: 1,
+            }],
+        })
+        .collect::<Vec<_>>();
+    entries.extend(bundles.iter().filter_map(collapsed_bundle_entry));
+    entries
+}
+
+fn collapsed_bundle_entry(bundle: &BundleProposal) -> Option<OverviewEntry> {
+    let file_count = bundle.members.len();
+    let label = match &bundle.kind {
+        tidyup_domain::BundleKind::SemanticCollection { label } => label.clone(),
+        _ => path_display_name(&bundle.root),
+    };
+    let (proposed_path, bundle_kind) = if bundle.kind.moves_as_file_set() {
+        let proposed_parents = bundle
+            .members
+            .iter()
+            .filter_map(|member| member.proposed_path.parent().map(Path::to_path_buf))
+            .collect::<Vec<_>>();
+        let proposed_path = common_ancestor(&proposed_parents);
+        (proposed_path, OverviewBundleKind::Collection)
+    } else {
+        let leaf = bundle.root.file_name()?;
+        (
+            bundle.target_parent.join(leaf),
+            OverviewBundleKind::Directory,
+        )
+    };
+
+    let moves = if bundle.kind.moves_as_file_set() {
+        bundle
+            .members
+            .iter()
+            .any(|member| member.original_path != member.proposed_path)
+    } else {
+        bundle.root != proposed_path
+    };
+    let sources = if bundle.kind.moves_as_file_set() {
+        bundle
+            .members
+            .iter()
+            .map(|member| OverviewSource {
+                id: member.id,
+                original_path: member.original_path.clone(),
+                confidence: member.confidence,
+                rename: matches!(
+                    member.change_type,
+                    ChangeType::Rename | ChangeType::RenameAndMove
+                ),
+                bundle_kind: None,
+                file_count: 1,
+            })
+            .collect()
+    } else {
+        vec![OverviewSource {
+            id: bundle.id,
+            original_path: bundle.root.clone(),
+            confidence: bundle.confidence,
+            rename: false,
+            bundle_kind: Some(OverviewBundleKind::Directory),
+            file_count,
+        }]
+    };
+    moves.then_some(OverviewEntry {
+        id: bundle.id,
+        proposed_path,
+        proposed_name: label,
+        confidence: bundle.confidence,
+        change_type: ChangeType::Move,
+        bundle_kind: Some(bundle_kind),
+        file_count,
+        sources,
+    })
+}
+
+fn overview_file_count(proposals: &[ChangeProposal], bundles: &[BundleProposal]) -> usize {
+    bundles.iter().fold(proposals.len(), |count, bundle| {
+        count.saturating_add(bundle.members.len())
+    })
+}
+
+fn overview_locked_ids(bundles: &[BundleProposal]) -> Vec<Uuid> {
+    bundles
+        .iter()
+        .flat_map(|bundle| {
+            if bundle.kind.moves_as_file_set() {
+                bundle
+                    .members
+                    .iter()
+                    .map(|member| member.id)
+                    .collect::<Vec<_>>()
+            } else {
+                vec![bundle.id]
+            }
+        })
+        .collect()
+}
+
+fn path_display_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map_or_else(|| path.display().to_string(), ToString::to_string)
 }
 
 fn common_ancestor(paths: &[PathBuf]) -> PathBuf {
@@ -448,30 +713,36 @@ fn common_ancestor(paths: &[PathBuf]) -> PathBuf {
 #[derive(Default)]
 struct TreeBuilder {
     folders: BTreeMap<String, Self>,
-    files: Vec<(String, usize)>, // (filename, proposal index)
+    files: Vec<(String, usize, usize)>, // (name, overview-entry index, represented files)
+}
+
+enum CurrentChild<'a> {
+    Folder(&'a str, &'a TreeBuilder),
+    File(&'a str, usize),
 }
 
 impl TreeBuilder {
-    fn insert(&mut self, folders: &[String], filename: String, idx: usize) {
+    fn insert(&mut self, folders: &[String], filename: String, idx: usize, file_count: usize) {
         let mut node = self;
         for folder in folders {
             node = node.folders.entry(folder.clone()).or_default();
         }
-        node.files.push((filename, idx));
+        node.files.push((filename, idx, file_count));
     }
 
     fn file_count(&self) -> usize {
-        self.folders
-            .values()
-            .fold(self.files.len(), |count, folder| {
-                count.saturating_add(folder.file_count())
-            })
+        self.folders.values().fold(
+            self.files
+                .iter()
+                .fold(0_usize, |count, (_, _, files)| count.saturating_add(*files)),
+            |count, folder| count.saturating_add(folder.file_count()),
+        )
     }
 
     fn flatten(
         &self,
         depth: usize,
-        proposals: &[ChangeProposal],
+        proposals: &[OverviewEntry],
         rows: &mut Vec<TreeRow>,
         file_row_by_id: &mut HashMap<Uuid, usize>,
     ) {
@@ -485,7 +756,7 @@ impl TreeBuilder {
         }
         let mut files = self.files.clone();
         files.sort_by(|a, b| a.0.cmp(&b.0));
-        for (name, idx) in files {
+        for (name, idx, _) in files {
             let Some(p) = proposals.get(idx) else {
                 continue;
             };
@@ -496,8 +767,104 @@ impl TreeBuilder {
                 confidence: p.confidence,
                 change_type: p.change_type.clone(),
                 proposal_id: p.id,
+                bundle_kind: p.bundle_kind,
+                file_count: p.file_count,
             });
             file_row_by_id.insert(p.id, row_idx);
+        }
+    }
+
+    fn flatten_current(
+        &self,
+        depth: usize,
+        entries: &[RightEntry],
+        destination_row_by_id: &HashMap<Uuid, usize>,
+        rows: &mut Vec<CurrentTreeRow>,
+        file_row_by_id: &mut HashMap<Uuid, usize>,
+    ) {
+        let mut children: Vec<CurrentChild<'_>> = self
+            .folders
+            .iter()
+            .map(|(name, child)| CurrentChild::Folder(name, child))
+            .chain(
+                self.files
+                    .iter()
+                    .map(|(name, idx, _)| CurrentChild::File(name, *idx)),
+            )
+            .collect();
+        children.sort_by(|a, b| {
+            a.destination_rank(entries, destination_row_by_id)
+                .cmp(&b.destination_rank(entries, destination_row_by_id))
+                .then_with(|| a.name().cmp(b.name()))
+        });
+
+        for child in children {
+            match child {
+                CurrentChild::Folder(name, child) => {
+                    rows.push(CurrentTreeRow::Folder {
+                        name: name.to_string(),
+                        depth,
+                        file_count: child.file_count(),
+                    });
+                    child.flatten_current(
+                        depth.saturating_add(1),
+                        entries,
+                        destination_row_by_id,
+                        rows,
+                        file_row_by_id,
+                    );
+                }
+                CurrentChild::File(_, idx) => {
+                    let Some(entry) = entries.get(idx).cloned() else {
+                        continue;
+                    };
+                    file_row_by_id.insert(entry.proposal_id, rows.len());
+                    rows.push(CurrentTreeRow::File { entry, depth });
+                }
+            }
+        }
+    }
+
+    fn minimum_destination_rank(
+        &self,
+        entries: &[RightEntry],
+        destination_row_by_id: &HashMap<Uuid, usize>,
+    ) -> usize {
+        self.files
+            .iter()
+            .filter_map(|(_, idx, _)| entries.get(*idx))
+            .filter_map(|entry| destination_row_by_id.get(&entry.proposal_id).copied())
+            .chain(
+                self.folders
+                    .values()
+                    .map(|folder| folder.minimum_destination_rank(entries, destination_row_by_id)),
+            )
+            .min()
+            .unwrap_or(usize::MAX)
+    }
+}
+
+impl CurrentChild<'_> {
+    const fn name(&self) -> &str {
+        match self {
+            Self::Folder(name, _) | Self::File(name, _) => name,
+        }
+    }
+
+    fn destination_rank(
+        &self,
+        entries: &[RightEntry],
+        destination_row_by_id: &HashMap<Uuid, usize>,
+    ) -> usize {
+        match self {
+            Self::Folder(_, folder) => {
+                folder.minimum_destination_rank(entries, destination_row_by_id)
+            }
+            Self::File(_, idx) => entries
+                .get(*idx)
+                .and_then(|entry| destination_row_by_id.get(&entry.proposal_id))
+                .copied()
+                .unwrap_or(usize::MAX),
         }
     }
 }
@@ -682,6 +1049,8 @@ fn execute_combined_with_threshold(state: &SharedState, threshold: f32) {
 struct ConnectorRender {
     id: Uuid,
     d: String,
+    left_row: usize,
+    right_row: usize,
     strong: bool,
     dashed: bool,
 }
@@ -707,6 +1076,33 @@ fn decision_state_of(
     }
 }
 
+fn approve_proposal(signals: SignalBundle, proposal_id: Uuid) {
+    let decision = signals
+        .proposals
+        .read()
+        .iter()
+        .find(|proposal| proposal.id == proposal_id)
+        .map_or(ReviewDecision::Approve(proposal_id), approval_decision);
+    let mut decisions = signals.decisions;
+    decisions.with_mut(|items| {
+        items.insert(proposal_id, decision);
+    });
+}
+
+fn approval_decision(proposal: &ChangeProposal) -> ReviewDecision {
+    if matches!(
+        proposal.change_type,
+        ChangeType::Rename | ChangeType::RenameAndMove
+    ) {
+        ReviewDecision::Override {
+            proposal_id: proposal.id,
+            new_target: proposal.proposed_path.clone(),
+        }
+    } else {
+        ReviewDecision::Approve(proposal.id)
+    }
+}
+
 const fn row_state_class(state: DecisionState) -> &'static str {
     match state {
         DecisionState::Approved => " row-approved",
@@ -725,26 +1121,36 @@ fn DiffView(
 ) -> Element {
     let locked_ids: HashSet<Uuid> = locked_ids.into_iter().collect();
     let left_height = rows_to_height(model.left_rows.len());
-    let right_height = rows_to_height(model.right_entries.len());
+    let right_height = rows_to_height(model.right_rows.len());
     let svg_height = left_height.max(right_height);
+    let viewport_height = svg_height.min(600);
 
     let connectors: Vec<ConnectorRender> = model
-        .right_entries
+        .connector_entries
         .iter()
-        .enumerate()
-        .filter_map(|(right_idx, entry)| {
+        .filter_map(|entry| {
             let &left_idx = model.file_row_by_id.get(&entry.proposal_id)?;
+            let &right_idx = model.current_file_row_by_id.get(&entry.proposal_id)?;
             let ly = row_center_y(left_idx);
             let ry = row_center_y(right_idx);
             let d = format!("M 0 {ly} C 50 {ly}, 50 {ry}, 100 {ry}");
             Some(ConnectorRender {
                 id: entry.proposal_id,
                 d,
+                left_row: left_idx,
+                right_row: right_idx,
                 strong: entry.confidence >= 0.80,
                 dashed: entry.rename,
             })
         })
         .collect();
+
+    let focus_id_by_left_row = connectors
+        .iter()
+        .fold(HashMap::new(), |mut ids, connector| {
+            ids.entry(connector.left_row).or_insert(connector.id);
+            ids
+        });
 
     let hovered_id = *hovered.read();
     let selected_id = *selected.read();
@@ -754,44 +1160,60 @@ fn DiffView(
     // element across renders even if ordering shifts.
     let left_rows = model.left_rows.clone();
 
+    use_effect(move || {
+        spawn(async move {
+            let _ = document::eval(PLAN_OVERVIEW_FOCUS_SCRIPT).await;
+        });
+    });
+
     rsx! {
         div {
             class: "diff-view",
+            id: "plan-overview-diff",
+            style: "--diff-viewport-height: {viewport_height}px;",
             div {
                 class: "diff-col diff-proposed",
                 div { class: "diff-col-header", "PROPOSED STRUCTURE" }
                 div {
-                    class: "diff-col-body",
-                    style: "height: {left_height}px;",
-                    for (i, row) in left_rows.iter().enumerate() {
-                        TreeRowView {
-                            key: "{tree_row_key(i, row)}",
-                            row: row.clone(),
-                            hovered,
-                            selected,
-                            signals,
+                    class: "diff-scroll-pane",
+                    div {
+                        class: "diff-col-body",
+                        style: "height: {left_height}px;",
+                        for (i, row) in left_rows.iter().enumerate() {
+                            TreeRowView {
+                                key: "{tree_row_key(i, row)}",
+                                row: row.clone(),
+                                row_index: i,
+                                focus_id: focus_id_by_left_row.get(&i).copied(),
+                                hovered,
+                                selected,
+                                signals,
+                            }
                         }
                     }
                 }
             }
             div {
                 class: "diff-gap",
-                style: "height: {svg_height}px;",
-                svg {
-                    class: "diff-overlay",
-                    width: "100%",
-                    height: "{svg_height}",
-                    view_box: "0 0 100 {svg_height}",
-                    preserve_aspect_ratio: "none",
-                    for c in connectors.iter().cloned() {
-                        ConnectorPath {
-                            key: "{c.id}",
-                            connector: c,
-                            hovered,
-                            selected,
-                            hovered_id,
-                            selected_id,
-                            signals,
+                div { class: "diff-gap-header" }
+                div {
+                    class: "diff-gap-viewport",
+                    svg {
+                        class: "diff-overlay",
+                        width: "100%",
+                        height: "{viewport_height}",
+                        view_box: "0 0 100 {viewport_height}",
+                        preserve_aspect_ratio: "none",
+                        for c in connectors.iter().cloned() {
+                            ConnectorPath {
+                                key: "{c.id}",
+                                connector: c,
+                                hovered,
+                                selected,
+                                hovered_id,
+                                selected_id,
+                                signals,
+                            }
                         }
                     }
                 }
@@ -800,20 +1222,33 @@ fn DiffView(
                 class: "diff-col diff-current",
                 div { class: "diff-col-header", "CURRENT STORAGE" }
                 div {
-                    class: "diff-col-body",
-                    style: "height: {right_height}px;",
-                    for entry in model.right_entries.iter().cloned() {
-                        CurrentRow {
-                            key: "{entry.proposal_id}",
-                            locked: locked_ids.contains(&entry.proposal_id),
-                            entry,
-                            hovered,
-                            selected,
-                            signals,
+                    class: "diff-scroll-pane",
+                    div {
+                        class: "diff-col-body",
+                        style: "height: {right_height}px;",
+                        for (i, row) in model.right_rows.iter().cloned().enumerate() {
+                            CurrentTreeRowView {
+                                key: "{current_tree_row_key(i, &row)}",
+                                row,
+                                row_index: i,
+                                locked_ids: locked_ids.clone(),
+                                hovered,
+                                selected,
+                                signals,
+                            }
                         }
                     }
                 }
             }
+        }
+    }
+}
+
+fn current_tree_row_key(i: usize, row: &CurrentTreeRow) -> String {
+    match row {
+        CurrentTreeRow::File { entry, .. } => format!("current-file-{}", entry.proposal_id),
+        CurrentTreeRow::Folder { name, depth, .. } => {
+            format!("current-folder-{i}-{depth}-{name}")
         }
     }
 }
@@ -834,6 +1269,96 @@ fn toggle_selection(mut signal: Signal<Option<Uuid>>, id: Uuid) {
         signal.set(Some(id));
     }
 }
+
+fn center_overview_connection(id: Uuid) {
+    let script = format!("window.tidyupFocusConnection?.('{id}')");
+    spawn(async move {
+        let _ = document::eval(&script).await;
+    });
+}
+
+const PLAN_OVERVIEW_FOCUS_SCRIPT: &str = r#"
+(() => {
+    const root = document.getElementById('plan-overview-diff');
+    if (!root) return;
+
+    const panes = [...root.querySelectorAll('.diff-scroll-pane')];
+    const overlay = root.querySelector('.diff-overlay');
+    if (panes.length !== 2 || !overlay) return;
+
+    const updateConnectors = () => {
+        const overlayRect = overlay.getBoundingClientRect();
+        root.querySelectorAll('.diff-hit').forEach((hit) => {
+            const left = root.querySelector(`.diff-proposed [data-row-index="${hit.dataset.leftRow}"]`);
+            const right = root.querySelector(`.diff-current [data-row-index="${hit.dataset.rightRow}"]`);
+            if (!left || !right) return;
+            const leftRect = left.getBoundingClientRect();
+            const rightRect = right.getBoundingClientRect();
+            const ly = leftRect.top + leftRect.height / 2 - overlayRect.top;
+            const ry = rightRect.top + rightRect.height / 2 - overlayRect.top;
+            const d = `M 0 ${ly} C 50 ${ly}, 50 ${ry}, 100 ${ry}`;
+            root.querySelectorAll(`[data-connector-id="${hit.dataset.connectorId}"]`)
+                .forEach((path) => path.setAttribute('d', d));
+        });
+    };
+
+    if (!root.dataset.focusReady) {
+        root.dataset.focusReady = 'true';
+        panes.forEach((pane) => {
+            pane.scrollTop = Math.max(0, (pane.clientHeight - 42) / 2);
+            let scheduled = false;
+            pane.addEventListener('scroll', () => {
+                if (scheduled) return;
+                scheduled = true;
+                requestAnimationFrame(() => {
+                    scheduled = false;
+                    updateConnectors();
+                });
+            }, { passive: true });
+        });
+        root.addEventListener('wheel', (event) => {
+            if (!event.target.closest('.diff-scroll-pane, .diff-gap-viewport')) return;
+            if (Math.abs(event.deltaY) <= Math.abs(event.deltaX)) return;
+            const canMove = panes.some((pane) => event.deltaY < 0
+                ? pane.scrollTop > 0
+                : pane.scrollTop + pane.clientHeight < pane.scrollHeight - 1);
+            if (!canMove) return;
+            event.preventDefault();
+            panes.forEach((pane) => {
+                pane.scrollTop += event.deltaY;
+            });
+        }, { passive: false });
+        new ResizeObserver(updateConnectors).observe(root);
+    }
+
+    window.tidyupFocusConnection = (id) => {
+        const connector = root.querySelector(`.diff-hit[data-connector-id="${id}"]`);
+        if (!connector) return;
+        const rows = [
+            root.querySelector(`.diff-proposed [data-row-index="${connector.dataset.leftRow}"]`),
+            root.querySelector(`.diff-current [data-row-index="${connector.dataset.rightRow}"]`),
+        ];
+        const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+        panes.forEach((pane, index) => {
+            const row = rows[index];
+            if (!row) return;
+            const paneRect = pane.getBoundingClientRect();
+            const rowRect = row.getBoundingClientRect();
+            const top = pane.scrollTop + rowRect.top + rowRect.height / 2
+                - paneRect.top - paneRect.height / 2;
+            pane.scrollTo({ top, behavior: reduceMotion ? 'auto' : 'smooth' });
+        });
+        const started = performance.now();
+        const animate = (now) => {
+            updateConnectors();
+            if (now - started < 700) requestAnimationFrame(animate);
+        };
+        requestAnimationFrame(animate);
+    };
+
+    requestAnimationFrame(updateConnectors);
+})();
+"#;
 
 #[component]
 fn ConnectorPath(
@@ -880,7 +1405,10 @@ fn ConnectorPath(
         let mut h = hovered;
         h.set(None);
     };
-    let on_click = move |_| toggle_selection(selected, conn_id);
+    let on_click = move |_| {
+        toggle_selection(selected, conn_id);
+        center_overview_connection(conn_id);
+    };
 
     rsx! {
         // Invisible fat "hit area" so the thin visible stroke is easier to
@@ -888,6 +1416,9 @@ fn ConnectorPath(
         path {
             class: "diff-hit",
             d: "{connector.d}",
+            "data-connector-id": "{connector.id}",
+            "data-left-row": "{connector.left_row}",
+            "data-right-row": "{connector.right_row}",
             fill: "none",
             stroke: "transparent",
             stroke_width: "14",
@@ -899,6 +1430,7 @@ fn ConnectorPath(
         path {
             class: "diff-stroke",
             d: "{connector.d}",
+            "data-connector-id": "{connector.id}",
             fill: "none",
             stroke: stroke,
             stroke_width: stroke_width,
@@ -911,6 +1443,8 @@ fn ConnectorPath(
 #[component]
 fn TreeRowView(
     row: TreeRow,
+    row_index: usize,
+    focus_id: Option<Uuid>,
     hovered: Signal<Option<Uuid>>,
     selected: Signal<Option<Uuid>>,
     signals: SignalBundle,
@@ -925,6 +1459,7 @@ fn TreeRowView(
             rsx! {
                 div {
                     class: "tree-row tree-folder",
+                    "data-row-index": "{row_index}",
                     style: "padding-left: {pad}px;",
                     span { class: "tree-caret", "▸" }
                     span { class: "tree-folder-name", "{name}/" }
@@ -941,18 +1476,25 @@ fn TreeRowView(
             confidence,
             change_type,
             proposal_id,
+            bundle_kind,
+            file_count,
         } => {
             let pad = depth.saturating_mul(24).saturating_add(12);
             let chip = confidence_chip(confidence);
             let is_rename = matches!(change_type, ChangeType::Rename | ChangeType::RenameAndMove);
+            let interaction_id = focus_id.unwrap_or(proposal_id);
 
             let hovered_id = *hovered.read();
             let selected_id = *selected.read();
-            let is_hovered = hovered_id == Some(proposal_id);
-            let is_selected = selected_id == Some(proposal_id);
+            let is_hovered = hovered_id == Some(interaction_id);
+            let is_selected = selected_id == Some(interaction_id);
             let state = decision_state_of(&signals.decisions.read(), proposal_id);
 
-            let mut row_class = String::from("tree-row tree-file");
+            let mut row_class = if bundle_kind.is_some() {
+                String::from("tree-row tree-folder tree-bundle")
+            } else {
+                String::from("tree-row tree-file")
+            };
             row_class.push_str(row_state_class(state));
             if is_hovered {
                 row_class.push_str(" row-hovered");
@@ -963,28 +1505,41 @@ fn TreeRowView(
 
             let on_enter = move |_| {
                 let mut h = hovered;
-                h.set(Some(proposal_id));
+                h.set(Some(interaction_id));
             };
             let on_leave = move |_| {
                 let mut h = hovered;
                 h.set(None);
             };
-            let on_click = move |_| toggle_selection(selected, proposal_id);
+            let on_click = move |_| {
+                toggle_selection(selected, interaction_id);
+                center_overview_connection(interaction_id);
+            };
 
             rsx! {
                 div {
                     class: "{row_class}",
+                    "data-row-index": "{row_index}",
                     style: "padding-left: {pad}px;",
                     onmouseenter: on_enter,
                     onmouseleave: on_leave,
                     onclick: on_click,
-                    span { class: "tree-file-name", "{name}" }
-                    span {
-                        class: "tree-row-meta",
-                        if is_rename {
-                            span { class: "chip chip-neutral", "rename" }
+                    if bundle_kind.is_some() {
+                        span { class: "tree-caret", "▸" }
+                        span { class: "tree-folder-name", title: "{name}", "{name}/" }
+                        span {
+                            class: "tree-filecount",
+                            if file_count == 1 { "1 file" } else { "{file_count} files" }
                         }
-                        span { class: "chip {chip.0} tree-confidence", "{chip.1}" }
+                    } else {
+                        span { class: "tree-file-name", title: "{name}", "{name}" }
+                        span {
+                            class: "tree-row-meta",
+                            if is_rename {
+                                span { class: "chip chip-neutral", "rename" }
+                            }
+                            span { class: "chip {chip.0} tree-confidence", "{chip.1}" }
+                        }
                     }
                 }
             }
@@ -995,6 +1550,8 @@ fn TreeRowView(
 #[component]
 fn CurrentRow(
     entry: RightEntry,
+    depth: usize,
+    row_index: usize,
     hovered: Signal<Option<Uuid>>,
     selected: Signal<Option<Uuid>>,
     signals: SignalBundle,
@@ -1006,7 +1563,11 @@ fn CurrentRow(
     let is_selected = selected_id == Some(entry.proposal_id);
     let state = decision_state_of(&signals.decisions.read(), entry.proposal_id);
 
-    let mut row_class = String::from("current-row");
+    let mut row_class = if entry.bundle_kind.is_some() {
+        String::from("current-row current-bundle")
+    } else {
+        String::from("current-row")
+    };
     row_class.push_str(row_state_class(state));
     if is_hovered {
         row_class.push_str(" row-hovered");
@@ -1024,14 +1585,14 @@ fn CurrentRow(
         let mut h = hovered;
         h.set(None);
     };
-    let on_click = move |_| toggle_selection(selected, pid);
+    let on_click = move |_| {
+        toggle_selection(selected, pid);
+        center_overview_connection(pid);
+    };
 
     let on_approve = move |ev: MouseEvent| {
         ev.stop_propagation(); // don't also toggle the row selection
-        let mut d = signals.decisions;
-        d.with_mut(|map| {
-            map.insert(pid, ReviewDecision::Approve(pid));
-        });
+        approve_proposal(signals, pid);
     };
     let on_reject = move |ev: MouseEvent| {
         ev.stop_propagation();
@@ -1056,10 +1617,29 @@ fn CurrentRow(
     rsx! {
         div {
             class: "{row_class}",
+            "data-row-index": "{row_index}",
+            style: "padding-left: {depth.saturating_mul(24).saturating_add(12)}px;",
             onmouseenter: on_enter,
             onmouseleave: on_leave,
             onclick: on_click,
-            span { class: "current-name", "{entry.display_name}" }
+            if let Some(bundle_kind) = entry.bundle_kind {
+                span { class: "tree-caret", "▸" }
+                span {
+                    class: "current-name",
+                    title: "{entry.display_name}",
+                    if bundle_kind == OverviewBundleKind::Directory {
+                        "{entry.display_name}/"
+                    } else {
+                        "{entry.display_name} collection"
+                    }
+                }
+                span {
+                    class: "tree-filecount",
+                    if entry.file_count == 1 { "1 file" } else { "{entry.file_count} files" }
+                }
+            } else {
+                span { class: "current-name", title: "{entry.display_name}", "{entry.display_name}" }
+            }
             if is_selected && !locked {
                 span {
                     class: "current-actions",
@@ -1079,6 +1659,45 @@ fn CurrentRow(
             }
             if is_selected && locked {
                 span { class: "chip chip-neutral", "approve with collection" }
+            }
+        }
+    }
+}
+
+#[component]
+fn CurrentTreeRowView(
+    row: CurrentTreeRow,
+    row_index: usize,
+    hovered: Signal<Option<Uuid>>,
+    selected: Signal<Option<Uuid>>,
+    signals: SignalBundle,
+    locked_ids: HashSet<Uuid>,
+) -> Element {
+    match row {
+        CurrentTreeRow::Folder {
+            name,
+            depth,
+            file_count,
+        } => {
+            let pad = depth.saturating_mul(24).saturating_add(12);
+            rsx! {
+                div {
+                    class: "tree-row tree-folder current-folder",
+                    "data-row-index": "{row_index}",
+                    style: "padding-left: {pad}px;",
+                    span { class: "tree-caret", "▸" }
+                    span { class: "tree-folder-name", title: "{name}", "{name}/" }
+                    span {
+                        class: "tree-filecount",
+                        if file_count == 1 { "1 file" } else { "{file_count} files" }
+                    }
+                }
+            }
+        }
+        CurrentTreeRow::File { entry, depth } => {
+            let locked = locked_ids.contains(&entry.proposal_id);
+            rsx! {
+                CurrentRow { entry, depth, row_index, hovered, selected, signals, locked }
             }
         }
     }
@@ -1162,7 +1781,10 @@ fn ProposalCard(proposal: ChangeProposal, signals: SignalBundle) -> Element {
     let state = decision_state_of(&decisions.read(), proposal.id);
 
     let from = proposal.original_path.display().to_string();
-    let to = proposal.proposed_path.display().to_string();
+    let destination = proposal
+        .proposed_path
+        .parent()
+        .map_or_else(String::new, |path| path.display().to_string());
     let conf = proposal.confidence;
     let chip = confidence_chip(conf);
 
@@ -1181,13 +1803,7 @@ fn ProposalCard(proposal: ChangeProposal, signals: SignalBundle) -> Element {
     let change_label = proposal.change_type.label();
 
     let on_approve = move |_| {
-        let mut d = decisions;
-        d.with_mut(|map| {
-            map.insert(
-                proposal_id,
-                tidyup_domain::ReviewDecision::Approve(proposal_id),
-            );
-        });
+        approve_proposal(signals, proposal_id);
     };
     let on_reject = move |_| {
         let mut d = decisions;
@@ -1217,17 +1833,21 @@ fn ProposalCard(proposal: ChangeProposal, signals: SignalBundle) -> Element {
                 class: "proposal-meta",
                 div {
                     class: "proposal-target",
-                    "{proposal.proposed_name}"
+                    title: "{from}",
+                    "{proposal.original_path.file_name().and_then(|name| name.to_str()).unwrap_or(\"File\")}"
                 }
                 div {
                     class: "proposal-path",
                     "{from}"
                     span { class: "proposal-arrow", " → " }
-                    "{to}"
+                    "{destination}/ (1 file)"
                 }
                 div {
                     class: "proposal-reason",
                     "{proposal.reasoning}"
+                }
+                if is_rename {
+                    ProposalRenameEditor { proposal: proposal.clone(), signals }
                 }
                 div {
                     class: "button-row small",
@@ -1259,6 +1879,138 @@ fn ProposalCard(proposal: ChangeProposal, signals: SignalBundle) -> Element {
     }
 }
 
+#[component]
+fn ProposalRenameEditor(proposal: ChangeProposal, signals: SignalBundle) -> Element {
+    let mut validation_error = use_signal(|| None::<String>);
+    let proposal_id = proposal.id;
+    let proposed_name = proposal.proposed_name.clone();
+    let original_name = proposal
+        .original_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let on_input = move |event: Event<FormData>| {
+        validation_error.set(
+            update_loose_proposal_name(signals, proposal_id, &event.value())
+                .err()
+                .map(str::to_string),
+        );
+    };
+    let validation_message = validation_error.read().clone();
+    rsx! {
+        div {
+            class: "semantic-members",
+            style: "margin-top: 12px; display: grid; gap: 8px;",
+            FilenameRenameEditor {
+                original: original_name.clone(),
+                proposed: proposed_name,
+                validation_message,
+                aria_label: format!("Proposed filename for {original_name}"),
+                oninput: on_input,
+            }
+        }
+    }
+}
+
+fn update_loose_proposal_name(
+    signals: SignalBundle,
+    proposal_id: Uuid,
+    raw_name: &str,
+) -> Result<(), &'static str> {
+    let proposals = signals.proposals.read();
+    let name = validate_loose_proposal_name(&proposals, proposal_id, raw_name)?;
+    drop(proposals);
+
+    let mut updated_target = None;
+    let mut proposals = signals.proposals;
+    proposals.with_mut(|items| {
+        let Some(proposal) = items.iter_mut().find(|proposal| proposal.id == proposal_id) else {
+            return;
+        };
+        proposal.proposed_name.clone_from(&name);
+        proposal.proposed_path.set_file_name(&name);
+        proposal.change_type =
+            change_type_for_paths(&proposal.original_path, &proposal.proposed_path);
+        updated_target = Some(proposal.proposed_path.clone());
+    });
+
+    if let Some(new_target) = updated_target {
+        let mut decisions = signals.decisions;
+        decisions.with_mut(|items| {
+            if matches!(
+                items.get(&proposal_id),
+                Some(ReviewDecision::Approve(_) | ReviewDecision::Override { .. })
+            ) {
+                items.insert(
+                    proposal_id,
+                    ReviewDecision::Override {
+                        proposal_id,
+                        new_target,
+                    },
+                );
+            }
+        });
+    }
+    Ok(())
+}
+
+fn validate_loose_proposal_name(
+    proposals: &[ChangeProposal],
+    proposal_id: Uuid,
+    raw_name: &str,
+) -> Result<String, &'static str> {
+    let proposal = proposals
+        .iter()
+        .find(|proposal| proposal.id == proposal_id)
+        .ok_or("This proposal is no longer available.")?;
+    let name = raw_name.trim();
+    if name.is_empty() {
+        return Err("Filename cannot be empty.");
+    }
+    if name == "." || name == ".." || name.contains('/') || name.contains('\\') {
+        return Err("Enter a filename, not a path.");
+    }
+
+    let expected_extension = Path::new(&proposal.proposed_name)
+        .extension()
+        .and_then(|extension| extension.to_str());
+    let supplied_extension = Path::new(name)
+        .extension()
+        .and_then(|extension| extension.to_str());
+    if !extensions_match(expected_extension, supplied_extension) {
+        return Err("Filename extension must stay the same.");
+    }
+
+    let destination_parent = proposal.proposed_path.parent();
+    if proposals.iter().any(|other| {
+        other.id != proposal_id
+            && other.proposed_path.parent() == destination_parent
+            && other.proposed_name.eq_ignore_ascii_case(name)
+    }) {
+        return Err("Another proposal in this folder already uses that filename.");
+    }
+    Ok(name.to_string())
+}
+
+const fn extensions_match(expected: Option<&str>, supplied: Option<&str>) -> bool {
+    match (expected, supplied) {
+        (Some(expected), Some(supplied)) => expected.eq_ignore_ascii_case(supplied),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn change_type_for_paths(original: &Path, proposed: &Path) -> ChangeType {
+    let renamed = original.file_name() != proposed.file_name();
+    let moved = original.parent() != proposed.parent();
+    match (renamed, moved) {
+        (true, true) => ChangeType::RenameAndMove,
+        (true, false) => ChangeType::Rename,
+        _ => ChangeType::Move,
+    }
+}
+
 /// Unified review surface for individual changes and atomic bundles.
 #[component]
 fn CombinedReview(state: SharedState) -> Element {
@@ -1283,17 +2035,15 @@ fn CombinedReview(state: SharedState) -> Element {
     let total_files = loose_count.saturating_add(collection_files);
     let indexed_count = usize::try_from(*signals.indexed_count.read()).unwrap_or(usize::MAX);
     let approved_n = approvals.values().filter(|v| **v).count();
-    let mut plan_changes = proposals.clone();
-    let locked_ids: Vec<Uuid> = bundles
-        .iter()
-        .flat_map(|bundle| bundle.members.iter().map(|member| member.id))
-        .collect();
-    plan_changes.extend(
-        bundles
-            .iter()
-            .flat_map(|bundle| bundle.members.iter().cloned()),
+    let locked_ids = overview_locked_ids(&bundles);
+    let source_root = signals.review_source_root.read().clone();
+    let target_root = signals.review_target_root.read().clone();
+    let model = build_diff_model(
+        &proposals,
+        &bundles,
+        source_root.as_deref(),
+        target_root.as_deref(),
     );
-    let model = build_diff_model(&plan_changes);
     let hovered = use_signal(|| Option::<Uuid>::None);
     let selected = use_signal(|| Option::<Uuid>::None);
 
@@ -1356,22 +2106,15 @@ fn CombinedReview(state: SharedState) -> Element {
             div { class: "section-heading", style: "margin-top: 24px;", "PLAN OVERVIEW" }
             DiffView { model, hovered, selected, signals, locked_ids }
             DiffLegend {}
-            div { class: "section-heading", style: "margin-top: 24px;", "ATOMIC DIRECTORIES & COLLECTIONS" }
+            div { class: "section-heading", style: "margin-top: 24px;", "CHANGES" }
             div {
                 class: "card-stack",
                 style: "margin-top: 16px;",
                 for b in bundles.iter().cloned() {
                     BundleReviewCard { key: "{b.id}", bundle: b, signals }
                 }
-            }
-            if !proposals.is_empty() {
-                div { class: "section-heading", style: "margin-top: 24px;", "INDIVIDUAL CHANGES" }
-                div {
-                    class: "card-stack",
-                    style: "margin-top: 16px;",
-                    for proposal in proposals.iter().cloned() {
-                        ProposalCard { key: "{proposal.id}", proposal, signals }
-                    }
+                for proposal in proposals.iter().cloned() {
+                    ProposalCard { key: "{proposal.id}", proposal, signals }
                 }
             }
         }
@@ -1529,6 +2272,25 @@ fn SemanticMemberEditor(bundle_id: Uuid, member: ChangeProposal, signals: Signal
         );
     };
     let validation_message = validation_error.read().clone();
+    rsx! {
+        FilenameRenameEditor {
+            original: original.clone(),
+            proposed,
+            validation_message,
+            aria_label: format!("Proposed filename for {original}"),
+            oninput: on_input,
+        }
+    }
+}
+
+#[component]
+fn FilenameRenameEditor(
+    original: String,
+    proposed: String,
+    validation_message: Option<String>,
+    aria_label: String,
+    oninput: EventHandler<Event<FormData>>,
+) -> Element {
     let invalid = validation_message.is_some();
     let input_class = if invalid {
         "path-input input-error"
@@ -1545,8 +2307,9 @@ fn SemanticMemberEditor(bundle_id: Uuid, member: ChangeProposal, signals: Signal
                 r#type: "text",
                 class: "{input_class}",
                 value: "{proposed}",
-                oninput: on_input,
-                aria_label: "Proposed filename for {original}",
+                title: "{proposed}",
+                oninput: move |event| oninput.call(event),
+                aria_label,
                 aria_invalid: invalid,
             }
             if let Some(ref message) = validation_message {
@@ -2276,6 +3039,10 @@ fn launch_scan(state: &SharedState, source: PathBuf, dry_run: bool) {
     let activation = current_activation(signals);
 
     reset_run_state(signals);
+    let mut review_source_root = signals.review_source_root;
+    review_source_root.set(Some(source.clone()));
+    let mut review_target_root = signals.review_target_root;
+    review_target_root.set(None);
     set_busy(signals, Busy::Scanning);
     // Config and model loading happen below, before any service call and so
     // before any phase event. Without this the banner renders nothing at all
@@ -2345,6 +3112,10 @@ fn launch_migrate(state: &SharedState, source: PathBuf, target: PathBuf, dry_run
     let activation = current_activation(signals);
 
     reset_run_state(signals);
+    let mut review_source_root = signals.review_source_root;
+    review_source_root.set(Some(source.clone()));
+    let mut review_target_root = signals.review_target_root;
+    review_target_root.set(Some(target.clone()));
     set_busy(signals, Busy::Migrating);
     set_phase(signals, tidyup_domain::Phase::Preparing);
 
@@ -2642,14 +3413,234 @@ mod tests {
             move_proposal("Resume_Evan_Rovelli.pdf"),
             move_proposal("Resume_Evan_Rovelli_Audible.pdf"),
         ];
-        let model = build_diff_model(&proposals);
+        let model = build_diff_model(
+            &proposals,
+            &[],
+            Some(Path::new("/Users/example/Desktop")),
+            None,
+        );
         assert!(model.left_rows.iter().any(|row| {
-            matches!(row, TreeRow::Folder { name, depth: 0, .. } if name == "Work")
+            matches!(row, TreeRow::Folder { name, depth: 0, .. } if name == "Desktop")
         }));
         assert!(model.left_rows.iter().any(|row| {
-            matches!(row, TreeRow::Folder { name, depth: 1, .. } if name == "Career")
+            matches!(row, TreeRow::Folder { name, depth: 1, .. } if name == "Work")
         }));
-        assert_eq!(count_folders(&model.left_rows), 2);
+        assert!(model.left_rows.iter().any(|row| {
+            matches!(row, TreeRow::Folder { name, depth: 2, .. } if name == "Career")
+        }));
+        assert_eq!(count_folders(&model.left_rows), 3);
+    }
+
+    #[test]
+    fn diff_model_preserves_current_source_directories_and_root_files() {
+        let root_file = move_proposal("semantic.md");
+        let root_file_id = root_file.id;
+        let mut nested_file = move_proposal("Back Piece.stl");
+        nested_file.original_path = PathBuf::from("/Users/example/Desktop/zprint/Back Piece.stl");
+        let nested_file_id = nested_file.id;
+
+        let model = build_diff_model(
+            &[root_file, nested_file],
+            &[],
+            Some(Path::new("/Users/example/Desktop")),
+            None,
+        );
+
+        assert!(matches!(
+            model.right_rows.first(),
+            Some(CurrentTreeRow::Folder {
+                name,
+                depth: 0,
+                file_count: 2,
+            }) if name == "Desktop"
+        ));
+        assert!(model.right_rows.iter().any(|row| {
+            matches!(
+                row,
+                CurrentTreeRow::Folder {
+                    name,
+                    depth: 1,
+                    file_count: 1,
+                } if name == "zprint"
+            )
+        }));
+        assert!(model.right_rows.iter().any(|row| {
+            matches!(
+                row,
+                CurrentTreeRow::File { entry, depth: 1 }
+                    if entry.proposal_id == root_file_id
+            )
+        }));
+        assert!(model.right_rows.iter().any(|row| {
+            matches!(
+                row,
+                CurrentTreeRow::File { entry, depth: 2 }
+                    if entry.proposal_id == nested_file_id
+            )
+        }));
+    }
+
+    #[test]
+    fn diff_model_pins_migration_roots_on_both_sides() {
+        let mut proposal = move_proposal("resume.pdf");
+        proposal.original_path = PathBuf::from("/Users/example/Incoming/resume.pdf");
+        proposal.proposed_path = PathBuf::from("/Users/example/Documents/Career/resume.pdf");
+
+        let model = build_diff_model(
+            &[proposal],
+            &[],
+            Some(Path::new("/Users/example/Incoming")),
+            Some(Path::new("/Users/example/Documents")),
+        );
+
+        assert!(matches!(
+            model.left_rows.first(),
+            Some(TreeRow::Folder { name, depth: 0, .. }) if name == "Documents"
+        ));
+        assert!(matches!(
+            model.right_rows.first(),
+            Some(CurrentTreeRow::Folder { name, depth: 0, .. }) if name == "Incoming"
+        ));
+    }
+
+    #[test]
+    fn current_siblings_follow_destination_order_to_avoid_crossings() {
+        let mut first_source_alphabetically = move_proposal("a.txt");
+        first_source_alphabetically.proposed_path = PathBuf::from("/Users/example/Desktop/Z/a.txt");
+        let first_id = first_source_alphabetically.id;
+        let mut last_source_alphabetically = move_proposal("z.txt");
+        last_source_alphabetically.proposed_path = PathBuf::from("/Users/example/Desktop/A/z.txt");
+        let last_id = last_source_alphabetically.id;
+
+        let model = build_diff_model(
+            &[first_source_alphabetically, last_source_alphabetically],
+            &[],
+            Some(Path::new("/Users/example/Desktop")),
+            None,
+        );
+
+        assert!(model.current_file_row_by_id[&last_id] < model.current_file_row_by_id[&first_id]);
+    }
+
+    #[test]
+    fn plan_overview_collapses_moved_bundles_and_omits_stationary_bundles() {
+        let mut moved_member = move_proposal("Back Piece.stl");
+        moved_member.original_path = PathBuf::from("/Users/example/Desktop/zprint/Back Piece.stl");
+        moved_member.proposed_path =
+            PathBuf::from("/Users/example/Desktop/3D Models/zprint/Back Piece.stl");
+        let moved_member_id = moved_member.id;
+        let moved = BundleProposal::new(
+            PathBuf::from("/Users/example/Desktop/zprint"),
+            tidyup_domain::BundleKind::DirectoryEnvelope,
+            PathBuf::from("/Users/example/Desktop/3D Models"),
+            vec![moved_member],
+            0.7,
+            "move directory as one unit".to_string(),
+        )
+        .unwrap();
+        let moved_id = moved.id;
+
+        let mut stationary_member = move_proposal("keep.txt");
+        stationary_member.original_path = PathBuf::from("/Users/example/Desktop/keep/keep.txt");
+        stationary_member.proposed_path = stationary_member.original_path.clone();
+        let stationary = BundleProposal::new(
+            PathBuf::from("/Users/example/Desktop/keep"),
+            tidyup_domain::BundleKind::DirectoryEnvelope,
+            PathBuf::from("/Users/example/Desktop"),
+            vec![stationary_member],
+            0.9,
+            "already in place".to_string(),
+        )
+        .unwrap();
+        let stationary_id = stationary.id;
+
+        let model = build_diff_model(
+            &[],
+            &[moved, stationary],
+            Some(Path::new("/Users/example/Desktop")),
+            None,
+        );
+
+        assert_eq!(model.connector_entries.len(), 1);
+        assert_eq!(model.connector_entries[0].proposal_id, moved_id);
+        assert_eq!(model.connector_entries[0].file_count, 1);
+        assert!(matches!(
+            model.left_rows.first(),
+            Some(TreeRow::Folder { file_count: 2, .. })
+        ));
+        assert!(matches!(
+            model.right_rows.first(),
+            Some(CurrentTreeRow::Folder { file_count: 2, .. })
+        ));
+        assert!(!model.file_row_by_id.contains_key(&moved_member_id));
+        assert!(!model.file_row_by_id.contains_key(&stationary_id));
+        assert!(model.left_rows.iter().any(|row| {
+            matches!(
+                row,
+                TreeRow::File {
+                    proposal_id,
+                    bundle_kind: Some(OverviewBundleKind::Directory),
+                    file_count: 1,
+                    ..
+                } if *proposal_id == moved_id
+            )
+        }));
+    }
+
+    #[test]
+    fn virtual_collections_keep_raw_source_files_visible() {
+        let mut first = move_proposal("first.txt");
+        first.proposed_path = PathBuf::from("/Users/example/Desktop/project/first.txt");
+        let first_id = first.id;
+        let mut second = move_proposal("second.txt");
+        second.proposed_path = PathBuf::from("/Users/example/Desktop/project/second.txt");
+        let second_id = second.id;
+        let bundle = BundleProposal::new(
+            PathBuf::from("/Users/example/Desktop"),
+            tidyup_domain::BundleKind::SemanticCollection {
+                label: "project".to_string(),
+            },
+            PathBuf::from("/Users/example/Desktop"),
+            vec![first, second],
+            0.8,
+            "related loose files".to_string(),
+        )
+        .unwrap();
+        let bundle_id = bundle.id;
+
+        let model = build_diff_model(
+            &[],
+            std::slice::from_ref(&bundle),
+            Some(Path::new("/Users/example/Desktop")),
+            None,
+        );
+
+        assert_eq!(model.connector_entries.len(), 2);
+        assert!(model
+            .connector_entries
+            .iter()
+            .all(|entry| entry.bundle_kind.is_none() && entry.file_count == 1));
+        assert_eq!(
+            model.file_row_by_id[&first_id],
+            model.file_row_by_id[&second_id]
+        );
+        assert_eq!(
+            model.file_row_by_id[&first_id],
+            model.file_row_by_id[&bundle_id]
+        );
+        assert!(model.right_rows.iter().all(|row| {
+            !matches!(
+                row,
+                CurrentTreeRow::File {
+                    entry: RightEntry {
+                        bundle_kind: Some(_),
+                        ..
+                    },
+                    ..
+                }
+            )
+        }));
+        assert_eq!(overview_locked_ids(&[bundle]), vec![first_id, second_id]);
     }
 
     #[test]
@@ -2684,6 +3675,52 @@ mod tests {
         assert_eq!(
             validate_semantic_member_name(&bundle, first_id, "renamed.png").unwrap(),
             "renamed.png",
+        );
+    }
+
+    #[test]
+    fn loose_rename_editor_validates_filename_extension_and_collision() {
+        let mut first = move_proposal("first.png");
+        first.change_type = ChangeType::RenameAndMove;
+        first.proposed_name = "project_dashboard.png".to_string();
+        first.proposed_path.set_file_name(&first.proposed_name);
+        let first_id = first.id;
+        let second = move_proposal("existing.png");
+        let proposals = vec![first, second];
+
+        assert_eq!(
+            validate_loose_proposal_name(&proposals, first_id, "robot_fleet.png").unwrap(),
+            "robot_fleet.png",
+        );
+        assert_eq!(
+            validate_loose_proposal_name(&proposals, first_id, "robot_fleet.jpg"),
+            Err("Filename extension must stay the same."),
+        );
+        assert_eq!(
+            validate_loose_proposal_name(&proposals, first_id, "EXISTING.PNG"),
+            Err("Another proposal in this folder already uses that filename."),
+        );
+        assert_eq!(
+            validate_loose_proposal_name(&proposals, first_id, "nested/robot_fleet.png"),
+            Err("Enter a filename, not a path."),
+        );
+    }
+
+    #[test]
+    fn approving_a_loose_rename_carries_the_edited_target() {
+        let mut proposal = move_proposal("Screenshot.png");
+        proposal.change_type = ChangeType::RenameAndMove;
+        proposal.proposed_name = "robot_fleet_dashboard.png".to_string();
+        proposal
+            .proposed_path
+            .set_file_name(&proposal.proposed_name);
+
+        assert_eq!(
+            approval_decision(&proposal),
+            ReviewDecision::Override {
+                proposal_id: proposal.id,
+                new_target: proposal.proposed_path.clone(),
+            },
         );
     }
 }

@@ -86,9 +86,51 @@ pub async fn gate_rename(
     filename: &str,
     config: &ClassifierConfig,
 ) -> Result<GatedRename> {
+    gate_rename_with_thresholds(
+        path,
+        metadata,
+        keywords,
+        year,
+        classification_confidence,
+        embeddings,
+        content_text,
+        filename,
+        config.rename.min_classification_confidence,
+        config.rename.min_mismatch_score,
+    )
+    .await
+}
+
+/// Apply the textual rename gate with evidence-specific thresholds.
+#[allow(clippy::too_many_arguments)]
+pub async fn gate_rename_with_thresholds(
+    path: &Path,
+    metadata: &serde_json::Value,
+    keywords: &[yake::Keyword],
+    year: Option<i32>,
+    classification_confidence: f32,
+    embeddings: &dyn EmbeddingBackend,
+    content_text: Option<&str>,
+    filename: &str,
+    min_classification_confidence: f32,
+    min_mismatch_score: f32,
+) -> Result<GatedRename> {
     let proposal = propose_rename(path, metadata, keywords, year);
+    // An extractor-supplied document title is direct, inspectable evidence.
+    // It does not need to inherit a routing model's unrelated score, and every
+    // rename still remains explicit-review only.
+    let exact_document_title = metadata
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|title| !title.trim().is_empty());
+    if exact_document_title && !matches!(proposal, RenameProposal::Keep) {
+        return Ok(GatedRename {
+            proposal,
+            mismatch_score: None,
+        });
+    }
     if matches!(proposal, RenameProposal::Keep)
-        || classification_confidence < config.rename.min_classification_confidence
+        || classification_confidence < min_classification_confidence
     {
         return Ok(GatedRename {
             proposal: RenameProposal::Keep,
@@ -106,7 +148,7 @@ pub async fn gate_rename(
             &embeddings.embed_text(filename).await?,
             &embeddings.embed_text(content_text).await?,
         );
-    if mismatch < config.rename.min_mismatch_score {
+    if mismatch < min_mismatch_score {
         return Ok(GatedRename {
             proposal: RenameProposal::Keep,
             mismatch_score: Some(mismatch),

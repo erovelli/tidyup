@@ -24,13 +24,13 @@ pub fn model_cache_dir() -> Option<PathBuf> {
 /// Full path to the default `bge-small-en-v1.5` ONNX file.
 #[must_use]
 pub fn default_model_path() -> Option<PathBuf> {
-    model_cache_dir().map(|d| d.join("bge-small-en-v1.5").join("model.onnx"))
+    bundle_artifact_path(crate::install::DEFAULT_BUNDLE_KEY, "model")
 }
 
 /// Full path to the default `bge-small-en-v1.5` tokenizer.
 #[must_use]
 pub fn default_tokenizer_path() -> Option<PathBuf> {
-    model_cache_dir().map(|d| d.join("bge-small-en-v1.5").join("tokenizer.json"))
+    bundle_artifact_path(crate::install::DEFAULT_BUNDLE_KEY, "tokenizer")
 }
 
 /// Full path to the taxonomy embedding cache.
@@ -43,26 +43,23 @@ pub fn taxonomy_cache_path() -> Option<PathBuf> {
 // SigLIP — cross-modal image/text encoder for image routing and naming.
 // ---------------------------------------------------------------------------
 
-/// Subdirectory under the model cache that holds the `SigLIP` image bundle.
-pub const SIGLIP_DIR: &str = "siglip-base-patch16-224";
-
 /// Vision-tower ONNX file.
 #[must_use]
 pub fn siglip_vision_path() -> Option<PathBuf> {
-    model_cache_dir().map(|d| d.join(SIGLIP_DIR).join("vision_model.onnx"))
+    bundle_artifact_path(crate::install::SIGLIP_BUNDLE_KEY, "vision")
 }
 
 /// Text-tower ONNX file (used to embed taxonomy descriptions in the same
 /// latent space the vision tower produces).
 #[must_use]
 pub fn siglip_text_path() -> Option<PathBuf> {
-    model_cache_dir().map(|d| d.join(SIGLIP_DIR).join("text_model.onnx"))
+    bundle_artifact_path(crate::install::SIGLIP_BUNDLE_KEY, "text")
 }
 
 /// Tokenizer JSON for the text tower.
 #[must_use]
 pub fn siglip_tokenizer_path() -> Option<PathBuf> {
-    model_cache_dir().map(|d| d.join(SIGLIP_DIR).join("tokenizer.json"))
+    bundle_artifact_path(crate::install::SIGLIP_BUNDLE_KEY, "tokenizer")
 }
 
 /// Image-side taxonomy embedding cache.
@@ -75,25 +72,28 @@ pub fn siglip_taxonomy_cache_path() -> Option<PathBuf> {
 // CLAP — cross-modal audio/text encoder for audio routing.
 // ---------------------------------------------------------------------------
 
-/// Subdirectory under the model cache that holds the `CLAP` audio bundle.
-pub const CLAP_DIR: &str = "clap-htsat-unfused";
-
 /// Audio-tower ONNX file.
 #[must_use]
 pub fn clap_audio_path() -> Option<PathBuf> {
-    model_cache_dir().map(|d| d.join(CLAP_DIR).join("audio_model.onnx"))
+    bundle_artifact_path(crate::install::CLAP_BUNDLE_KEY, "audio")
 }
 
 /// Text-tower ONNX file.
 #[must_use]
 pub fn clap_text_path() -> Option<PathBuf> {
-    model_cache_dir().map(|d| d.join(CLAP_DIR).join("text_model.onnx"))
+    bundle_artifact_path(crate::install::CLAP_BUNDLE_KEY, "text")
 }
 
 /// Tokenizer JSON for the text tower.
 #[must_use]
 pub fn clap_tokenizer_path() -> Option<PathBuf> {
-    model_cache_dir().map(|d| d.join(CLAP_DIR).join("tokenizer.json"))
+    bundle_artifact_path(crate::install::CLAP_BUNDLE_KEY, "tokenizer")
+}
+
+fn bundle_artifact_path(bundle_key: &str, role: &str) -> Option<PathBuf> {
+    let bundle = crate::install::model_bundle(bundle_key).ok()?;
+    let artifact = bundle.artifact(role)?;
+    model_cache_dir().map(|root| root.join(&bundle.dir).join(&artifact.filename))
 }
 
 /// Audio-side taxonomy embedding cache.

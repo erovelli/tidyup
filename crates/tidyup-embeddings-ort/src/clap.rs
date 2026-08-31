@@ -68,21 +68,11 @@ use tidyup_core::inference::AudioEmbeddingBackend;
 
 use crate::util::l2_normalize;
 
-/// Default model identifier (CLAP HTSAT-unfused via Xenova HF mirror).
-pub const DEFAULT_MODEL_ID: &str = "laion/clap-htsat-unfused";
-
-/// Default output dimensionality.
-pub const DEFAULT_EMBEDDING_DIMS: usize = 512;
-
 /// Sample rate the audio tower expects (Hz).
 pub const TARGET_SAMPLE_RATE: u32 = 48_000;
 
 /// Audio clip length in samples — 10 seconds at [`TARGET_SAMPLE_RATE`].
 pub const AUDIO_LENGTH_SAMPLES: usize = (TARGET_SAMPLE_RATE as usize) * 10;
-
-/// Default text-tower max sequence length. CLAP base caps at 77 tokens
-/// (CLIP-style).
-pub const DEFAULT_MAX_SEQ_LEN: usize = 77;
 
 /// Configuration for [`ClapEmbeddings::load`].
 #[derive(Debug, Clone)]
@@ -93,19 +83,22 @@ pub struct Config {
     pub model_id: String,
     pub dims: usize,
     pub max_seq_len: usize,
+    pub preprocessing_version: String,
     pub intra_threads: Option<usize>,
 }
 
 impl Config {
     #[must_use]
     pub fn default_clap() -> Option<Self> {
+        let bundle = crate::install::model_bundle(crate::install::CLAP_BUNDLE_KEY).ok()?;
         Some(Self {
             audio_path: crate::paths::clap_audio_path()?,
             text_path: crate::paths::clap_text_path()?,
             tokenizer_path: crate::paths::clap_tokenizer_path()?,
-            model_id: DEFAULT_MODEL_ID.to_string(),
-            dims: DEFAULT_EMBEDDING_DIMS,
-            max_seq_len: DEFAULT_MAX_SEQ_LEN,
+            model_id: bundle.model_id.clone(),
+            dims: bundle.dimensions,
+            max_seq_len: bundle.max_sequence_length,
+            preprocessing_version: bundle.preprocessing_version.clone(),
             intra_threads: None,
         })
     }
@@ -118,6 +111,7 @@ pub struct ClapEmbeddings {
     tokenizer: Arc<Tokenizer>,
     dims: usize,
     model_id: String,
+    preprocessing_version: String,
 }
 
 impl std::fmt::Debug for ClapEmbeddings {
@@ -176,6 +170,7 @@ impl ClapEmbeddings {
             tokenizer: Arc::new(tokenizer),
             dims: config.dims,
             model_id: config.model_id,
+            preprocessing_version: config.preprocessing_version,
         })
     }
 
@@ -239,6 +234,10 @@ impl AudioEmbeddingBackend for ClapEmbeddings {
 
     fn model_id(&self) -> &str {
         &self.model_id
+    }
+
+    fn preprocessing_version(&self) -> &str {
+        &self.preprocessing_version
     }
 }
 
@@ -655,8 +654,9 @@ mod tests {
     #[test]
     fn config_default_clap_shape() {
         if let Some(cfg) = Config::default_clap() {
-            assert_eq!(cfg.model_id, DEFAULT_MODEL_ID);
-            assert_eq!(cfg.dims, DEFAULT_EMBEDDING_DIMS);
+            let bundle = crate::install::model_bundle(crate::install::CLAP_BUNDLE_KEY).unwrap();
+            assert_eq!(cfg.model_id, bundle.model_id);
+            assert_eq!(cfg.dims, bundle.dimensions);
             assert!(cfg.audio_path.ends_with("audio_model.onnx"));
             assert!(cfg.text_path.ends_with("text_model.onnx"));
         }
@@ -671,6 +671,7 @@ mod tests {
             model_id: "test".into(),
             dims: 512,
             max_seq_len: 77,
+            preprocessing_version: "test-v1".to_string(),
             intra_threads: None,
         };
         let err = ClapEmbeddings::load(cfg).unwrap_err();

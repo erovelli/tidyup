@@ -199,11 +199,12 @@ impl ScanService {
         // the persistent index remains the source of truth even when a later
         // extractor, model, or router fails. The pipeline does not depend on
         // SQLite; it writes through the FileIndex port.
-        let indexed = tidyup_pipeline::indexing::index_directory(
+        let indexed = tidyup_pipeline::indexing::index_directory_with_config(
             &request.root,
             self.ctx.file_index.as_ref(),
             run_id,
             FileProcessingRole::Source,
+            &self.ctx.classifier.discovery,
         )
         .await?;
         report_indexing(&indexed, progress).await;

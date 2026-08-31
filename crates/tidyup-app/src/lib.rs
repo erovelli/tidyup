@@ -241,13 +241,24 @@ pub fn classifier_config_for(
     text_present: bool,
 ) -> tidyup_domain::ClassifierConfig {
     tidyup_domain::ClassifierConfig {
+        embedding_threshold: cfg.classifier.text_min_similarity,
+        ambiguity_gap: cfg.classifier.text_min_gap,
+        image_embedding_threshold: cfg.classifier.image_min_similarity,
+        image_ambiguity_gap: cfg.classifier.image_min_gap,
+        bundle_embedding_threshold: cfg.classifier.bundle_min_similarity,
+        bundle_ambiguity_gap: cfg.classifier.bundle_min_gap,
         enable_llm_fallback: text_present,
         rename: tidyup_domain::migration::RenameConfig {
             min_classification_confidence: cfg.rename.min_classification_confidence,
             min_mismatch_score: cfg.rename.min_mismatch_score,
+            min_ocr_mismatch_score: cfg.rename.min_ocr_mismatch_score,
             min_grounded_mismatch: cfg.rename.min_grounded_mismatch,
             min_grounding_confidence: cfg.rename.min_grounding_confidence,
             min_grounding_gap: cfg.rename.min_grounding_gap,
+        },
+        discovery: tidyup_domain::DiscoveryConfig {
+            include_hidden: cfg.discovery.include_hidden,
+            ignore_names: cfg.discovery.ignore_names.clone(),
         },
         directory_envelopes: tidyup_domain::DirectoryEnvelopeConfig {
             enabled: cfg.directory_envelopes.enabled,
@@ -326,6 +337,7 @@ mod classifier_config_tests {
             rename: RenameConfig {
                 min_classification_confidence: 0.42,
                 min_mismatch_score: 0.99,
+                min_ocr_mismatch_score: 0.27,
                 min_grounded_mismatch: 0.73,
                 min_grounding_confidence: 0.31,
                 min_grounding_gap: 0.04,
@@ -335,6 +347,7 @@ mod classifier_config_tests {
         let cc = super::classifier_config_for(&cfg, false);
         assert!((cc.rename.min_classification_confidence - 0.42).abs() < f32::EPSILON);
         assert!((cc.rename.min_mismatch_score - 0.99).abs() < f32::EPSILON);
+        assert!((cc.rename.min_ocr_mismatch_score - 0.27).abs() < f32::EPSILON);
         assert!((cc.rename.min_grounded_mismatch - 0.73).abs() < f32::EPSILON);
         assert!((cc.rename.min_grounding_confidence - 0.31).abs() < f32::EPSILON);
         assert!((cc.rename.min_grounding_gap - 0.04).abs() < f32::EPSILON);

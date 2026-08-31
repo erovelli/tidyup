@@ -13,6 +13,7 @@ use std::sync::Arc;
 use tidyup_core::extractor::ContentExtractor;
 use tidyup_domain::{
     DirectoryBoundary, DirectoryEnvelope, DirectoryEnvelopeConfig, DirectorySnapshot,
+    DiscoveryConfig,
 };
 use walkdir::WalkDir;
 
@@ -193,8 +194,12 @@ pub fn snapshot_directory(root: &Path) -> DirectorySnapshot {
 /// coherent. This permits a Desktop-like root to expose unrelated immediate
 /// files while still preserving a coherent nested directory.
 #[must_use]
-pub fn discover(source_root: &Path, config: &DirectoryEnvelopeConfig) -> EnvelopeDiscovery {
-    let nodes = collect_nodes(source_root);
+pub fn discover(
+    source_root: &Path,
+    config: &DirectoryEnvelopeConfig,
+    discovery: &DiscoveryConfig,
+) -> EnvelopeDiscovery {
+    let nodes = collect_nodes(source_root, discovery);
     let mut profiles = BTreeMap::new();
     let mut paths: Vec<PathBuf> = nodes.keys().cloned().collect();
     paths.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
@@ -272,13 +277,13 @@ fn select(
     });
 }
 
-fn collect_nodes(root: &Path) -> BTreeMap<PathBuf, Node> {
+fn collect_nodes(root: &Path, discovery: &DiscoveryConfig) -> BTreeMap<PathBuf, Node> {
     let mut nodes = BTreeMap::new();
-    collect_node(root, &mut nodes);
+    collect_node(root, &mut nodes, discovery);
     nodes
 }
 
-fn collect_node(path: &Path, nodes: &mut BTreeMap<PathBuf, Node>) {
+fn collect_node(path: &Path, nodes: &mut BTreeMap<PathBuf, Node>, discovery: &DiscoveryConfig) {
     let mut node = Node {
         path: path.to_path_buf(),
         ..Node::default()
@@ -308,10 +313,13 @@ fn collect_node(path: &Path, nodes: &mut BTreeMap<PathBuf, Node>) {
             }
         };
         let entry_path = entry.path();
+        if scanner::is_ignored(&entry_path, discovery) {
+            continue;
+        }
         match entry.file_type() {
             Ok(file_type) if file_type.is_dir() => {
                 node.children.push(entry_path.clone());
-                collect_node(&entry_path, nodes);
+                collect_node(&entry_path, nodes, discovery);
             }
             Ok(file_type) if file_type.is_file() => node.files.push(entry_path),
             Ok(_) => {}
@@ -518,7 +526,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         write(temp.path(), "Projects/project-alpha/main.rs", b"alpha");
         write(temp.path(), "Projects/project-beta/main.rs", b"beta");
-        let found = discover(temp.path(), &enabled());
+        let found = discover(temp.path(), &enabled(), &DiscoveryConfig::default());
         assert_eq!(found.envelopes.len(), 1);
         assert!(found.envelopes[0].root.ends_with("Projects"));
     }
@@ -529,7 +537,7 @@ mod tests {
         write(temp.path(), "Misc/tax-return.pdf", b"tax");
         write(temp.path(), "Misc/beach-photo.jpg", b"photo");
         write(temp.path(), "Misc/meeting-notes.txt", b"notes");
-        let found = discover(temp.path(), &enabled());
+        let found = discover(temp.path(), &enabled(), &DiscoveryConfig::default());
         assert!(found.envelopes.is_empty());
         assert_eq!(found.loose_files.len(), 3);
     }
@@ -538,7 +546,7 @@ mod tests {
     fn empty_directory_remains_an_uncertain_envelope() {
         let temp = TempDir::new().unwrap();
         std::fs::create_dir_all(temp.path().join("empty")).unwrap();
-        let found = discover(temp.path(), &enabled());
+        let found = discover(temp.path(), &enabled(), &DiscoveryConfig::default());
         assert_eq!(found.envelopes.len(), 1);
         assert!(found.envelopes[0].metadata.requires_review);
         assert_eq!(found.envelopes[0].members.len(), 0);

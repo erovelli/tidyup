@@ -27,8 +27,9 @@ pub use file::{
 };
 pub use migration::{
     Calibration, Candidate, ClassificationResult, ClassifierConfig, DatePattern,
-    DirectoryEnvelopeConfig, FolderMetadata, FolderNode, FolderProfile, OrganizationType,
-    ProfileCache, RenameConfig, ScanDiff, ScoreBreakdown, ScoreWeights, TargetScan, Tier,
+    DirectoryEnvelopeConfig, DiscoveryConfig, FolderMetadata, FolderNode, FolderProfile,
+    OrganizationType, ProfileCache, RenameConfig, ScanDiff, ScoreBreakdown, ScoreWeights,
+    TargetScan, Tier,
 };
 pub use run::{
     CapabilityEntry, CapabilityKind, CapabilityManifest, CapabilityStatus, RunMode, RunRecord,

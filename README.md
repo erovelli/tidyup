@@ -169,10 +169,11 @@ Rust pinned to 1.95 via `rust-toolchain.toml`. The default-binary embedding mode
 
 **Multimodal model bundles (optional).** Specialized image and audio
 classification needs the SigLIP and CLAP ONNX bundles — neither ships by
-default because each adds several hundred MB to the on-disk install (SigLIP ~370 MB, CLAP ~600 MB).
+default because each adds substantial weight to the on-disk install (the pinned
+INT8 SigLIP bundle is ~205 MB; CLAP remains ~600 MB).
 
 ```bash
-# Just the SigLIP image encoder (~370 MB).
+# Just the SigLIP image encoder (~205 MB).
 cargo xtask download-models --siglip
 # Just the CLAP audio encoder (~600 MB).
 cargo xtask download-models --clap
@@ -255,6 +256,16 @@ backup_retention_days = 30             # shelved originals older than this are e
 [classifier]
 tiers = ["embeddings"]                 # compatibility field; only semantic embeddings are currently used
 min_confidence = 0.75                  # --yes threshold for loose move-only proposals; renames remain review-only
+text_min_similarity = 0.35             # BGE routing floor for text and general files
+text_ambiguity_gap = 0.05              # required separation from the runner-up text destination
+image_min_similarity = 0.04            # SigLIP scores have a different scale from BGE
+image_ambiguity_gap = 0.01
+bundle_min_similarity = 0.35           # aggregate structural/collection routing floor
+bundle_ambiguity_gap = 0.03             # ambiguous collections stay in place for review
+
+[discovery]
+include_hidden = false                 # ignore dotfiles and dot-directories by default
+ignore_names = [".DS_Store", ".localized", "Thumbs.db", "desktop.ini"]
 
 [inference]
 backends = ["embeddings-ort"]          # reserved: parsed for forward-compat but not yet consulted; the
@@ -276,9 +287,10 @@ ocr_max_bytes = 20971520               # 20 MiB cap for a whole image passed to 
 [rename]
 min_classification_confidence = 0.85   # both thresholds must clear before a rename is proposed
 min_mismatch_score = 0.60              # 1.0 - cosine(embed(filename), content_embedding)
+min_ocr_mismatch_score = 0.30          # OCR is direct visual evidence; use a separate mismatch floor
 min_grounded_mismatch = 0.60           # fraction of selected visual concepts absent from filename tokens
-min_grounding_confidence = 0.30        # raw contrastive score floor for non-textual concepts
-min_grounding_gap = 0.02               # selected concept must separate from the next candidate
+min_grounding_confidence = 0.05        # raw SigLIP concept-score floor for non-textual concepts
+min_grounding_gap = 0.01               # selected concept must separate from the next candidate
 
 [bundle_detection]
 enabled = true
@@ -286,7 +298,7 @@ extra_markers = []                     # extra directory-bundle marker filenames
 soft_bundle_enabled = true             # metadata clusters: EXIF photo bursts, ID3 albums, filename series
 ```
 
-`classifier.tiers` is retained so old config files continue to parse; the current classifier always uses semantic embeddings and ignores unknown/removed values. Opaque recognized structural bundles use a separate internal raw-cosine auto-approval floor of `0.50`; file-set collections and every rename remain review-only. The OCR controls are live in both CLI and desktop service construction. The `[bundle_detection]` fields are parsed but not yet wired into the pipeline.
+`classifier.tiers` is retained so old config files continue to parse; the current classifier always uses semantic embeddings and ignores unknown/removed values. Text, image, and aggregate-bundle thresholds are separate because their model score distributions are not interchangeable. An aggregate bundle that misses its routing floor or ambiguity gap is held at its source location instead of being forced into the least-bad destination. Opaque recognized structural bundles use a separate internal raw-cosine auto-approval floor of `0.50`; file-set collections and every rename remain review-only. The discovery and OCR controls are live in both CLI and desktop service construction. The `[bundle_detection]` fields are parsed but not yet wired into the pipeline.
 
 ---
 
@@ -368,7 +380,7 @@ tidyup is being built in phases. Each phase lands an independently compilable sl
 - `tidyup-ui`: Dioxus 0.7 desktop binary (`cargo run --release -p tidyup-ui --bin tidyup-desktop` — the stylesheet is compiled into the binary, so no `dx` CLI or asset bundling step is needed; `--release` matters because debug-profile inference is unusably slow) with Dashboard / Review / Runs / Settings pages, signal-backed `ProgressReporter` and oneshot-channel `ReviewHandler`. Settings opens with an **About** card reporting the version, the git revision the binary was built from (with a `-dirty` marker for uncommitted trees), whether the embedding model is actually present on disk, and whether the optional LLM reranker was compiled in — the four facts a pre-alpha bug report needs. It renders even when config loading fails. Dashboard Scan and Migrate default to **Preview only (dry run)**, reporting what would apply without changing files, shelves, or proposal state; execution requires explicitly turning preview off. Raw routing evidence is displayed as a similarity score, not a percentage, until a fitted calibrator compatible with the run’s capability manifest ships. It uses the same services, extractor registry, and embedding models as the CLI. **Review is a complete-plan surface** through `ReviewHandler::review_all`: loose changes and atomic bundles are shown together; semantic collection labels/member basenames can be edited, while duplicate sibling names are rejected inline and immutable bundle identity is revalidated by the executor. Styled per `DESIGN.md` ("The Verdant Archive") with the Manrope/Inter pairing self-hosted — Latin-subset variable faces are embedded in the binary and injected as `data:` URLs, so the design renders without the webview reaching a font CDN. It launches as **Tidyup** with the project mark as its window icon (the `tidyup-desktop` binary name stays a developer-facing handle that disambiguates it from the `tidyup` CLI)
 - **Multimodal embeddings (optional, off-by-default)**: SigLIP-base for cross-modal image semantics and CLAP-htsat-unfused for audio. Both load only when their model bundles exist. Scan ranks per-modality taxonomies; migration combines matching-space folder-label prototypes with optional content centroids, so empty named folders remain candidates. SigLIP also grounds visible concepts used for rename suggestions and conservative visual collections. Embeddings persist in SQLite under exact content/model/preprocessing/latent-space keys.
 - **Semantic latency harness** (`cargo xtask bench-semantic <image>`): reports cold model load separately from warm read+hash+SigLIP+concept-ranking+grounded-name p50/p95/worst latency and enforces a configurable one-second p95 gate.
-- **Model-integrity verification**: `cargo xtask download-models` and the runtime loader share one `BundleSpec` source of truth (`tidyup-embeddings-ort::install`); downloads are checksum-verified (pinned BLAKE3 enforced and a corrupt file deleted; unpinned digests reported so they can be pinned), and `cargo xtask verify-models` checks an install against those specs on demand
+- **Model-integrity verification**: `cargo xtask download-models` and the runtime loader share the checked-in `crates/tidyup-embeddings-ort/models.toml` manifest; model identities, immutable revisions, preprocessing settings, URLs, sizes, and BLAKE3 hashes are data rather than Rust constants. Downloads are checksum-verified, and `cargo xtask verify-models` checks an install against the same manifest on demand
 - **Classification eval harness** (`cargo xtask eval`): a labeled golden corpus plus accuracy, per-label precision/recall/F1, coverage, and confusions (`--json`). Classification entries require the `bge-small-en-v1.5` bundle; without it they are reported as deferred. `cargo xtask eval --calibrate` fits a Platt calibrator and reports Expected Calibration Error. The harness stays out of model-free `cargo xtask ci`.
 - **Held-out routing eval** (`cargo xtask eval-routing <corpus>`): the *falsifiable* test of the core premise "route by contents, not filename." It treats an already-organized directory as ground truth (folder = label), holds out files, routes them with the real embedding backend (the migration centroid-cosine rule), and reports top-1/top-3 with bootstrap 95% CIs against three baselines — **filename-embedding** (the one it must beat), most-frequent, and extension — plus the content−filename delta and a PASS/FAIL verdict. The split/metrics/baselines are unit-tested deterministically (a stub backend proves the instrument without the model). The **`model-eval` nightly lane** provisions libonnxruntime + the bundle and runs both `eval` and `eval-routing` on real 20-Newsgroups data, gated so a broken premise fails the lane — the only CI lane that exercises the real model path
 

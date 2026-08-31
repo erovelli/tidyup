@@ -4,9 +4,9 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use tidyup_domain::{
-    BackupRecord, BundleProposal, ChangeProposal, ContentHash, FileId, FileProcessingRecord,
-    FileProcessingRole, FileProcessingStage, IndexedFile, RestorePrecheck, RunRecord, RunState,
-    SemanticArtifact,
+    BackupRecord, BundleProposal, ChangeProposal, ChangeType, ContentHash, FileId,
+    FileProcessingRecord, FileProcessingRole, FileProcessingStage, IndexedFile, RestorePrecheck,
+    RunRecord, RunState, SemanticArtifact,
 };
 use uuid::Uuid;
 
@@ -89,6 +89,15 @@ pub trait ChangeLog: Send + Sync {
     ///
     /// `run_id` optionally ties this proposal to a run record for rollback lookup.
     async fn record_proposal(&self, proposal: &ChangeProposal, run_id: Option<Uuid>) -> Result<()>;
+    /// Persist the effective target selected during review before marking the
+    /// proposal applied. Rollback must follow an override to its actual path.
+    async fn update_proposed_target(
+        &self,
+        proposal_id: Uuid,
+        proposed_path: &Path,
+        proposed_name: &str,
+        change_type: ChangeType,
+    ) -> Result<()>;
     async fn mark_applied(&self, proposal_id: Uuid) -> Result<()>;
     /// Record a review rejection so the proposal leaves the pending set. Without
     /// this a rejected proposal stays `Pending` forever and re-surfaces from
