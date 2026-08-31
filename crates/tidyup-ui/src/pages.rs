@@ -1049,6 +1049,8 @@ fn execute_combined_with_threshold(state: &SharedState, threshold: f32) {
 struct ConnectorRender {
     id: Uuid,
     d: String,
+    left_row: usize,
+    right_row: usize,
     strong: bool,
     dashed: bool,
 }
@@ -1121,6 +1123,7 @@ fn DiffView(
     let left_height = rows_to_height(model.left_rows.len());
     let right_height = rows_to_height(model.right_rows.len());
     let svg_height = left_height.max(right_height);
+    let viewport_height = svg_height.min(600);
 
     let connectors: Vec<ConnectorRender> = model
         .connector_entries
@@ -1134,11 +1137,20 @@ fn DiffView(
             Some(ConnectorRender {
                 id: entry.proposal_id,
                 d,
+                left_row: left_idx,
+                right_row: right_idx,
                 strong: entry.confidence >= 0.80,
                 dashed: entry.rename,
             })
         })
         .collect();
+
+    let focus_id_by_left_row = connectors
+        .iter()
+        .fold(HashMap::new(), |mut ids, connector| {
+            ids.entry(connector.left_row).or_insert(connector.id);
+            ids
+        });
 
     let hovered_id = *hovered.read();
     let selected_id = *selected.read();
@@ -1148,44 +1160,60 @@ fn DiffView(
     // element across renders even if ordering shifts.
     let left_rows = model.left_rows.clone();
 
+    use_effect(move || {
+        spawn(async move {
+            let _ = document::eval(PLAN_OVERVIEW_FOCUS_SCRIPT).await;
+        });
+    });
+
     rsx! {
         div {
             class: "diff-view",
+            id: "plan-overview-diff",
+            style: "--diff-viewport-height: {viewport_height}px;",
             div {
                 class: "diff-col diff-proposed",
                 div { class: "diff-col-header", "PROPOSED STRUCTURE" }
                 div {
-                    class: "diff-col-body",
-                    style: "height: {left_height}px;",
-                    for (i, row) in left_rows.iter().enumerate() {
-                        TreeRowView {
-                            key: "{tree_row_key(i, row)}",
-                            row: row.clone(),
-                            hovered,
-                            selected,
-                            signals,
+                    class: "diff-scroll-pane",
+                    div {
+                        class: "diff-col-body",
+                        style: "height: {left_height}px;",
+                        for (i, row) in left_rows.iter().enumerate() {
+                            TreeRowView {
+                                key: "{tree_row_key(i, row)}",
+                                row: row.clone(),
+                                row_index: i,
+                                focus_id: focus_id_by_left_row.get(&i).copied(),
+                                hovered,
+                                selected,
+                                signals,
+                            }
                         }
                     }
                 }
             }
             div {
                 class: "diff-gap",
-                style: "height: {svg_height}px;",
-                svg {
-                    class: "diff-overlay",
-                    width: "100%",
-                    height: "{svg_height}",
-                    view_box: "0 0 100 {svg_height}",
-                    preserve_aspect_ratio: "none",
-                    for c in connectors.iter().cloned() {
-                        ConnectorPath {
-                            key: "{c.id}",
-                            connector: c,
-                            hovered,
-                            selected,
-                            hovered_id,
-                            selected_id,
-                            signals,
+                div { class: "diff-gap-header" }
+                div {
+                    class: "diff-gap-viewport",
+                    svg {
+                        class: "diff-overlay",
+                        width: "100%",
+                        height: "{viewport_height}",
+                        view_box: "0 0 100 {viewport_height}",
+                        preserve_aspect_ratio: "none",
+                        for c in connectors.iter().cloned() {
+                            ConnectorPath {
+                                key: "{c.id}",
+                                connector: c,
+                                hovered,
+                                selected,
+                                hovered_id,
+                                selected_id,
+                                signals,
+                            }
                         }
                     }
                 }
@@ -1194,16 +1222,20 @@ fn DiffView(
                 class: "diff-col diff-current",
                 div { class: "diff-col-header", "CURRENT STORAGE" }
                 div {
-                    class: "diff-col-body",
-                    style: "height: {right_height}px;",
-                    for (i, row) in model.right_rows.iter().cloned().enumerate() {
-                        CurrentTreeRowView {
-                            key: "{current_tree_row_key(i, &row)}",
-                            row,
-                            locked_ids: locked_ids.clone(),
-                            hovered,
-                            selected,
-                            signals,
+                    class: "diff-scroll-pane",
+                    div {
+                        class: "diff-col-body",
+                        style: "height: {right_height}px;",
+                        for (i, row) in model.right_rows.iter().cloned().enumerate() {
+                            CurrentTreeRowView {
+                                key: "{current_tree_row_key(i, &row)}",
+                                row,
+                                row_index: i,
+                                locked_ids: locked_ids.clone(),
+                                hovered,
+                                selected,
+                                signals,
+                            }
                         }
                     }
                 }
@@ -1237,6 +1269,84 @@ fn toggle_selection(mut signal: Signal<Option<Uuid>>, id: Uuid) {
         signal.set(Some(id));
     }
 }
+
+fn center_overview_connection(id: Uuid) {
+    let script = format!("window.tidyupFocusConnection?.('{id}')");
+    spawn(async move {
+        let _ = document::eval(&script).await;
+    });
+}
+
+const PLAN_OVERVIEW_FOCUS_SCRIPT: &str = r#"
+(() => {
+    const root = document.getElementById('plan-overview-diff');
+    if (!root) return;
+
+    const panes = [...root.querySelectorAll('.diff-scroll-pane')];
+    const overlay = root.querySelector('.diff-overlay');
+    if (panes.length !== 2 || !overlay) return;
+
+    const updateConnectors = () => {
+        const overlayRect = overlay.getBoundingClientRect();
+        root.querySelectorAll('.diff-hit').forEach((hit) => {
+            const left = root.querySelector(`.diff-proposed [data-row-index="${hit.dataset.leftRow}"]`);
+            const right = root.querySelector(`.diff-current [data-row-index="${hit.dataset.rightRow}"]`);
+            if (!left || !right) return;
+            const leftRect = left.getBoundingClientRect();
+            const rightRect = right.getBoundingClientRect();
+            const ly = leftRect.top + leftRect.height / 2 - overlayRect.top;
+            const ry = rightRect.top + rightRect.height / 2 - overlayRect.top;
+            const d = `M 0 ${ly} C 50 ${ly}, 50 ${ry}, 100 ${ry}`;
+            root.querySelectorAll(`[data-connector-id="${hit.dataset.connectorId}"]`)
+                .forEach((path) => path.setAttribute('d', d));
+        });
+    };
+
+    if (!root.dataset.focusReady) {
+        root.dataset.focusReady = 'true';
+        panes.forEach((pane) => {
+            pane.scrollTop = Math.max(0, (pane.clientHeight - 42) / 2);
+            let scheduled = false;
+            pane.addEventListener('scroll', () => {
+                if (scheduled) return;
+                scheduled = true;
+                requestAnimationFrame(() => {
+                    scheduled = false;
+                    updateConnectors();
+                });
+            }, { passive: true });
+        });
+        new ResizeObserver(updateConnectors).observe(root);
+    }
+
+    window.tidyupFocusConnection = (id) => {
+        const connector = root.querySelector(`.diff-hit[data-connector-id="${id}"]`);
+        if (!connector) return;
+        const rows = [
+            root.querySelector(`.diff-proposed [data-row-index="${connector.dataset.leftRow}"]`),
+            root.querySelector(`.diff-current [data-row-index="${connector.dataset.rightRow}"]`),
+        ];
+        const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+        panes.forEach((pane, index) => {
+            const row = rows[index];
+            if (!row) return;
+            const paneRect = pane.getBoundingClientRect();
+            const rowRect = row.getBoundingClientRect();
+            const top = pane.scrollTop + rowRect.top + rowRect.height / 2
+                - paneRect.top - paneRect.height / 2;
+            pane.scrollTo({ top, behavior: reduceMotion ? 'auto' : 'smooth' });
+        });
+        const started = performance.now();
+        const animate = (now) => {
+            updateConnectors();
+            if (now - started < 700) requestAnimationFrame(animate);
+        };
+        requestAnimationFrame(animate);
+    };
+
+    requestAnimationFrame(updateConnectors);
+})();
+"#;
 
 #[component]
 fn ConnectorPath(
@@ -1283,7 +1393,10 @@ fn ConnectorPath(
         let mut h = hovered;
         h.set(None);
     };
-    let on_click = move |_| toggle_selection(selected, conn_id);
+    let on_click = move |_| {
+        toggle_selection(selected, conn_id);
+        center_overview_connection(conn_id);
+    };
 
     rsx! {
         // Invisible fat "hit area" so the thin visible stroke is easier to
@@ -1291,6 +1404,9 @@ fn ConnectorPath(
         path {
             class: "diff-hit",
             d: "{connector.d}",
+            "data-connector-id": "{connector.id}",
+            "data-left-row": "{connector.left_row}",
+            "data-right-row": "{connector.right_row}",
             fill: "none",
             stroke: "transparent",
             stroke_width: "14",
@@ -1302,6 +1418,7 @@ fn ConnectorPath(
         path {
             class: "diff-stroke",
             d: "{connector.d}",
+            "data-connector-id": "{connector.id}",
             fill: "none",
             stroke: stroke,
             stroke_width: stroke_width,
@@ -1314,6 +1431,8 @@ fn ConnectorPath(
 #[component]
 fn TreeRowView(
     row: TreeRow,
+    row_index: usize,
+    focus_id: Option<Uuid>,
     hovered: Signal<Option<Uuid>>,
     selected: Signal<Option<Uuid>>,
     signals: SignalBundle,
@@ -1328,6 +1447,7 @@ fn TreeRowView(
             rsx! {
                 div {
                     class: "tree-row tree-folder",
+                    "data-row-index": "{row_index}",
                     style: "padding-left: {pad}px;",
                     span { class: "tree-caret", "▸" }
                     span { class: "tree-folder-name", "{name}/" }
@@ -1350,11 +1470,12 @@ fn TreeRowView(
             let pad = depth.saturating_mul(24).saturating_add(12);
             let chip = confidence_chip(confidence);
             let is_rename = matches!(change_type, ChangeType::Rename | ChangeType::RenameAndMove);
+            let interaction_id = focus_id.unwrap_or(proposal_id);
 
             let hovered_id = *hovered.read();
             let selected_id = *selected.read();
-            let is_hovered = hovered_id == Some(proposal_id);
-            let is_selected = selected_id == Some(proposal_id);
+            let is_hovered = hovered_id == Some(interaction_id);
+            let is_selected = selected_id == Some(interaction_id);
             let state = decision_state_of(&signals.decisions.read(), proposal_id);
 
             let mut row_class = if bundle_kind.is_some() {
@@ -1372,17 +1493,21 @@ fn TreeRowView(
 
             let on_enter = move |_| {
                 let mut h = hovered;
-                h.set(Some(proposal_id));
+                h.set(Some(interaction_id));
             };
             let on_leave = move |_| {
                 let mut h = hovered;
                 h.set(None);
             };
-            let on_click = move |_| toggle_selection(selected, proposal_id);
+            let on_click = move |_| {
+                toggle_selection(selected, interaction_id);
+                center_overview_connection(interaction_id);
+            };
 
             rsx! {
                 div {
                     class: "{row_class}",
+                    "data-row-index": "{row_index}",
                     style: "padding-left: {pad}px;",
                     onmouseenter: on_enter,
                     onmouseleave: on_leave,
@@ -1414,6 +1539,7 @@ fn TreeRowView(
 fn CurrentRow(
     entry: RightEntry,
     depth: usize,
+    row_index: usize,
     hovered: Signal<Option<Uuid>>,
     selected: Signal<Option<Uuid>>,
     signals: SignalBundle,
@@ -1447,7 +1573,10 @@ fn CurrentRow(
         let mut h = hovered;
         h.set(None);
     };
-    let on_click = move |_| toggle_selection(selected, pid);
+    let on_click = move |_| {
+        toggle_selection(selected, pid);
+        center_overview_connection(pid);
+    };
 
     let on_approve = move |ev: MouseEvent| {
         ev.stop_propagation(); // don't also toggle the row selection
@@ -1476,6 +1605,7 @@ fn CurrentRow(
     rsx! {
         div {
             class: "{row_class}",
+            "data-row-index": "{row_index}",
             style: "padding-left: {depth.saturating_mul(24).saturating_add(12)}px;",
             onmouseenter: on_enter,
             onmouseleave: on_leave,
@@ -1525,6 +1655,7 @@ fn CurrentRow(
 #[component]
 fn CurrentTreeRowView(
     row: CurrentTreeRow,
+    row_index: usize,
     hovered: Signal<Option<Uuid>>,
     selected: Signal<Option<Uuid>>,
     signals: SignalBundle,
@@ -1540,6 +1671,7 @@ fn CurrentTreeRowView(
             rsx! {
                 div {
                     class: "tree-row tree-folder current-folder",
+                    "data-row-index": "{row_index}",
                     style: "padding-left: {pad}px;",
                     span { class: "tree-caret", "▸" }
                     span { class: "tree-folder-name", title: "{name}", "{name}/" }
@@ -1553,7 +1685,7 @@ fn CurrentTreeRowView(
         CurrentTreeRow::File { entry, depth } => {
             let locked = locked_ids.contains(&entry.proposal_id);
             rsx! {
-                CurrentRow { entry, depth, hovered, selected, signals, locked }
+                CurrentRow { entry, depth, row_index, hovered, selected, signals, locked }
             }
         }
     }

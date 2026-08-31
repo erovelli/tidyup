@@ -580,15 +580,36 @@ a { color: inherit; text-decoration: none; }
 .diff-col-body {
     position: relative;
     padding-top: 12px;
+    box-sizing: content-box;
+    padding-bottom: 12px;
+    margin-block: calc((var(--diff-viewport-height) - 42px) / 2);
 }
 
 .diff-gap {
     position: relative;
-    padding-top: calc(12px + 1.75rem); /* align with .diff-col-body after header */
+    min-width: 0;
+}
+.diff-gap-header {
+    height: calc(1.75rem + var(--space-sm));
+}
+.diff-scroll-pane,
+.diff-gap-viewport {
+    height: var(--diff-viewport-height);
+    min-height: 0;
+}
+.diff-scroll-pane {
+    overflow-y: auto;
+    overflow-x: hidden;
+    scrollbar-width: thin;
+    overscroll-behavior: contain;
+}
+.diff-gap-viewport {
+    position: relative;
+    overflow: hidden;
 }
 .diff-overlay {
     position: absolute;
-    top: calc(12px + 1.75rem);
+    inset: 0;
     left: 0;
     width: 100%;
     pointer-events: none;       /* container passes clicks through */
@@ -640,6 +661,9 @@ a { color: inherit; text-decoration: none; }
     color: var(--on-surface-variant);
     cursor: pointer;
     transition: background 160ms ease-out, color 160ms ease-out;
+}
+.tree-bundle {
+    cursor: pointer;
 }
 .current-folder { margin: 0; }
 .current-bundle {
