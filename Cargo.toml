@@ -140,7 +140,7 @@ rfd          = "0.17"
 # never reaches the network to render the design system's own typefaces. Already
 # present in the lockfile transitively, so promoting it to a direct dependency
 # adds no new compilation unit.
-base64       = "0.22"
+base64       = "0.23"
 
 # Storage
 rusqlite     = { version = "0.40", features = ["bundled", "chrono"] }
